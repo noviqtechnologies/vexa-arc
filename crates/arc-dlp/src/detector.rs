@@ -283,7 +283,7 @@ impl SecretScanEngine {
                 start: mat.start(),
                 end: mat.end(),
                 confidence: 90,
-                snippet: format!("{}://***:***@...", scheme),
+                snippet: format!("{scheme}://***:***@..."),
             });
         }
 
@@ -315,8 +315,7 @@ mod tests {
 
         let stripe_dummy = format!("{}_{}_{}", "sk", "live", "51AbcdefghijklmnopQRST123456");
         let sample = format!(
-            "Stripe: {}\nGCP: AIzaSyD98765432101234567890123456789012\nDB: postgres://admin:super_secret_pw@db.internal:5432\nnpm: npm_abcd1234efgh5678ijkl9012mnop3456qrst\nPyPI: pypi-AgEIcHlwaS5vcmcCJDIzYjA0MzI4LWQwMzItNDIxZS1iZDYzLTVlODAyMTlmNzBhMAACKls",
-            stripe_dummy
+            "Stripe: {stripe_dummy}\nGCP: AIzaSyD98765432101234567890123456789012\nDB: postgres://admin:super_secret_pw@db.internal:5432\nnpm: npm_abcd1234efgh5678ijkl9012mnop3456qrst\nPyPI: pypi-AgEIcHlwaS5vcmcCJDIzYjA0MzI4LWQwMzItNDIxZS1iZDYzLTVlODAyMTlmNzBhMAACKls"
         );
         let findings = engine.scan(sample.as_bytes());
 

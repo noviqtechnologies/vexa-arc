@@ -228,8 +228,7 @@ fn test_e2e_extended_secret_detection_and_redaction() {
 
     let stripe_key = format!("{}_{}_{}", "sk", "live", "51AbcdefghijklmnopQRST123456");
     let payload_str = format!(
-        "Stripe: {}\nGCP: AIzaSyD98765432101234567890123456789012\nDB: postgres://admin:super_secret_pw@db.internal:5432\n",
-        stripe_key
+        "Stripe: {stripe_key}\nGCP: AIzaSyD98765432101234567890123456789012\nDB: postgres://admin:super_secret_pw@db.internal:5432\n"
     );
     let payload = payload_str.as_bytes();
 

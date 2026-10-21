@@ -34,12 +34,12 @@ impl SlopsquatVerdict {
                 "CompoundTyposquatGate" => {
                     if let Some(target) = reason.split("of '").nth(1).and_then(|s| s.split('\'').next()) {
                         let install_cmd = match ecosystem.to_lowercase().as_str() {
-                            "pypi" | "pip" => format!("pip install {}", target),
-                            "cargo" | "rust" => format!("cargo add {}", target),
-                            "go" => format!("go get {}", target),
-                            _ => format!("npm install {}", target),
+                            "pypi" | "pip" => format!("pip install {target}"),
+                            "cargo" | "rust" => format!("cargo add {target}"),
+                            "go" => format!("go get {target}"),
+                            _ => format!("npm install {target}"),
                         };
-                        Some(format!("Did you mean: '{}'? Run: {}", target, install_cmd))
+                        Some(format!("Did you mean: '{target}'? Run: {install_cmd}"))
                     } else {
                         Some("Verify spelling against official registry package listings.".to_string())
                     }

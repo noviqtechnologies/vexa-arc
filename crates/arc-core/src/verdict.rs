@@ -45,7 +45,7 @@ impl Explanation {
             }
         }
         if let Some(ref url) = self.policy_url {
-            out.push_str(&format!("\nPolicy Reference: {}\n", url));
+            out.push_str(&format!("\nPolicy Reference: {url}\n"));
         }
         out
     }

@@ -31,7 +31,7 @@ impl PackageFirewall {
         let is_popular = self.engine.is_popular_package(package_name);
         let meta = PackageRegistryMetadata {
             name: package_name.to_string(),
-            ecosystem: format!("{:?}", ecosystem).to_lowercase(),
+            ecosystem: format!("{ecosystem:?}").to_lowercase(),
             age_days: age_days.unwrap_or(if is_popular { 365 } else { 1 }),
             monthly_downloads: monthly_downloads.unwrap_or(if is_popular { 10_000_000 } else { 0 }),
             has_verified_repository_link: is_popular,

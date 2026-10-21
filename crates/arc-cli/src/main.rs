@@ -262,7 +262,7 @@ fn main() {
                 for (eco, pkg_name) in pkgs {
                     let permitted = run_shield_check(
                         &pkg_name,
-                        &format!("{:?}", eco).to_lowercase(),
+                        &format!("{eco:?}").to_lowercase(),
                         age_days,
                         downloads,
                         dangerous_scripts,
@@ -297,7 +297,7 @@ fn main() {
                 for (eco, pkg_name) in pkgs {
                     let permitted = run_shield_check(
                         &pkg_name,
-                        &format!("{:?}", eco).to_lowercase(),
+                        &format!("{eco:?}").to_lowercase(),
                         None,
                         None,
                         dangerous_scripts,
@@ -636,14 +636,10 @@ fn run_scan_secrets(path: Option<&Path>, redact: bool) {
             }
 
             if total_findings == 0 {
-                println!(
-                    "Scan complete: 0 secrets detected across {} file(s).",
-                    files_scanned
-                );
+                println!("Scan complete: 0 secrets detected across {files_scanned} file(s).");
             } else {
                 println!(
-                    "Scan complete: {} secret(s) detected across {} file(s)!",
-                    total_findings, files_scanned
+                    "Scan complete: {total_findings} secret(s) detected across {files_scanned} file(s)!"
                 );
             }
             return;
@@ -739,7 +735,7 @@ fn run_shield_check(
             arc_firewall::slopsquat::SlopsquatVerdict::Permitted { reason } => {
                 serde_json::json!({
                     "package": package,
-                    "ecosystem": format!("{:?}", eco).to_lowercase(),
+                    "ecosystem": format!("{eco:?}").to_lowercase(),
                     "status": "permitted",
                     "reason": reason,
                     "suggested_action": null,
@@ -753,7 +749,7 @@ fn run_shield_check(
             arc_firewall::slopsquat::SlopsquatVerdict::Blocked { gate, reason } => {
                 serde_json::json!({
                     "package": package,
-                    "ecosystem": format!("{:?}", eco).to_lowercase(),
+                    "ecosystem": format!("{eco:?}").to_lowercase(),
                     "status": "blocked",
                     "gate": gate,
                     "reason": reason,
@@ -776,46 +772,42 @@ fn run_shield_check(
     println!("\n┌────────────────────────────────────────────────────────┐");
     println!("│        ARC SHIELD ANTI-SLOPSQUATTING EVALUATION        │");
     println!("└────────────────────────────────────────────────────────┘");
-    println!("Package:            {} ({})", package, ecosystem);
+    println!("Package:            {package} ({ecosystem})");
     if let (Some(age), Some(dl)) = (age_days, downloads) {
-        println!(
-            "Registry Metrics:   Age: {} days | Monthly Downloads: {}",
-            age, dl
-        );
+        println!("Registry Metrics:   Age: {age} days | Monthly Downloads: {dl}");
     } else if let Some(age) = age_days {
-        println!("Registry Metrics:   Age: {} days", age);
+        println!("Registry Metrics:   Age: {age} days");
     } else if let Some(dl) = downloads {
-        println!("Registry Metrics:   Monthly Downloads: {}", dl);
+        println!("Registry Metrics:   Monthly Downloads: {dl}");
     } else {
         println!(
             "Registry Metrics:   Pre-install Gate (Automated package baseline & slopsquat check)"
         );
     }
-    println!("Dangerous Scripts:  {}", dangerous_scripts);
+    println!("Dangerous Scripts:  {dangerous_scripts}");
     println!("----------------------------------------------------------");
 
     match &verdict {
         arc_firewall::slopsquat::SlopsquatVerdict::Permitted { reason } => {
             println!("STATUS:             ✅ PERMITTED (PASS)");
-            println!("Reason:             {}", reason);
+            println!("Reason:             {reason}");
         }
         arc_firewall::slopsquat::SlopsquatVerdict::Blocked { gate, reason } => {
             println!("STATUS:             🛑 BLOCKED (HARD GATE REJECTION)");
-            println!("Triggered Gate:     {}", gate);
-            println!("Finding:            {}", reason);
+            println!("Triggered Gate:     {gate}");
+            println!("Finding:            {reason}");
 
             if let Some(act) = &suggestion {
                 println!("\nSUGGESTED ACTION:");
                 if gate == &"CompoundTyposquatGate" {
-                    println!("  💡 {}", act);
+                    println!("  💡 {act}");
                     println!(
-                        "  ℹ️  If legitimate: arc shield allow {} --ecosystem {}",
-                        package, ecosystem
+                        "  ℹ️  If legitimate: arc shield allow {package} --ecosystem {ecosystem}"
                     );
                 } else if gate == &"CompoundLifecycleGate" {
-                    println!("  ⚠️  {}", act);
+                    println!("  ⚠️  {act}");
                 } else {
-                    println!("  ➜  {}", act);
+                    println!("  ➜  {act}");
                 }
             }
         }
@@ -1019,7 +1011,7 @@ fn run_intercept_session(session_id: &str, reset: bool, json: bool) {
                 serde_json::json!({ "session_id": session_id, "cleared": cleared })
             );
         } else {
-            println!("\nSession '{}' state cleared successfully.", session_id);
+            println!("\nSession '{session_id}' state cleared successfully.");
         }
         return;
     }
@@ -1123,10 +1115,7 @@ fn run_intercept_eval(
             is_error: false,
         },
         _ => {
-            eprintln!(
-                "Unknown action kind '{}'. Use file_read, shell, mcp_call, or prompt.",
-                kind
-            );
+            eprintln!("Unknown action kind '{kind}'. Use file_read, shell, mcp_call, or prompt.");
             return false;
         }
     };
@@ -1172,14 +1161,14 @@ fn run_intercept_eval(
     println!("\n═══════════════════════════════════════════════════════════════════════");
     println!("                    ARC RUNTIME ACTION INTERCEPT                       ");
     println!("═══════════════════════════════════════════════════════════════════════");
-    println!(" Session ID:    {}", session);
+    println!(" Session ID:    {session}");
     if let Some(ref path) = session_file {
         println!(" Session File:  {}", path.display());
     }
     if kind == "mcp_call" {
-        println!(" Action:        {} ➔ {}:{}", kind, server, target);
+        println!(" Action:        {kind} ➔ {server}:{target}");
     } else {
-        println!(" Action:        {} ➔ {}", kind, target);
+        println!(" Action:        {kind} ➔ {target}");
     }
     println!(" Phase:         Pre-Execution Runtime Interception");
     println!("───────────────────────────────────────────────────────────────────────");
@@ -1243,7 +1232,7 @@ fn run_intercept_eval(
     println!(
         "       └─ Sensitive Sink:        {}",
         if is_sensitive_sink {
-            format!("[✔] {:?}", sink)
+            format!("[✔] {sink:?}")
         } else {
             "[ ] None (Read-only or safe)".to_string()
         }
@@ -1258,7 +1247,7 @@ fn run_intercept_eval(
             if !obligations.is_empty() {
                 println!("\n Obligations Enforced ({}):", obligations.len());
                 for ob in obligations {
-                    println!("  • {:?}", ob);
+                    println!("  • {ob:?}");
                 }
             }
             if !newly_added_taints.is_empty() {
@@ -1287,7 +1276,7 @@ fn run_intercept_eval(
                 }
             }
             if let Some(ref url) = explanation.policy_url {
-                println!("\n Policy Documentation: {}", url);
+                println!("\n Policy Documentation: {url}");
             }
         }
         arc_core::verdict::Verdict::Quarantine { rule, explanation } => {
