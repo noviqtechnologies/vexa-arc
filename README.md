@@ -3,7 +3,7 @@
 [![Rust Edition](https://img.shields.io/badge/Rust-2021%20Edition-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-brightgreen.svg)](#cross-platform-installation--setup)
-[![Tests](https://img.shields.io/badge/Tests-49%2F49%20Passing-success.svg)](#automated-tests--verification)
+[![Tests](https://img.shields.io/badge/Tests-55%2F55%20Passing-success.svg)](#automated-tests--verification)
 [![CycloneDX](https://img.shields.io/badge/CycloneDX-v1.6%20AI--BOM-blueviolet?logo=owasp&logoColor=white)](#2-live-cyclonedx-v16-ai-bom-export-arc-bom)
 [![Docs](https://img.shields.io/badge/Docs-Guides%20%26%20Reference-blueviolet?logo=read-the-docs&logoColor=white)](#-documentation--workflow-guides)
 
@@ -31,8 +31,8 @@
 | ⚡ [**Sub-Millisecond Pure Rust Core**](#cross-platform-installation--setup) | High-throughput in-memory policy and taint evaluation with **$p_{99} < 3.5\text{ ms}$ latency** and **zero external C / OpenSSL dependencies**. | `arc audit` |
 | 🚫 [**Anti-Slopsquatting Package Firewall**](#2-anti-slopsquatting-dependency-firewall-arc-shield) | 4-gate compound defense blocking hallucinated packages and typosquats across `npm`, `pypi`, `cargo`, and `go` before install scripts execute. | `arc shield npm install reactt` |
 | 🔒 [**Linear-Time Context DLP & Vault**](#3-context-dlp-secret-detection--pseudonymization-vault) | Scans credentials and sensitive data in $< 0.9\text{ ms}$ with Shannon entropy and local pseudonymization tokenization (`<ARC_VAULT_SECRET_XX>`). | `arc scan-secrets --redact` |
-| 📋 [**CycloneDX v1.6 AI-BOM Generator**](#5-standardized-cyclonedx-v16-ai-bom-export-arc-bom) | Generates certified **CycloneDX v1.6 AI-BOM** manifests capturing models, datasets, MCP server capabilities, and agent instruction files. | `arc bom --out ai-bom.json` |
-| 🔍 [**Zero-Touch AI Asset Discovery**](#4-zero-touch-ai-spm--asset-discovery-arc-audit) | Exhaustive multi-origin scanner discovering local models, agent rules (`.cursorrules`, `CLAUDE.md`), and MCP configs in $< 1.2\text{ s}$ with zero network egress. | `arc audit` |
+| 📋 [**CycloneDX v1.6 AI-BOM Generator**](#5-standardized-cyclonedx-v16-ai-bom-export-arc-bom) | Generates specification-compliant **CycloneDX v1.6 AI-BOM** manifests capturing models, datasets, MCP server capabilities, and agent instruction files. | `arc bom --out ai-bom.json` |
+| 🔍 [**Zero-Touch AI Asset Discovery**](#4-zero-touch-ai-spm--asset-discovery-arc-audit) | Exhaustive multi-origin scanner discovering local models, agent rules (`.cursorrules`, `CLAUDE.md`), and MCP configs with zero network egress. | `arc audit` |
 | 🛡️ [**Prompt Injection Sanitizer**](#6-inbound-prompt-injection-sanitization--nonce-spotlighting) | Strips invisible Unicode tags, Trojan Source bidi overrides, and wraps untrusted external context in cryptographic nonce boundaries. | `arc intercept prompt "https://issue/42"` |
 | 🔄 [**Dynamic Schema Rug-Pull Quarantine**](#7-mcp-host-adapters--self-explaining-json-rpc-interceptors) | Computes RFC 8785 JSON Canonicalization Scheme (JCS) SHA-256 hashes of MCP schemas to halt runtime privilege escalation attempts. | `arc intercept mcp slack read` |
 | 🚦 [**CI/CD Quality Gates & Exit Codes**](#8-cicd-quality-gates--policy-enforcement) | Deterministic exit codes (`0` = permitted / no violations, `1` = blocked, secret findings, invalid scan paths, or failed artifact exports) with structured JSON-RPC remediation options for automated agent self-healing. | `arc audit --json` |
@@ -704,7 +704,7 @@ fi
 Vexa Arc includes a comprehensive automated test suite covering all 7 workspace crates and end-to-end integration scenarios:
 
 ```bash
-# Run all workspace unit and integration tests (46 tests)
+# Run all workspace unit and integration tests (55 tests)
 cargo test --workspace
 
 # Run integration tests specifically
@@ -712,14 +712,14 @@ cargo test --test integration_tests
 ```
 
 ### Test Suite Validations:
-- **`arc-cli` (5 tests)**: Positional parameter resolution, secret directory collection, shield blocked & permitted packages, CLI audit execution, multi-step session persistence and Lethal Trifecta enforcement.
-- **`integration_tests` (9 tests)**: E2E compound anti-slopsquatting gates, inbound prompt injection sanitization and cryptographic spotlighting, Lethal Trifecta runtime governance, asset discovery & CycloneDX v1.6 AI-BOM export, DLP secret redaction and vault lifecycle, extended secret detection and vaulting (Stripe, GCP, DB URIs), cross-platform package manager shimming (`go get`, `python -m pip`, `pnpm`), dynamic schema rug-pull quarantine (`ARC-RUG-001`), and unapproved MCP server blocking (`ARC-MCP-001`).
-- **`arc-core` (5 tests)**: MCP 3D capability profiling and risk bands, monotonic taint bitflags, `ActionEvent` normalization, self-explaining `Verdict` formats, RFC 8785 JSON Canonicalization Scheme (JCS) hash consistency.
-- **`arc-discover` (3 tests)**: CycloneDX v1.6 AI-BOM serialization conformity, multi-origin MCP configuration and asset discovery, modern agent rule (`.mdc`) and model (`.onnx`) asset discovery.
+- **`arc-cli` (5 tests)**: Positional parameter resolution, working-directory-independent secret directory collection, shield blocked & permitted packages, CLI audit execution, multi-step session persistence and Lethal Trifecta enforcement.
+- **`integration_tests` (15 tests)**: E2E compound anti-slopsquatting gates, inbound prompt injection sanitization and cryptographic spotlighting, Lethal Trifecta runtime governance, asset discovery & CycloneDX v1.6 AI-BOM export, DLP secret redaction and vault lifecycle, extended secret detection and vaulting (Stripe, GCP, DB URIs), cross-platform package manager shimming (`go get`, `python -m pip`, `pnpm`), dynamic schema rug-pull quarantine (`ARC-RUG-001`), unapproved MCP server blocking (`ARC-MCP-001`), CLI secret scan exit codes and stdout redaction, CLI audit path validation and non-zero exit codes, failed AI-BOM export and read-only destination exit codes, executable CLI schema rug-pull quarantine and cross-session baseline isolation, provenance-aware prompt taint classification and Lethal Trifecta enforcement, and explicit cross-platform session storage directory overrides.
+- **`arc-core` (5 tests)**: MCP 3D capability profiling and risk bands, monotonic taint bitflags, `ActionEvent` normalization and provenance metadata, self-explaining `Verdict` formats, RFC 8785 JSON Canonicalization Scheme (JCS) hash consistency.
+- **`arc-discover` (4 tests)**: CycloneDX v1.6 AI-BOM serialization conformity, multi-origin MCP configuration and asset discovery, modern agent rule (`.mdc`) and model (`.onnx`) asset discovery, audit directory validation and non-directory error handling.
 - **`arc-dlp` (8 tests)**: Invisible Unicode and Trojan Source bidi sanitization, nonce-delimited spotlighting, normalized and raw Shannon entropy calculation, local pseudonymization vault tokenization and rehydration, multi-pattern secret detection, and extended credential types (Stripe live keys, Google Cloud API keys, Database URIs, PyPI tokens, npm tokens).
 - **`arc-firewall` (10 tests)**: `npm`, `pnpm`, `yarn`, `pip`, `python -m pip`, `cargo`, and `go get` command parsing, target/command resolver, established package fast path, Phantom 404 gate rejection, lifecycle scripts gate rejection, typosquat similarity rejection and suggested remediation actions.
-- **`arc-hooks` (1 test)**: MCP JSON-RPC 2.0 request parsing and error response structure.
-- **`arc-policy-engine` (5 tests)**: Stateful Taint DAG Lethal Trifecta trigger, unapproved MCP server block, Lethal Trifecta policy evaluation, policy configuration serialization and disk roundtrip (`.arc/policy.json`), Windows backslash path and SSH key taint classification.
+- **`arc-hooks` (2 tests)**: MCP JSON-RPC 2.0 request parsing and error response structure, and MCP schema fingerprint extraction for dynamic rug-pull quarantine.
+- **`arc-policy-engine` (6 tests)**: Stateful Taint DAG Lethal Trifecta trigger, unapproved MCP server block, Lethal Trifecta policy evaluation, policy configuration serialization and disk roundtrip (`.arc/policy.json`), Windows backslash path and SSH key taint classification, and session-scoped schema rug-pull isolation.
 
 ---
 

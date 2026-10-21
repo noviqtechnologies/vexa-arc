@@ -142,6 +142,26 @@ enum InterceptAction {
         #[arg(long)]
         server: Option<String>,
 
+        /// MCP schema fingerprint (hex-encoded SHA-256 or raw JSON schema) for rug-pull detection
+        #[arg(long)]
+        schema: Option<String>,
+
+        /// Source/provenance of content (e.g. 'github_issue', 'web_scraper', 'user')
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Explicitly mark action content as untrusted external input
+        #[arg(long)]
+        untrusted: bool,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
+
         /// Reset session state before evaluating
         #[arg(long)]
         reset: bool,
@@ -160,6 +180,14 @@ enum InterceptAction {
         #[arg(short, long, default_value = "default-session")]
         session: String,
 
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
+
         /// Output verdict as structured JSON
         #[arg(long)]
         json: bool,
@@ -173,6 +201,14 @@ enum InterceptAction {
         /// Host session identifier
         #[arg(short, long, default_value = "default-session")]
         session: String,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
 
         /// Output verdict as structured JSON
         #[arg(long)]
@@ -191,6 +227,18 @@ enum InterceptAction {
         #[arg(short, long, default_value = "default-session")]
         session: String,
 
+        /// MCP schema fingerprint (hex-encoded SHA-256 or raw JSON schema) for rug-pull detection
+        #[arg(long)]
+        schema: Option<String>,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
+
         /// Output verdict as structured JSON
         #[arg(long)]
         json: bool,
@@ -204,6 +252,22 @@ enum InterceptAction {
         /// Host session identifier
         #[arg(short, long, default_value = "default-session")]
         session: String,
+
+        /// Source/provenance of content (e.g. 'github_issue', 'web_scraper', 'user')
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Explicitly mark prompt content as untrusted external input
+        #[arg(long)]
+        untrusted: bool,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
 
         /// Output verdict as structured JSON
         #[arg(long)]
@@ -219,6 +283,14 @@ enum InterceptAction {
         /// Clear/reset the recorded taints and history for this session
         #[arg(long)]
         reset: bool,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
 
         /// Output session state as JSON
         #[arg(long)]
@@ -326,19 +398,29 @@ fn main() {
                 kind,
                 target,
                 server,
+                schema,
+                source,
+                untrusted,
+                session_dir,
+                project_local,
                 reset,
                 json,
             } => {
-                let permitted = run_intercept_eval(
-                    &session,
-                    kind.as_deref(),
-                    target.as_deref(),
-                    server.as_deref(),
-                    pos_target.as_deref(),
-                    pos_extra.as_deref(),
+                let permitted = run_intercept_eval_with_opts(InterceptEvalOptions {
+                    session: &session,
+                    kind: kind.as_deref(),
+                    target: target.as_deref(),
+                    server: server.as_deref(),
+                    pos_target: pos_target.as_deref(),
+                    pos_extra: pos_extra.as_deref(),
+                    schema: schema.as_deref(),
+                    source: source.as_deref(),
+                    untrusted,
+                    session_dir: session_dir.as_deref(),
+                    project_local,
                     reset,
                     json,
-                );
+                });
                 if !permitted {
                     std::process::exit(1);
                 }
@@ -346,19 +428,20 @@ fn main() {
             InterceptAction::Read {
                 path,
                 session,
+                session_dir,
+                project_local,
                 json,
             } => {
                 let path_str = path.to_string_lossy();
-                let permitted = run_intercept_eval(
-                    &session,
-                    Some("file_read"),
-                    Some(&path_str),
-                    None,
-                    None,
-                    None,
-                    false,
+                let permitted = run_intercept_eval_with_opts(InterceptEvalOptions {
+                    session: &session,
+                    kind: Some("file_read"),
+                    target: Some(&path_str),
+                    session_dir: session_dir.as_deref(),
+                    project_local,
                     json,
-                );
+                    ..Default::default()
+                });
                 if !permitted {
                     std::process::exit(1);
                 }
@@ -366,18 +449,19 @@ fn main() {
             InterceptAction::Exec {
                 command,
                 session,
+                session_dir,
+                project_local,
                 json,
             } => {
-                let permitted = run_intercept_eval(
-                    &session,
-                    Some("shell"),
-                    Some(&command),
-                    None,
-                    None,
-                    None,
-                    false,
+                let permitted = run_intercept_eval_with_opts(InterceptEvalOptions {
+                    session: &session,
+                    kind: Some("shell"),
+                    target: Some(&command),
+                    session_dir: session_dir.as_deref(),
+                    project_local,
                     json,
-                );
+                    ..Default::default()
+                });
                 if !permitted {
                     std::process::exit(1);
                 }
@@ -386,18 +470,22 @@ fn main() {
                 server,
                 tool,
                 session,
+                schema,
+                session_dir,
+                project_local,
                 json,
             } => {
-                let permitted = run_intercept_eval(
-                    &session,
-                    Some("mcp_call"),
-                    Some(&tool),
-                    Some(&server),
-                    None,
-                    None,
-                    false,
+                let permitted = run_intercept_eval_with_opts(InterceptEvalOptions {
+                    session: &session,
+                    kind: Some("mcp_call"),
+                    target: Some(&tool),
+                    server: Some(&server),
+                    schema: schema.as_deref(),
+                    session_dir: session_dir.as_deref(),
+                    project_local,
                     json,
-                );
+                    ..Default::default()
+                });
                 if !permitted {
                     std::process::exit(1);
                 }
@@ -405,18 +493,23 @@ fn main() {
             InterceptAction::Prompt {
                 text,
                 session,
+                source,
+                untrusted,
+                session_dir,
+                project_local,
                 json,
             } => {
-                let permitted = run_intercept_eval(
-                    &session,
-                    Some("prompt"),
-                    Some(&text),
-                    None,
-                    None,
-                    None,
-                    false,
+                let permitted = run_intercept_eval_with_opts(InterceptEvalOptions {
+                    session: &session,
+                    kind: Some("prompt"),
+                    target: Some(&text),
+                    source: source.as_deref(),
+                    untrusted,
+                    session_dir: session_dir.as_deref(),
+                    project_local,
                     json,
-                );
+                    ..Default::default()
+                });
                 if !permitted {
                     std::process::exit(1);
                 }
@@ -424,9 +517,17 @@ fn main() {
             InterceptAction::Session {
                 session_id,
                 reset,
+                session_dir,
+                project_local,
                 json,
             } => {
-                run_intercept_session(&session_id, reset, json);
+                run_intercept_session_with_dir(
+                    &session_id,
+                    reset,
+                    json,
+                    session_dir.as_deref(),
+                    project_local,
+                );
             }
         },
         Commands::Version => {
@@ -869,14 +970,117 @@ fn run_shield_check(
     !verdict.is_blocked()
 }
 
-fn get_session_storage_dir() -> PathBuf {
-    let local_arc = Path::new(".arc").join("sessions");
-    if local_arc.exists() || fs::create_dir_all(&local_arc).is_ok() {
+#[derive(Default, Debug)]
+pub struct InterceptEvalOptions<'a> {
+    pub session: &'a str,
+    pub kind: Option<&'a str>,
+    pub target: Option<&'a str>,
+    pub server: Option<&'a str>,
+    pub pos_target: Option<&'a str>,
+    pub pos_extra: Option<&'a str>,
+    pub schema: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub untrusted: bool,
+    pub session_dir: Option<&'a Path>,
+    pub project_local: bool,
+    pub reset: bool,
+    pub json: bool,
+}
+
+fn get_session_storage_dir(override_dir: Option<&Path>, project_local: bool) -> PathBuf {
+    // 1. Explicit override passed via CLI argument
+    if let Some(dir) = override_dir {
+        let _ = fs::create_dir_all(dir);
+        return dir.to_path_buf();
+    }
+
+    // 2. Explicit environment variable ARC_SESSION_DIR
+    if let Ok(env_dir) = std::env::var("ARC_SESSION_DIR") {
+        let pb = PathBuf::from(env_dir);
+        let _ = fs::create_dir_all(&pb);
+        return pb;
+    }
+
+    // 3. Opt-in project-local mode (via --project-local flag or ARC_PROJECT_LOCAL=1)
+    let env_local = std::env::var("ARC_PROJECT_LOCAL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if project_local || env_local {
+        let local_arc = Path::new(".arc").join("sessions");
+        let _ = fs::create_dir_all(&local_arc);
         return local_arc;
     }
+
+    // 4. If current working directory already contains .arc/sessions, preserve project-local continuity
+    let cwd_local = Path::new(".arc").join("sessions");
+    if cwd_local.is_dir() {
+        return cwd_local;
+    }
+
+    // 5. OS-appropriate user data directory:
+    #[cfg(windows)]
+    let base_user_dir = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("USERPROFILE").map(|p| PathBuf::from(p).join(".arc")));
+
+    #[cfg(not(windows))]
+    let base_user_dir = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::var("HOME").map(|h| {
+                #[cfg(target_os = "macos")]
+                {
+                    PathBuf::from(&h)
+                        .join("Library")
+                        .join("Application Support")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    PathBuf::from(&h).join(".local").join("share")
+                }
+            })
+        });
+
+    if let Ok(user_dir) = base_user_dir {
+        let arc_dir = user_dir.join("vexa-arc").join("sessions");
+        if fs::create_dir_all(&arc_dir).is_ok() {
+            return arc_dir;
+        }
+    }
+
+    // 6. Fallback: system temp directory
     let temp_arc = std::env::temp_dir().join("vexa-arc").join("sessions");
     let _ = fs::create_dir_all(&temp_arc);
     temp_arc
+}
+
+fn parse_schema_fingerprint(schema_input: Option<&str>) -> Option<[u8; 32]> {
+    let raw = schema_input?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Check if it's 64-char hex
+    if raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(bytes) = hex::decode(raw) {
+            if let Ok(arr) = bytes.try_into() {
+                return Some(arr);
+            }
+        }
+    }
+    // Check if it's a file path containing JSON schema
+    let json_bytes = if let Ok(content) = fs::read(raw) {
+        content
+    } else {
+        raw.as_bytes().to_vec()
+    };
+    if let Ok(hash) = arc_core::compute_jcs_schema_hash(&json_bytes) {
+        return Some(hash);
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&json_bytes);
+    Some(hasher.finalize().into())
 }
 
 fn resolve_action_params(
@@ -1048,8 +1252,19 @@ fn format_added_taints(taints: Taint) -> String {
     names.join(", ")
 }
 
+#[allow(dead_code)]
 fn run_intercept_session(session_id: &str, reset: bool, json: bool) {
-    let storage_dir = get_session_storage_dir();
+    run_intercept_session_with_dir(session_id, reset, json, None, false);
+}
+
+fn run_intercept_session_with_dir(
+    session_id: &str,
+    reset: bool,
+    json: bool,
+    session_dir: Option<&Path>,
+    project_local: bool,
+) {
+    let storage_dir = get_session_storage_dir(session_dir, project_local);
     let evaluator = PolicyEvaluator::default();
     let _ = evaluator.load_session_state(&storage_dir, session_id);
 
@@ -1104,6 +1319,7 @@ fn run_intercept_session(session_id: &str, reset: bool, json: bool) {
     println!("═══════════════════════════════════════════════════════════\n");
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn run_intercept_eval(
     session: &str,
@@ -1115,19 +1331,39 @@ fn run_intercept_eval(
     reset: bool,
     output_json: bool,
 ) -> bool {
-    let (kind, target, server) =
-        match resolve_action_params(kind_arg, target_arg, server_arg, pos_target, pos_extra) {
-            Ok(res) => res,
-            Err(err) => {
-                eprintln!("Error: {err}");
-                return false;
-            }
-        };
+    run_intercept_eval_with_opts(InterceptEvalOptions {
+        session,
+        kind: kind_arg,
+        target: target_arg,
+        server: server_arg,
+        pos_target,
+        pos_extra,
+        reset,
+        json: output_json,
+        ..Default::default()
+    })
+}
 
-    let storage_dir = get_session_storage_dir();
+fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
+    let session = opts.session;
+    let (kind, target, server) = match resolve_action_params(
+        opts.kind,
+        opts.target,
+        opts.server,
+        opts.pos_target,
+        opts.pos_extra,
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            return false;
+        }
+    };
+
+    let storage_dir = get_session_storage_dir(opts.session_dir, opts.project_local);
     let evaluator = PolicyEvaluator::default();
 
-    if reset {
+    if opts.reset {
         let _ = evaluator.clear_session_state(Some(&storage_dir), session);
     } else {
         let _ = evaluator.load_session_state(&storage_dir, session);
@@ -1135,6 +1371,8 @@ fn run_intercept_eval(
 
     let prev_dag = evaluator.taint_tracker.get_or_create(session);
     let prev_taints = prev_dag.current_taints;
+
+    let schema_root = parse_schema_fingerprint(opts.schema);
 
     let action = match kind.to_lowercase().as_str() {
         "file_read" | "read" => Action::FileRead {
@@ -1148,19 +1386,20 @@ fn run_intercept_eval(
             server: ServerIdentity {
                 config_name: server.to_string(),
                 artifact: Artifact::Unknown,
-                schema_root: None,
+                schema_root,
             },
             tool: target.to_string(),
             arguments: serde_json::json!({}),
         },
         "prompt" => Action::PromptSubmit {
             text: target.to_string(),
+            source: opts.source.map(|s| s.to_string()),
         },
         "mcp_result" => Action::McpToolResult {
             server: ServerIdentity {
                 config_name: server.to_string(),
                 artifact: Artifact::Unknown,
-                schema_root: None,
+                schema_root,
             },
             tool: target.to_string(),
             content: String::new(),
@@ -1172,13 +1411,19 @@ fn run_intercept_eval(
         }
     };
 
-    let event = ActionEvent::new(
+    let mut event = ActionEvent::new(
         AgentHost::ClaudeCode,
         session,
         OsPrincipal::Uid(1000),
         Phase::Pre,
         action,
     );
+
+    if opts.untrusted || opts.source.is_some() {
+        let src = opts.source.unwrap_or("untrusted_external").to_string();
+        event = event
+            .with_provenance(arc_core::event::EventProvenance::UntrustedExternal { source: src });
+    }
 
     let verdict = evaluator.evaluate(&event);
 
@@ -1189,7 +1434,7 @@ fn run_intercept_eval(
     let current_taints = updated_dag.current_taints;
     let newly_added_taints = current_taints - prev_taints;
 
-    if output_json {
+    if opts.json {
         let json_output = serde_json::json!({
             "session_id": session,
             "action_kind": kind,
@@ -1366,9 +1611,20 @@ mod tests {
 
     #[test]
     fn test_scan_secrets_directory_collection() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("arc_scan_test_{ts}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let test_file = temp_dir.join("test.rs");
+        std::fs::write(&test_file, "fn main() {}").unwrap();
+
         let mut files = Vec::new();
-        collect_scan_files(Path::new("src"), 0, &mut files).unwrap();
+        collect_scan_files(&temp_dir, 0, &mut files).unwrap();
         assert!(!files.is_empty(), "Must collect files from directory");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

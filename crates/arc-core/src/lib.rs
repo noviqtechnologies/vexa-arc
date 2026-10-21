@@ -6,7 +6,8 @@ pub mod verdict;
 
 pub use error::ArcError;
 pub use event::{
-    Action, ActionEvent, AgentHost, Artifact, Ecosystem, OsPrincipal, Phase, ServerIdentity,
+    Action, ActionEvent, AgentHost, Artifact, Ecosystem, EventProvenance, OsPrincipal, Phase,
+    ServerIdentity,
 };
 pub use mcp_profile::{compute_jcs_schema_hash, Mcp3DCapabilityProfile, RiskBand};
 pub use taint::{SinkClass, Taint};

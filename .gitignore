@@ -4,8 +4,9 @@
 /prd
 /images
 /.sca-cache
-/.arc
+**/.arc
 /misc
 /design
 /outputs
+/completed
 

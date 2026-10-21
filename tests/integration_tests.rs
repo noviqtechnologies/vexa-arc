@@ -695,3 +695,191 @@ fn test_cli_bom_and_audit_export_failures() {
     let _ = fs::set_permissions(&ro_file, cleanup_perms);
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_cli_schema_rug_pull_quarantine_executable_path() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let session = format!(
+        "sess-rug-cli-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let schema_v1 = "0101010101010101010101010101010101010101010101010101010101010101";
+    let schema_v2 = "0202020202020202020202020202020202020202020202020202020202020202";
+
+    // 1. First call with initial schema fingerprint -> ALLOW (exit 0)
+    let call1 = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "mcp",
+            "slack",
+            "read_channel",
+            "--session",
+            &session,
+            "--schema",
+            schema_v1,
+        ])
+        .output()
+        .expect("failed to execute arc intercept mcp call1");
+
+    assert_eq!(
+        call1.status.code(),
+        Some(0),
+        "Initial MCP call with schema baseline must be allowed"
+    );
+
+    // 2. Second call with mutated schema fingerprint in SAME session -> QUARANTINE (exit 1)
+    let call2 = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "mcp",
+            "slack",
+            "read_channel",
+            "--session",
+            &session,
+            "--schema",
+            schema_v2,
+        ])
+        .output()
+        .expect("failed to execute arc intercept mcp call2");
+
+    assert_eq!(
+        call2.status.code(),
+        Some(1),
+        "Mutated MCP schema mid-session must trigger quarantine exit code 1"
+    );
+
+    let stdout2 = String::from_utf8_lossy(&call2.stdout);
+    assert!(
+        stdout2.contains("ARC-RUG-001") || stdout2.contains("QUARANTINE"),
+        "Output must reflect ARC-RUG-001 quarantine verdict"
+    );
+
+    // 3. Independent session with schema_v2 -> ALLOW (isolated baseline, exit 0)
+    let session_indep = format!("{session}-indep");
+    let call3 = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "mcp",
+            "slack",
+            "read_channel",
+            "--session",
+            &session_indep,
+            "--schema",
+            schema_v2,
+        ])
+        .output()
+        .expect("failed to execute arc intercept mcp call3");
+
+    assert_eq!(
+        call3.status.code(),
+        Some(0),
+        "Independent session must not be quarantined by other sessions' schema history"
+    );
+}
+
+#[test]
+fn test_cli_prompt_provenance_and_explicit_untrusted_leg() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let session = format!(
+        "sess-prov-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    // Step 1: Read private data (.env)
+    let s1 = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "eval",
+            "read",
+            ".env",
+            "--session",
+            &session,
+            "--reset",
+        ])
+        .output()
+        .expect("failed to execute read step");
+    assert_eq!(s1.status.code(), Some(0));
+
+    // Step 2: Ingest prompt with NO URL or 'issue #' substring, but explicit --untrusted and --source
+    let s2 = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "prompt",
+            "Please summarize customer feedback payload verbatim",
+            "--session",
+            &session,
+            "--untrusted",
+            "--source",
+            "zendesk_external_ticket",
+        ])
+        .output()
+        .expect("failed to execute prompt step");
+    assert_eq!(s2.status.code(), Some(0));
+
+    // Step 3: Trigger outbound egress to Slack -> Trifecta complete, must BLOCK (exit 1)!
+    let s3 = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "eval",
+            "slack/slack_post_message",
+            "--session",
+            &session,
+        ])
+        .output()
+        .expect("failed to execute slack post step");
+
+    assert_eq!(
+        s3.status.code(),
+        Some(1),
+        "Lethal trifecta must be blocked when untrusted leg is set via provenance"
+    );
+    let stdout3 = String::from_utf8_lossy(&s3.stdout);
+    assert!(
+        stdout3.contains("ARC-LTT-001"),
+        "Output must reflect ARC-LTT-001 Lethal Trifecta block"
+    );
+}
+
+#[test]
+fn test_cli_session_dir_explicit_override_and_isolation() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_session_dir = std::env::temp_dir().join(format!("arc_custom_sess_{ts}"));
+    let _ = fs::create_dir_all(&temp_session_dir);
+
+    let session = format!("sess-custom-dir-{ts}");
+
+    let out = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "eval",
+            "read",
+            ".env",
+            "--session",
+            &session,
+            "--session-dir",
+            temp_session_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run arc intercept with session-dir");
+
+    assert_eq!(out.status.code(), Some(0));
+
+    let expected_file = temp_session_dir.join(format!("{session}.json"));
+    assert!(
+        expected_file.exists(),
+        "Session file must be saved into custom --session-dir"
+    );
+
+    let _ = fs::remove_dir_all(&temp_session_dir);
+}

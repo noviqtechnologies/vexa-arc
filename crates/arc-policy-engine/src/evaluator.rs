@@ -65,7 +65,7 @@ pub struct PolicyEvaluator {
     pub config: RwLock<PolicyConfig>,
     pub taint_tracker: TaintTracker,
     pub dlp_engine: SecretScanEngine,
-    known_schemas: RwLock<HashMap<String, [u8; 32]>>, // server name -> canonical JCS sha256
+    known_schemas: RwLock<HashMap<(String, String), [u8; 32]>>, // (session_id, server_name) -> canonical JCS sha256
 }
 
 impl Default for PolicyEvaluator {
@@ -89,7 +89,14 @@ impl PolicyEvaluator {
         dir: &std::path::Path,
         session_id: &str,
     ) -> std::io::Result<Option<crate::taint_dag::SessionTaintDag>> {
-        self.taint_tracker.load_session_from_disk(dir, session_id)
+        let res = self.taint_tracker.load_session_from_disk(dir, session_id)?;
+        if let Some(ref dag) = res {
+            let mut schemas = self.known_schemas.write().unwrap();
+            for (srv, hash) in &dag.known_schemas {
+                schemas.insert((session_id.to_string(), srv.clone()), *hash);
+            }
+        }
+        Ok(res)
     }
 
     pub fn save_session_state(
@@ -97,6 +104,14 @@ impl PolicyEvaluator {
         dir: &std::path::Path,
         session_id: &str,
     ) -> std::io::Result<std::path::PathBuf> {
+        let schemas = self.known_schemas.read().unwrap();
+        let session_schemas: HashMap<String, [u8; 32]> = schemas
+            .iter()
+            .filter(|((s_id, _), _)| s_id == session_id)
+            .map(|((_, srv), hash)| (srv.clone(), *hash))
+            .collect();
+        self.taint_tracker
+            .update_session_schemas(session_id, session_schemas);
         self.taint_tracker.save_session_to_disk(dir, session_id)
     }
 
@@ -105,6 +120,8 @@ impl PolicyEvaluator {
         dir: Option<&std::path::Path>,
         session_id: &str,
     ) -> std::io::Result<bool> {
+        let mut schemas = self.known_schemas.write().unwrap();
+        schemas.retain(|(s_id, _), _| s_id != session_id);
         self.taint_tracker.clear_session(dir, session_id)
     }
 
@@ -132,10 +149,11 @@ impl PolicyEvaluator {
                 };
             }
 
-            // Check Schema Rug-Pull
+            // Check Schema Rug-Pull (Session-scoped)
             if let Some(schema_hash) = server.schema_root {
                 let mut schemas = self.known_schemas.write().unwrap();
-                if let Some(known) = schemas.get(&server.config_name) {
+                let key = (session_id.clone(), server.config_name.clone());
+                if let Some(known) = schemas.get(&key) {
                     if known != &schema_hash {
                         return Verdict::Quarantine {
                             rule: RuleId("ARC-RUG-001".to_string()),
@@ -153,7 +171,7 @@ impl PolicyEvaluator {
                         };
                     }
                 } else {
-                    schemas.insert(server.config_name.clone(), schema_hash);
+                    schemas.insert(key, schema_hash);
                 }
             }
         }
@@ -169,16 +187,15 @@ impl PolicyEvaluator {
             }
         }
 
-        // 3. Update session taints with this action
-        self.taint_tracker
-            .record_action_and_update_taints(session_id, &event.action);
+        // 3. Update session taints with this action and explicit event provenance
+        self.taint_tracker.record_event_and_update_taints(event);
 
         // 4. Secret DLP Check on outbound arguments / prompt text
         let mut obligations = Vec::new();
         if cfg.redact_secrets {
             let bytes_to_scan = match &event.action {
                 Action::McpToolCall { arguments, .. } => arguments.to_string().into_bytes(),
-                Action::PromptSubmit { text } => text.as_bytes().to_vec(),
+                Action::PromptSubmit { text, .. } => text.as_bytes().to_vec(),
                 Action::Shell { command, .. } => command.as_bytes().to_vec(),
                 _ => Vec::new(),
             };
@@ -322,5 +339,84 @@ mod tests {
         assert!(loaded.allowed_mcp_servers.contains("custom-mcp"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_session_scoped_schema_rug_pull_isolation() {
+        let evaluator = PolicyEvaluator::default();
+
+        let schema_a = [1u8; 32];
+        let schema_b = [2u8; 32];
+
+        // Session 1 registers schema_a for "mcp-server"
+        let event_s1_a = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "session-1",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "mcp-server".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: Some(schema_a),
+                },
+                tool: "search".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let v1 = evaluator.evaluate(&event_s1_a);
+        assert!(
+            v1.is_allowed(),
+            "Session 1 initial schema should be allowed"
+        );
+
+        // Session 2 registers schema_b for "mcp-server" - independent session, should NOT be quarantined!
+        let event_s2_b = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "session-2",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "mcp-server".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: Some(schema_b),
+                },
+                tool: "search".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let v2 = evaluator.evaluate(&event_s2_b);
+        assert!(
+            v2.is_allowed(),
+            "Session 2 baseline should be independent of Session 1"
+        );
+
+        // Session 1 changes to schema_b mid-session - MUST be quarantined!
+        let event_s1_mutated = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "session-1",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "mcp-server".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: Some(schema_b),
+                },
+                tool: "search".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let v3 = evaluator.evaluate(&event_s1_mutated);
+        assert!(
+            v3.is_denied(),
+            "Mid-session mutation in Session 1 must be quarantined"
+        );
+        if let Verdict::Quarantine { rule, .. } = v3 {
+            assert_eq!(rule.0, "ARC-RUG-001");
+        } else {
+            panic!("Expected Quarantine verdict");
+        }
     }
 }

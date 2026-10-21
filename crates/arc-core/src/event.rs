@@ -94,6 +94,21 @@ pub enum Action {
     },
     PromptSubmit {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventProvenance {
+    #[default]
+    UserExplicit,
+    UntrustedExternal {
+        source: String,
+    },
+    TrustedInternal {
+        source: String,
     },
 }
 
@@ -113,6 +128,8 @@ pub struct ActionEvent {
     pub os_principal: OsPrincipal,
     pub phase: Phase,
     pub action: Action,
+    #[serde(default)]
+    pub provenance: EventProvenance,
 }
 
 impl ActionEvent {
@@ -132,6 +149,12 @@ impl ActionEvent {
             os_principal,
             phase,
             action,
+            provenance: EventProvenance::UserExplicit,
         }
+    }
+
+    pub fn with_provenance(mut self, provenance: EventProvenance) -> Self {
+        self.provenance = provenance;
+        self
     }
 }

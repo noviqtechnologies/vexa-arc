@@ -82,8 +82,10 @@ dependencies = [
  "arc-policy-engine",
  "chrono",
  "clap",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 
@@ -150,6 +152,7 @@ version = "1.0.0"
 dependencies = [
  "arc-core",
  "arc-policy-engine",
+ "hex",
  "serde",
  "serde_json",
  "thiserror",

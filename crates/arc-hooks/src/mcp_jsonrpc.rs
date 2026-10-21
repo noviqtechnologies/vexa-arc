@@ -25,6 +25,27 @@ impl McpJsonRpcInterceptor {
         let req: JsonRpcRequest =
             serde_json::from_slice(raw_bytes).map_err(|e| format!("Invalid JSON-RPC: {e}"))?;
 
+        let schema_root = if let Some(ref params) = req.params {
+            params
+                .get("_arc_schema_hash")
+                .or_else(|| params.get("schema_hash"))
+                .and_then(|h| h.as_str())
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| b.try_into().ok())
+                .or_else(|| {
+                    params
+                        .get("_arc_schema")
+                        .or_else(|| params.get("schema"))
+                        .and_then(|val| {
+                            serde_json::to_vec(val)
+                                .ok()
+                                .and_then(|bytes| arc_core::compute_jcs_schema_hash(&bytes).ok())
+                        })
+                })
+        } else {
+            None
+        };
+
         let action = if req.method == "tools/call" {
             let params = req.params.clone().unwrap_or(serde_json::Value::Null);
             let tool_name = params
@@ -41,7 +62,7 @@ impl McpJsonRpcInterceptor {
                 server: ServerIdentity {
                     config_name: server_name.to_string(),
                     artifact: Artifact::Unknown,
-                    schema_root: None,
+                    schema_root,
                 },
                 tool: tool_name,
                 arguments: args,
@@ -51,7 +72,7 @@ impl McpJsonRpcInterceptor {
                 server: ServerIdentity {
                     config_name: server_name.to_string(),
                     artifact: Artifact::Unknown,
-                    schema_root: None,
+                    schema_root,
                 },
                 tools_json: String::new(),
             }
@@ -178,5 +199,18 @@ mod tests {
         let content_str = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content_str.contains("ARC-LTT-001"));
         assert!(content_str.contains("Lethal Trifecta triggered"));
+    }
+
+    #[test]
+    fn test_mcp_jsonrpc_parse_with_schema_fingerprint() {
+        let req_json = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","_arc_schema_hash":"0101010101010101010101010101010101010101010101010101010101010101"}}"#;
+        let (_, event) =
+            McpJsonRpcInterceptor::parse_request(req_json, "fs", "session-schema-test").unwrap();
+
+        if let Action::McpToolCall { server, .. } = event.action {
+            assert_eq!(server.schema_root, Some([1u8; 32]));
+        } else {
+            panic!("Expected McpToolCall");
+        }
     }
 }

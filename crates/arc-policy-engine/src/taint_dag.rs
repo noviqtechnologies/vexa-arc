@@ -1,4 +1,4 @@
-use arc_core::event::Action;
+use arc_core::event::{Action, ActionEvent};
 use arc_core::taint::{SinkClass, Taint};
 use arc_core::verdict::Explanation;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,8 @@ pub struct SessionTaintDag {
     pub session_id: String,
     pub current_taints: Taint,
     pub history: Vec<TaintEntry>,
+    #[serde(default)]
+    pub known_schemas: HashMap<String, [u8; 32]>,
 }
 
 impl SessionTaintDag {
@@ -26,6 +28,7 @@ impl SessionTaintDag {
             session_id: session_id.into(),
             current_taints: Taint::empty(),
             history: Vec::new(),
+            known_schemas: HashMap::new(),
         }
     }
 
@@ -196,6 +199,13 @@ impl TaintTracker {
             .clone()
     }
 
+    pub fn update_session_schemas(&self, session_id: &str, schemas: HashMap<String, [u8; 32]>) {
+        let mut guard = self.sessions.write().unwrap();
+        if let Some(dag) = guard.get_mut(session_id) {
+            dag.known_schemas = schemas;
+        }
+    }
+
     pub fn record_action_and_update_taints(&self, session_id: &str, action: &Action) -> Taint {
         let (taint, origin) = Self::classify_action_taints(action);
         if !taint.is_empty() {
@@ -203,6 +213,18 @@ impl TaintTracker {
             let session = guard
                 .entry(session_id.to_string())
                 .or_insert_with(|| SessionTaintDag::new(session_id));
+            session.add_taint(taint, origin);
+        }
+        taint
+    }
+
+    pub fn record_event_and_update_taints(&self, event: &ActionEvent) -> Taint {
+        let (taint, origin) = Self::classify_event_taints(event);
+        if !taint.is_empty() {
+            let mut guard = self.sessions.write().unwrap();
+            let session = guard
+                .entry(event.host_session_id.clone())
+                .or_insert_with(|| SessionTaintDag::new(&event.host_session_id));
             session.add_taint(taint, origin);
         }
         taint
@@ -313,22 +335,48 @@ impl TaintTracker {
                     (Taint::empty(), String::new())
                 }
             }
-            Action::PromptSubmit { text } => {
+            Action::PromptSubmit { text, source } => {
+                let is_untrusted_source = source
+                    .as_deref()
+                    .map(|s| {
+                        let s_lower = s.to_lowercase();
+                        s_lower.contains("untrusted")
+                            || s_lower.contains("issue")
+                            || s_lower.contains("web")
+                            || s_lower.contains("pr")
+                            || s_lower.contains("external")
+                            || s_lower.contains("chat")
+                    })
+                    .unwrap_or(false);
+
                 let text_lower = text.to_lowercase();
-                if text_lower.contains("issue #")
+                let has_url_or_issue = text_lower.contains("issue #")
                     || text_lower.contains("http://")
-                    || text_lower.contains("https://")
-                {
-                    (
-                        Taint::UNTRUSTED_CONTENT,
-                        "prompt_with_external_url_or_issue".to_string(),
-                    )
+                    || text_lower.contains("https://");
+
+                if is_untrusted_source || has_url_or_issue {
+                    let origin = source
+                        .clone()
+                        .unwrap_or_else(|| "prompt_with_external_url_or_issue".to_string());
+                    (Taint::UNTRUSTED_CONTENT, origin)
                 } else {
                     (Taint::empty(), String::new())
                 }
             }
             _ => (Taint::empty(), String::new()),
         }
+    }
+
+    /// Classifies an ActionEvent taking into account explicit provenance metadata.
+    pub fn classify_event_taints(event: &ActionEvent) -> (Taint, String) {
+        let (mut taint, mut origin) = Self::classify_action_taints(&event.action);
+        if let arc_core::event::EventProvenance::UntrustedExternal { source } = &event.provenance {
+            taint.insert(Taint::UNTRUSTED_CONTENT);
+            if origin.is_empty() {
+                origin = format!("provenance:{source}");
+            }
+        }
+        (taint, origin)
     }
 
     /// Classifies the sink capability of an action.
