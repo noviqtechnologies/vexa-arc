@@ -459,7 +459,7 @@ mod tests {
 
         // 2. Path is a file, not a directory
         let temp_file = std::env::temp_dir().join("test_not_a_dir.txt");
-        let _ = fs::write(&temp_file, "content").unwrap();
+        fs::write(&temp_file, "content").unwrap();
         let err2 = scanner.audit_directory(&temp_file).unwrap_err();
         assert_eq!(err2.kind(), io::ErrorKind::InvalidInput);
         let _ = fs::remove_file(&temp_file);

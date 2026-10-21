@@ -502,11 +502,7 @@ fn test_cli_scan_secrets_exit_code_and_redaction() {
     // 6. Nonexistent file/path -> exit code 1
     let nonexistent_file = temp_dir.join("nonexistent.txt");
     let out_nonexistent = Command::new(arc_bin)
-        .args([
-            "scan-secrets",
-            "--path",
-            nonexistent_file.to_str().unwrap(),
-        ])
+        .args(["scan-secrets", "--path", nonexistent_file.to_str().unwrap()])
         .output()
         .expect("failed to run nonexistent path");
     assert_eq!(
@@ -694,6 +690,7 @@ fn test_cli_bom_and_audit_export_failures() {
 
     // Clean up permissions so temp_dir can be deleted
     let mut cleanup_perms = fs::metadata(&ro_file).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
     cleanup_perms.set_readonly(false);
     let _ = fs::set_permissions(&ro_file, cleanup_perms);
     let _ = fs::remove_dir_all(&temp_dir);
