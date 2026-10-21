@@ -1,4 +1,7 @@
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use arc_core::event::{
     Action, ActionEvent, AgentHost, Artifact, Ecosystem, OsPrincipal, Phase, ServerIdentity,
@@ -18,7 +21,9 @@ use arc_policy_engine::evaluator::PolicyEvaluator;
 #[test]
 fn test_e2e_discovery_and_cyclonedx_bom() {
     let scanner = DiscoveryScanner::new();
-    let report = scanner.audit_directory(Path::new("."));
+    let report = scanner
+        .audit_directory(Path::new("."))
+        .expect("audit_directory failed");
 
     // Performance target: < 1.2s
     assert!(
@@ -370,4 +375,326 @@ fn test_e2e_unapproved_mcp_server_block() {
         assert_eq!(rule.0, "ARC-MCP-001");
         assert!(explanation.summary.contains("Unapproved MCP server"));
     }
+}
+
+#[test]
+fn test_cli_scan_secrets_exit_code_and_redaction() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+
+    // 1. Stdin with secret -> exit code 1
+    let mut child = Command::new(arc_bin)
+        .arg("scan-secrets")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn arc scan-secrets");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("failed to open stdin")
+        .write_all(b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n")
+        .expect("failed to write to stdin");
+
+    let output = child.wait_with_output().expect("failed to read output");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Secret in stdin must exit with code 1"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("secret(s) detected"));
+    assert!(stdout.contains("SEC-AWS-001"));
+
+    // 2. Stdin with secret and --redact -> exit code 1 and vault token output
+    let mut child_redact = Command::new(arc_bin)
+        .args(["scan-secrets", "--redact"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn arc scan-secrets --redact");
+
+    child_redact
+        .stdin
+        .as_mut()
+        .expect("failed to open stdin")
+        .write_all(b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n")
+        .expect("failed to write to stdin");
+
+    let out_redact = child_redact
+        .wait_with_output()
+        .expect("failed to read output");
+    assert_eq!(
+        out_redact.status.code(),
+        Some(1),
+        "Secret in stdin with redact must exit with code 1"
+    );
+    let stdout_redact = String::from_utf8_lossy(&out_redact.stdout);
+    assert!(stdout_redact.contains("<ARC_VAULT_SECRET_01>"));
+
+    // 3. Stdin clean -> exit code 0
+    let mut child_clean = Command::new(arc_bin)
+        .arg("scan-secrets")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn arc scan-secrets clean");
+
+    child_clean
+        .stdin
+        .as_mut()
+        .expect("failed to open stdin")
+        .write_all(b"Hello world clean developer text without secrets\n")
+        .expect("failed to write to stdin");
+
+    let out_clean = child_clean
+        .wait_with_output()
+        .expect("failed to read output");
+    assert_eq!(
+        out_clean.status.code(),
+        Some(0),
+        "Clean stdin must exit with code 0"
+    );
+    let stdout_clean = String::from_utf8_lossy(&out_clean.stdout);
+    assert!(stdout_clean.contains("0 secrets detected"));
+
+    // 4. File scan with secret -> exit code 1
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("arc_test_secrets_{ts}"));
+    fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+    let secret_file = temp_dir.join("creds.env");
+    fs::write(
+        &secret_file,
+        "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n",
+    )
+    .unwrap();
+
+    let out_file_secret = Command::new(arc_bin)
+        .args(["scan-secrets", "--path", secret_file.to_str().unwrap()])
+        .output()
+        .expect("failed to run file scan");
+    assert_eq!(
+        out_file_secret.status.code(),
+        Some(1),
+        "Secret in file must exit with code 1"
+    );
+
+    // 5. Clean file -> exit code 0
+    let clean_file = temp_dir.join("clean.txt");
+    fs::write(&clean_file, "clean content\n").unwrap();
+
+    let out_file_clean = Command::new(arc_bin)
+        .args(["scan-secrets", "--path", clean_file.to_str().unwrap()])
+        .output()
+        .expect("failed to run clean file scan");
+    assert_eq!(
+        out_file_clean.status.code(),
+        Some(0),
+        "Clean file must exit with code 0"
+    );
+
+    // 6. Nonexistent file/path -> exit code 1
+    let nonexistent_file = temp_dir.join("nonexistent.txt");
+    let out_nonexistent = Command::new(arc_bin)
+        .args([
+            "scan-secrets",
+            "--path",
+            nonexistent_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run nonexistent path");
+    assert_eq!(
+        out_nonexistent.status.code(),
+        Some(1),
+        "Nonexistent path must exit with code 1"
+    );
+    let stderr_nonexistent = String::from_utf8_lossy(&out_nonexistent.stderr);
+    assert!(stderr_nonexistent.contains("does not exist"));
+
+    // 7. Directory scan with secret -> exit code 1
+    let out_dir_secret = Command::new(arc_bin)
+        .args(["scan-secrets", "--path", temp_dir.to_str().unwrap()])
+        .output()
+        .expect("failed to run directory scan");
+    assert_eq!(
+        out_dir_secret.status.code(),
+        Some(1),
+        "Directory with secret must exit with code 1"
+    );
+
+    // 8. Clean directory -> exit code 0
+    fs::remove_file(&secret_file).unwrap();
+    let out_dir_clean = Command::new(arc_bin)
+        .args(["scan-secrets", "--path", temp_dir.to_str().unwrap()])
+        .output()
+        .expect("failed to run clean dir scan");
+    assert_eq!(
+        out_dir_clean.status.code(),
+        Some(0),
+        "Clean directory must exit with code 0"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_cli_audit_path_validation_and_exit_code() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+
+    // 1. Nonexistent directory -> exit code 1, stderr error, no JSON report
+    let out_nonexistent = Command::new(arc_bin)
+        .args(["audit", "--path", "does-not-exist-dir-qa-12345", "--json"])
+        .output()
+        .expect("failed to execute arc audit");
+
+    assert_eq!(
+        out_nonexistent.status.code(),
+        Some(1),
+        "Audit of nonexistent path must exit with code 1"
+    );
+    let stderr = String::from_utf8_lossy(&out_nonexistent.stderr);
+    assert!(
+        stderr.contains("Cannot audit target path") || stderr.contains("does not exist"),
+        "stderr was: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out_nonexistent.stdout);
+    assert!(
+        !stdout.contains("\"total_assets\""),
+        "Must not emit clean audit report for invalid target"
+    );
+
+    // 2. Path pointing to a file (not a directory) -> exit code 1
+    let out_file = Command::new(arc_bin)
+        .args(["audit", "--path", "Cargo.toml", "--json"])
+        .output()
+        .expect("failed to execute arc audit on file");
+
+    assert_eq!(
+        out_file.status.code(),
+        Some(1),
+        "Audit of a file must exit with code 1"
+    );
+    let stderr_file = String::from_utf8_lossy(&out_file.stderr);
+    assert!(
+        stderr_file.contains("not a directory"),
+        "stderr was: {stderr_file}"
+    );
+
+    // 3. Valid directory -> exit code 0
+    let out_valid = Command::new(arc_bin)
+        .args(["audit", "--path", ".", "--json"])
+        .output()
+        .expect("failed to execute arc audit on valid dir");
+
+    assert_eq!(
+        out_valid.status.code(),
+        Some(0),
+        "Audit of valid dir must exit with code 0"
+    );
+    let stdout_valid = String::from_utf8_lossy(&out_valid.stdout);
+    assert!(stdout_valid.contains("\"total_assets\""));
+}
+
+#[test]
+fn test_cli_bom_and_audit_export_failures() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+
+    // 1. arc bom --out into nonexistent parent directory -> exit code 1
+    let out_bom_fail = Command::new(arc_bin)
+        .args(["bom", "--out", "qa-no-such-dir/bom.json"])
+        .output()
+        .expect("failed to run arc bom");
+
+    assert_eq!(
+        out_bom_fail.status.code(),
+        Some(1),
+        "BOM write to unwritable dir must exit with code 1"
+    );
+    let stderr_bom = String::from_utf8_lossy(&out_bom_fail.stderr);
+    assert!(
+        stderr_bom.contains("Error writing CycloneDX BOM"),
+        "stderr was: {stderr_bom}"
+    );
+
+    // 2. arc audit --output-bom into nonexistent parent directory -> exit code 1 and no success report
+    let out_audit_fail = Command::new(arc_bin)
+        .args(["audit", "--output-bom", "qa-no-such-dir/bom.json", "--json"])
+        .output()
+        .expect("failed to run arc audit with invalid output-bom");
+
+    assert_eq!(
+        out_audit_fail.status.code(),
+        Some(1),
+        "Audit with failed BOM export must exit with code 1"
+    );
+    let stderr_audit = String::from_utf8_lossy(&out_audit_fail.stderr);
+    assert!(
+        stderr_audit.contains("Error saving CycloneDX AI-BOM"),
+        "stderr was: {stderr_audit}"
+    );
+    let stdout_audit = String::from_utf8_lossy(&out_audit_fail.stdout);
+    assert!(
+        !stdout_audit.contains("\"total_assets\""),
+        "Must not print successful report after export failed"
+    );
+
+    // 3. arc bom --path nonexistent -> exit code 1
+    let out_bom_bad_path = Command::new(arc_bin)
+        .args(["bom", "--path", "qa-no-such-path-dir"])
+        .output()
+        .expect("failed to run arc bom bad path");
+
+    assert_eq!(
+        out_bom_bad_path.status.code(),
+        Some(1),
+        "BOM with nonexistent path must exit with code 1"
+    );
+
+    // 4. Read-only destination file for BOM export -> exit code 1
+    let ts_ro = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("arc_bom_ro_{ts_ro}"));
+    fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+    let ro_file = temp_dir.join("readonly_bom.json");
+    fs::write(&ro_file, "existing content").unwrap();
+
+    let mut perms = fs::metadata(&ro_file).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&ro_file, perms).unwrap();
+
+    let out_ro_bom = Command::new(arc_bin)
+        .args(["bom", "--out", ro_file.to_str().unwrap()])
+        .output()
+        .expect("failed to run arc bom on readonly file");
+
+    assert_eq!(
+        out_ro_bom.status.code(),
+        Some(1),
+        "Writing BOM to read-only destination must exit with code 1"
+    );
+
+    let out_ro_audit = Command::new(arc_bin)
+        .args(["audit", "--output-bom", ro_file.to_str().unwrap()])
+        .output()
+        .expect("failed to run arc audit on readonly bom file");
+
+    assert_eq!(
+        out_ro_audit.status.code(),
+        Some(1),
+        "Audit writing BOM to read-only destination must exit with code 1"
+    );
+
+    // Clean up permissions so temp_dir can be deleted
+    let mut cleanup_perms = fs::metadata(&ro_file).unwrap().permissions();
+    cleanup_perms.set_readonly(false);
+    let _ = fs::set_permissions(&ro_file, cleanup_perms);
+    let _ = fs::remove_dir_all(&temp_dir);
 }

@@ -3,6 +3,7 @@ use arc_dlp::detector::SecretScanEngine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +71,22 @@ impl DiscoveryScanner {
     }
 
     /// Performs zero-touch discovery of all AI assets, MCP servers, skills, and secrets.
-    pub fn audit_directory(&self, root: &Path) -> AuditReport {
+    pub fn audit_directory(&self, root: &Path) -> io::Result<AuditReport> {
+        if !root.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Target path does not exist: {}", root.display()),
+            ));
+        }
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Target path is not a directory: {}", root.display()),
+            ));
+        }
+        // Verify read permissions on root directory
+        let _ = fs::read_dir(root)?;
+
         let start = std::time::Instant::now();
         let mut mcp_servers = Vec::new();
         let mut agent_skills = Vec::new();
@@ -101,7 +117,7 @@ impl DiscoveryScanner {
 
         let total_assets = mcp_servers.len() + agent_skills.len() + model_assets.len();
 
-        AuditReport {
+        Ok(AuditReport {
             scanned_path: root.to_path_buf(),
             scan_duration_ms: elapsed,
             mcp_servers,
@@ -110,7 +126,7 @@ impl DiscoveryScanner {
             exposed_secrets,
             overall_risk_band: highest_band,
             total_assets,
-        }
+        })
     }
 
     fn scan_recursive(
@@ -430,5 +446,26 @@ mod tests {
 
         assert_eq!(model_assets.len(), 1);
         assert_eq!(model_assets[0].kind, "onnx");
+    }
+
+    #[test]
+    fn test_audit_directory_validation() {
+        let scanner = DiscoveryScanner::new();
+
+        // 1. Nonexistent directory
+        let non_existent = Path::new("target").join("non_existent_dir_qa_12345");
+        let err = scanner.audit_directory(&non_existent).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        // 2. Path is a file, not a directory
+        let temp_file = std::env::temp_dir().join("test_not_a_dir.txt");
+        let _ = fs::write(&temp_file, "content").unwrap();
+        let err2 = scanner.audit_directory(&temp_file).unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_file(&temp_file);
+
+        // 3. Valid directory
+        let res = scanner.audit_directory(Path::new("."));
+        assert!(res.is_ok());
     }
 }

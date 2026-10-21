@@ -235,13 +235,19 @@ fn main() {
             json,
             output_bom,
         } => {
-            run_audit(&path, json, output_bom.as_deref());
+            if !run_audit(&path, json, output_bom.as_deref()) {
+                std::process::exit(1);
+            }
         }
         Commands::Bom { path, out } => {
-            run_bom(&path, out.as_deref());
+            if !run_bom(&path, out.as_deref()) {
+                std::process::exit(1);
+            }
         }
         Commands::ScanSecrets { path, redact } => {
-            run_scan_secrets(path.as_deref(), redact);
+            if !run_scan_secrets(path.as_deref(), redact) {
+                std::process::exit(1);
+            }
         }
         Commands::Shield { action } => match action {
             ShieldAction::Check {
@@ -431,28 +437,40 @@ fn main() {
     }
 }
 
-fn run_audit(path: &Path, output_json: bool, bom_file: Option<&Path>) {
+fn run_audit(path: &Path, output_json: bool, bom_file: Option<&Path>) -> bool {
     let scanner = DiscoveryScanner::new();
-    let report = scanner.audit_directory(path);
+    let report = match scanner.audit_directory(path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: Cannot audit target path '{}': {e}", path.display());
+            return false;
+        }
+    };
 
     if let Some(bom_path) = bom_file {
         let bom = generate_cyclonedx_1_6_bom(&report);
-        if let Ok(json_str) = serde_json::to_string_pretty(&bom) {
-            if let Err(e) = fs::write(bom_path, json_str) {
-                eprintln!(
-                    "Error saving CycloneDX AI-BOM to {}: {e}",
-                    bom_path.display()
-                );
-            } else {
-                println!("Exported CycloneDX v1.6 AI-BOM to {}", bom_path.display());
+        let json_str = match serde_json::to_string_pretty(&bom) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error serializing CycloneDX AI-BOM: {e}");
+                return false;
             }
+        };
+        if let Err(e) = fs::write(bom_path, json_str) {
+            eprintln!(
+                "Error saving CycloneDX AI-BOM to {}: {e}",
+                bom_path.display()
+            );
+            return false;
+        } else {
+            println!("Exported CycloneDX v1.6 AI-BOM to {}", bom_path.display());
         }
     }
 
     if output_json {
         let json_str = serde_json::to_string_pretty(&report).unwrap_or_default();
         println!("{json_str}");
-        return;
+        return true;
     }
 
     // Terminal Summary
@@ -536,34 +554,48 @@ fn run_audit(path: &Path, output_json: bool, bom_file: Option<&Path>) {
         }
     }
     println!("=======================================================\n");
+    true
 }
 
-fn run_bom(path: &Path, out: Option<&Path>) {
+fn run_bom(path: &Path, out: Option<&Path>) -> bool {
     let scanner = DiscoveryScanner::new();
-    let report = scanner.audit_directory(path);
+    let report = match scanner.audit_directory(path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: Cannot scan target path '{}': {e}", path.display());
+            return false;
+        }
+    };
     let bom = generate_cyclonedx_1_6_bom(&report);
-    let json_str = serde_json::to_string_pretty(&bom).unwrap_or_default();
+    let json_str = match serde_json::to_string_pretty(&bom) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error serializing CycloneDX BOM: {e}");
+            return false;
+        }
+    };
 
     if let Some(out_path) = out {
         if let Err(e) = fs::write(out_path, json_str) {
             eprintln!("Error writing CycloneDX BOM to {}: {e}", out_path.display());
+            false
         } else {
             println!("Saved CycloneDX v1.6 AI-BOM to {}", out_path.display());
+            true
         }
     } else {
         println!("{json_str}");
+        true
     }
 }
 
-fn collect_scan_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+fn collect_scan_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) -> io::Result<()> {
     if depth > 10 {
-        return;
+        return Ok(());
     }
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
+    let entries = fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if file_name == ".git"
@@ -575,28 +607,33 @@ fn collect_scan_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
             continue;
         }
         if path.is_dir() {
-            collect_scan_files(&path, depth + 1, files);
+            let _ = collect_scan_files(&path, depth + 1, files);
         } else if path.is_file() {
             files.push(path);
         }
     }
+    Ok(())
 }
 
-fn run_scan_secrets(path: Option<&Path>, redact: bool) {
+fn run_scan_secrets(path: Option<&Path>, redact: bool) -> bool {
     let engine = SecretScanEngine::new();
     let vault = LocalPseudonymizationVault::new();
 
     if let Some(p) = path {
         if !p.exists() {
             eprintln!("Error: Target path does not exist: {}", p.display());
-            return;
+            return false;
         }
 
         if p.is_dir() {
             let mut files = Vec::new();
-            collect_scan_files(p, 0, &mut files);
+            if let Err(e) = collect_scan_files(p, 0, &mut files) {
+                eprintln!("Error reading directory {}: {e}", p.display());
+                return false;
+            }
             let mut total_findings = 0;
             let mut files_scanned = 0;
+            let mut read_errors = 0;
 
             for file_path in &files {
                 match fs::read(file_path) {
@@ -630,61 +667,75 @@ fn run_scan_secrets(path: Option<&Path>, redact: bool) {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed reading {}: {e}", file_path.display());
+                        eprintln!("Error: Failed reading {}: {e}", file_path.display());
+                        read_errors += 1;
                     }
                 }
             }
 
-            if total_findings == 0 {
+            if total_findings == 0 && read_errors == 0 {
                 println!("Scan complete: 0 secrets detected across {files_scanned} file(s).");
+                true
             } else {
+                if total_findings > 0 {
+                    println!(
+                        "Scan complete: {total_findings} secret(s) detected across {files_scanned} file(s)!"
+                    );
+                }
+                false
+            }
+        } else if p.is_file() {
+            // Single file scan
+            let raw_bytes = match fs::read(p) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("Error: Failed to read {}: {e}", p.display());
+                    return false;
+                }
+            };
+
+            let findings = engine.scan(&raw_bytes);
+            if findings.is_empty() {
+                println!("Scan complete: 0 secrets detected.");
+                return true;
+            }
+
+            println!("Scan complete: {} secret(s) detected!", findings.len());
+            for f in &findings {
                 println!(
-                    "Scan complete: {total_findings} secret(s) detected across {files_scanned} file(s)!"
+                    "• Detector: {:<12} Offset: {}..{} Snippet: {}",
+                    f.detector, f.start, f.end, f.snippet
                 );
             }
-            return;
-        }
 
-        // Single file scan
-        let raw_bytes = match fs::read(p) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Failed to read {}: {e}", p.display());
-                return;
+            if redact {
+                let (redacted, tokens) = vault.redact_and_vault("cli-scan", &raw_bytes, &findings);
+                println!("\n--- Redacted Output (Vault tokens attached) ---");
+                println!("{}", String::from_utf8_lossy(&redacted));
+                println!("\nVault Tokens Registered ({}):", tokens.len());
+                for t in tokens {
+                    println!("  • Token: {:<24} Detector: {}", t.token, t.detector);
+                }
             }
-        };
-
-        let findings = engine.scan(&raw_bytes);
-        if findings.is_empty() {
-            println!("Scan complete: 0 secrets detected.");
-            return;
-        }
-
-        println!("Scan complete: {} secret(s) detected!", findings.len());
-        for f in &findings {
-            println!(
-                "• Detector: {:<12} Offset: {}..{} Snippet: {}",
-                f.detector, f.start, f.end, f.snippet
+            false
+        } else {
+            eprintln!(
+                "Error: Target path is not a regular file or directory: {}",
+                p.display()
             );
-        }
-
-        if redact {
-            let (redacted, tokens) = vault.redact_and_vault("cli-scan", &raw_bytes, &findings);
-            println!("\n--- Redacted Output (Vault tokens attached) ---");
-            println!("{}", String::from_utf8_lossy(&redacted));
-            println!("\nVault Tokens Registered ({}):", tokens.len());
-            for t in tokens {
-                println!("  • Token: {:<24} Detector: {}", t.token, t.detector);
-            }
+            false
         }
     } else {
         let mut buffer = Vec::new();
-        let _ = io::stdin().read_to_end(&mut buffer);
+        if let Err(e) = io::stdin().read_to_end(&mut buffer) {
+            eprintln!("Error reading stdin: {e}");
+            return false;
+        }
 
         let findings = engine.scan(&buffer);
         if findings.is_empty() {
             println!("Scan complete: 0 secrets detected.");
-            return;
+            return true;
         }
 
         println!("Scan complete: {} secret(s) detected!", findings.len());
@@ -704,6 +755,7 @@ fn run_scan_secrets(path: Option<&Path>, redact: bool) {
                 println!("  • Token: {:<24} Detector: {}", t.token, t.detector);
             }
         }
+        false
     }
 }
 
@@ -1308,14 +1360,14 @@ mod tests {
     #[test]
     fn test_cli_audit_execution() {
         let scanner = DiscoveryScanner::new();
-        let report = scanner.audit_directory(Path::new("."));
+        let report = scanner.audit_directory(Path::new(".")).unwrap();
         assert!(report.scan_duration_ms < 5000);
     }
 
     #[test]
     fn test_scan_secrets_directory_collection() {
         let mut files = Vec::new();
-        collect_scan_files(Path::new("src"), 0, &mut files);
+        collect_scan_files(Path::new("src"), 0, &mut files).unwrap();
         assert!(!files.is_empty(), "Must collect files from directory");
     }
 

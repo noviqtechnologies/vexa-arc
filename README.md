@@ -3,7 +3,7 @@
 [![Rust Edition](https://img.shields.io/badge/Rust-2021%20Edition-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-brightgreen.svg)](#cross-platform-installation--setup)
-[![Tests](https://img.shields.io/badge/Tests-46%2F46%20Passing-success.svg)](#automated-tests--verification)
+[![Tests](https://img.shields.io/badge/Tests-49%2F49%20Passing-success.svg)](#automated-tests--verification)
 [![CycloneDX](https://img.shields.io/badge/CycloneDX-v1.6%20AI--BOM-blueviolet?logo=owasp&logoColor=white)](#2-live-cyclonedx-v16-ai-bom-export-arc-bom)
 [![Docs](https://img.shields.io/badge/Docs-Guides%20%26%20Reference-blueviolet?logo=read-the-docs&logoColor=white)](#-documentation--workflow-guides)
 
@@ -35,7 +35,7 @@
 | 🔍 [**Zero-Touch AI Asset Discovery**](#4-zero-touch-ai-spm--asset-discovery-arc-audit) | Exhaustive multi-origin scanner discovering local models, agent rules (`.cursorrules`, `CLAUDE.md`), and MCP configs in $< 1.2\text{ s}$ with zero network egress. | `arc audit` |
 | 🛡️ [**Prompt Injection Sanitizer**](#6-inbound-prompt-injection-sanitization--nonce-spotlighting) | Strips invisible Unicode tags, Trojan Source bidi overrides, and wraps untrusted external context in cryptographic nonce boundaries. | `arc intercept prompt "https://issue/42"` |
 | 🔄 [**Dynamic Schema Rug-Pull Quarantine**](#7-mcp-host-adapters--self-explaining-json-rpc-interceptors) | Computes RFC 8785 JSON Canonicalization Scheme (JCS) SHA-256 hashes of MCP schemas to halt runtime privilege escalation attempts. | `arc intercept mcp slack read` |
-| 🚦 [**CI/CD Quality Gates & Exit Codes**](#8-cicd-quality-gates--policy-enforcement) | Deterministic exit codes (`0` on permit, `1` on block/quarantine) with structured JSON-RPC remediation options for automated agent self-healing. | `arc audit --json` |
+| 🚦 [**CI/CD Quality Gates & Exit Codes**](#8-cicd-quality-gates--policy-enforcement) | Deterministic exit codes (`0` = permitted / no violations, `1` = blocked, secret findings, invalid scan paths, or failed artifact exports) with structured JSON-RPC remediation options for automated agent self-healing. | `arc audit --json` |
 
 > [!TIP]
 > **Try It in 30 Seconds**:
