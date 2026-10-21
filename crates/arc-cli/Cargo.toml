@@ -1,0 +1,27 @@
+[package]
+name = "arc-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arc"
+path = "src/main.rs"
+
+[[test]]
+name = "integration_tests"
+path = "../../tests/integration_tests.rs"
+
+[dependencies]
+arc-core = { path = "../arc-core" }
+arc-dlp = { path = "../arc-dlp" }
+arc-policy-engine = { path = "../arc-policy-engine" }
+arc-discover = { path = "../arc-discover" }
+arc-firewall = { path = "../arc-firewall" }
+arc-hooks = { path = "../arc-hooks" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

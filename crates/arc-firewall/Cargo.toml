@@ -1,0 +1,13 @@
+[package]
+name = "arc-firewall"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-core = { path = "../arc-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strsim = { workspace = true }
+thiserror = { workspace = true }

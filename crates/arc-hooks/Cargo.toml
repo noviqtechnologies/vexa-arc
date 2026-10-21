@@ -1,0 +1,13 @@
+[package]
+name = "arc-hooks"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-core = { path = "../arc-core" }
+arc-policy-engine = { path = "../arc-policy-engine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  # ── 1. Clean Reproducibility Job (No Cache) ──────────────────────────────────
+  clean-reproducibility:
+    name: Clean Container Validation (No Cache)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+          components: clippy, rustfmt
+
+      - name: Print Exact Toolchain Versions
+        run: |
+          echo "=== Pinned Toolchain Diagnostics ==="
+          rustc --version
+          cargo --version
+
+      - name: Format Check
+        run: cargo fmt --check
+
+      - name: Clippy Linter (Deny Warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build Binary from Scratch
+        run: cargo build --release --locked
+
+      - name: Full Test Suite
+        run: cargo test --release --all-targets --locked
+
+  # ── 2. Multi-OS Matrix with Caching Optimization ─────────────────────────────
+  test-matrix:
+    name: Test Matrix (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+          components: clippy, rustfmt
+
+      - name: Print Toolchain Versions
+        shell: bash
+        run: |
+          echo "=== Toolchain Versions ==="
+          rustc --version
+          cargo --version
+
+      - name: Cache dependencies (Optimization only)
+        uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+
+      - name: Check code formatting
+        run: cargo fmt --check
+
+      - name: Run clippy linter
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run all tests
+        run: cargo test --all-targets

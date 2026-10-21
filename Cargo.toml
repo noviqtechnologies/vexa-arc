@@ -1,3 +1,33 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+    "crates/arc-core",
+    "crates/arc-dlp",
+    "crates/arc-policy-engine",
+    "crates/arc-discover",
+    "crates/arc-firewall",
+    "crates/arc-hooks",
+    "crates/arc-cli",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+authors = ["Vexa Arc Core Team <contact@vexasec.io>"]
+license = "Apache-2.0"
+repository = "https://github.com/noviqtechnologies/vexa-arc"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_jcs = "0.2"
+sha2 = "0.10"
+uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
+bitflags = { version = "2.6", features = ["serde"] }
+aho-corasick = "1.1"
+regex = "1.10"
+strsim = "0.11"
+thiserror = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"

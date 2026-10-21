@@ -1,0 +1,17 @@
+[package]
+name = "arc-dlp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-core = { path = "../arc-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+aho-corasick = { workspace = true }
+regex = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
