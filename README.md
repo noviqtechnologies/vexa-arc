@@ -42,10 +42,14 @@
 > 
 > **1. Global Installation (Single Command via Cargo):**
 > ```bash
-> cargo install --git https://github.com/noviqtechnologies/vexa-arc.git crates/arc-cli
+> cargo install --git https://github.com/noviqtechnologies/vexa-arc.git arc-cli
 > 
-> # Audit any project or workstation instantly:
+> # Navigate to any repository or project and audit:
+> cd /path/to/your-project
 > arc audit
+> 
+> # Or audit any workspace directly from anywhere:
+> arc audit --path ./my-project
 > ```
 > 
 > **2. Evaluate from Source in this Cloned Repository:**
@@ -150,16 +154,30 @@ sudo mv bin/arc /usr/local/bin/
 arc --version
 ```
 
-#### Windows
-Download `vexa-arc-v1.0.0-windows-x86_64.zip` from [GitHub Releases](https://github.com/noviqtechnologies/vexa-arc/releases), extract `arc.exe`, and add to your `PATH`.
+#### Windows (PowerShell)
+```powershell
+# Download Windows x86_64 binary
+Invoke-WebRequest -Uri "https://github.com/noviqtechnologies/vexa-arc/releases/latest/download/vexa-arc-v1.0.0-windows-x86_64.zip" -OutFile "arc.zip"
+Expand-Archive -Path "arc.zip" -DestinationPath "$HOME\.arc" -Force
+
+# Add to user PATH (persisted for future sessions)
+[Environment]::SetEnvironmentVariable("Path", $env:Path + ";$HOME\.arc\bin", [EnvironmentVariableTarget]::User)
+$env:Path += ";$HOME\.arc\bin"
+
+# Verify installation
+arc --version
+```
 
 ---
 
 ### Option 3: Install via Cargo
 
 ```bash
-cargo install --git https://github.com/noviqtechnologies/vexa-arc.git crates/arc-cli
+cargo install --git https://github.com/noviqtechnologies/vexa-arc.git arc-cli
 arc --version
+
+# Audit a project repository:
+arc audit --path /path/to/project
 ```
 
 ---
