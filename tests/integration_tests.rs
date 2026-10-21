@@ -219,3 +219,156 @@ fn test_e2e_inbound_prompt_injection_sanitization_and_spotlighting() {
     )));
     assert!(spotlighted.ends_with(&format!("<<<END_ARC_UNTRUSTED_CONTENT_{nonce}>>>")));
 }
+
+#[test]
+fn test_e2e_extended_secret_detection_and_redaction() {
+    let dlp = SecretScanEngine::new();
+    let vault = LocalPseudonymizationVault::new();
+    let session = "sess-extended-secrets";
+
+    let stripe_key = format!("{}_{}_{}", "sk", "live", "51AbcdefghijklmnopQRST123456");
+    let payload_str = format!(
+        "Stripe: {}\nGCP: AIzaSyD98765432101234567890123456789012\nDB: postgres://admin:super_secret_pw@db.internal:5432\n",
+        stripe_key
+    );
+    let payload = payload_str.as_bytes();
+
+    let findings = dlp.scan(payload);
+    assert_eq!(
+        findings.len(),
+        3,
+        "Stripe, GCP, and DB URI must be detected"
+    );
+
+    let (redacted, tokens) = vault.redact_and_vault(session, payload, &findings);
+    let text = String::from_utf8(redacted).unwrap();
+
+    assert!(text.contains("<ARC_VAULT_SECRET_01>"));
+    assert!(text.contains("<ARC_VAULT_SECRET_02>"));
+    assert!(text.contains("<ARC_VAULT_SECRET_03>"));
+    assert!(!text.contains(&stripe_key));
+    assert!(!text.contains("AIzaSyD98765432101234567890123456789012"));
+
+    assert_eq!(tokens.len(), 3);
+}
+
+#[test]
+fn test_e2e_cross_platform_package_manager_shimming() {
+    // 1. Go Get
+    let go_pkgs = PackageFirewall::parse_command("go get github.com/gin-gonic/gin");
+    assert_eq!(go_pkgs.len(), 1);
+    assert_eq!(go_pkgs[0].0, Ecosystem::Go);
+    assert_eq!(go_pkgs[0].1, "github.com/gin-gonic/gin");
+
+    // 2. Python -m pip
+    let py_pkgs = PackageFirewall::parse_command("python -m pip install pydantic fastapi");
+    assert_eq!(py_pkgs.len(), 2);
+    assert_eq!(py_pkgs[0].0, Ecosystem::Pypi);
+    assert_eq!(py_pkgs[0].1, "pydantic");
+    assert_eq!(py_pkgs[1].1, "fastapi");
+
+    // 3. Pnpm / Yarn
+    let pnpm_pkgs = PackageFirewall::parse_command("pnpm add vue");
+    assert_eq!(pnpm_pkgs.len(), 1);
+    assert_eq!(pnpm_pkgs[0].0, Ecosystem::Npm);
+    assert_eq!(pnpm_pkgs[0].1, "vue");
+}
+
+#[test]
+fn test_e2e_dynamic_schema_rug_pull_quarantine() {
+    let evaluator = PolicyEvaluator::default();
+    let session = "sess-rug-pull-test";
+
+    let initial_schema_hash = [1u8; 32];
+    let mutated_schema_hash = [2u8; 32];
+
+    // Call 1: Server operates under initial verified schema
+    let event1 = ActionEvent::new(
+        AgentHost::ClaudeCode,
+        session,
+        OsPrincipal::Uid(1000),
+        Phase::Pre,
+        Action::McpToolCall {
+            server: ServerIdentity {
+                config_name: "doc-search".to_string(),
+                artifact: Artifact::Unknown,
+                schema_root: Some(initial_schema_hash),
+            },
+            tool: "search_docs".to_string(),
+            arguments: serde_json::json!({"query": "rust"}),
+        },
+    );
+    let v1 = evaluator.evaluate(&event1);
+    assert!(
+        v1.is_allowed(),
+        "Initial schema should be permitted and recorded"
+    );
+
+    // Call 2: Server dynamically mutates tool schema mid-session
+    let event2 = ActionEvent::new(
+        AgentHost::ClaudeCode,
+        session,
+        OsPrincipal::Uid(1000),
+        Phase::Pre,
+        Action::McpToolCall {
+            server: ServerIdentity {
+                config_name: "doc-search".to_string(),
+                artifact: Artifact::Unknown,
+                schema_root: Some(mutated_schema_hash),
+            },
+            tool: "search_docs".to_string(),
+            arguments: serde_json::json!({"query": "rust"}),
+        },
+    );
+    let v2 = evaluator.evaluate(&event2);
+    assert!(v2.is_denied(), "Mutated tool schema must be quarantined");
+    if let Verdict::Quarantine { rule, explanation } = v2 {
+        assert_eq!(rule.0, "ARC-RUG-001");
+        assert!(explanation
+            .summary
+            .contains("Dynamic Schema Rug-Pull detected"));
+    }
+}
+
+#[test]
+fn test_e2e_unapproved_mcp_server_block() {
+    use arc_policy_engine::evaluator::PolicyConfig;
+    use std::collections::HashSet;
+
+    let mut allowed = HashSet::new();
+    allowed.insert("approved-mcp".to_string());
+
+    let cfg = PolicyConfig {
+        allowed_mcp_servers: allowed,
+        block_unapproved_mcp: true,
+        enforce_taint_dag: true,
+        redact_secrets: true,
+    };
+
+    let evaluator = PolicyEvaluator::new(cfg);
+    let session = "sess-mcp-whitelist-test";
+
+    // Calling unapproved MCP server
+    let event = ActionEvent::new(
+        AgentHost::ClaudeCode,
+        session,
+        OsPrincipal::Uid(1000),
+        Phase::Pre,
+        Action::McpToolCall {
+            server: ServerIdentity {
+                config_name: "unauthorized-remote-mcp".to_string(),
+                artifact: Artifact::Unknown,
+                schema_root: None,
+            },
+            tool: "execute".to_string(),
+            arguments: serde_json::json!({}),
+        },
+    );
+
+    let verdict = evaluator.evaluate(&event);
+    assert!(verdict.is_denied(), "Unapproved MCP server must be denied");
+    if let Verdict::Deny { rule, explanation } = verdict {
+        assert_eq!(rule.0, "ARC-MCP-001");
+        assert!(explanation.summary.contains("Unapproved MCP server"));
+    }
+}

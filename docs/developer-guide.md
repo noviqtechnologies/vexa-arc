@@ -181,13 +181,23 @@ Quantifies the "Lethal Trifecta" dimensions ($0\text{--}1000$):
 ### Multi-Stage Secret Detector
 
 The detection engine combines:
-1. **Aho-Corasick Multi-Pattern Prefilter:** Quickly identifies candidate keywords (`AKIA`, `ghp_`, `sk-ant-`, `sk-proj-`, `xoxb-`, `-----BEGIN`).
-2. **Linear-Time Anchored Regex:** Confirms structural token boundaries.
-3. **Shannon & Normalized Entropy:** Ensures false-positive resistance ($H(X) \ge 4.2$).
+1. **Aho-Corasick Multi-Pattern Prefilter:** Quickly identifies candidate keywords in linear time ($< 0.1\text{ ms}$):
+   - AWS Access Key IDs (`AKIA`) and Session Keys (`ASIA`)
+   - GitHub Personal Access Tokens (`ghp_`, `github_pat_`)
+   - Anthropic API Keys (`sk-ant-api`) and OpenAI Keys (`sk-proj-`)
+   - Slack Bot Tokens (`xoxb-`)
+   - Cryptographic Private Keys (`-----BEGIN RSA/EC/OPENSSH/DSA PRIVATE KEY-----`)
+   - JSON Web Tokens (`eyJ`)
+   - Stripe Live Secret and Restricted Keys (`sk_live_`, `rk_live_`)
+   - Google Cloud API Keys (`AIza`)
+   - PyPI API Tokens (`pypi-`) and npm Access Tokens (`npm_`)
+   - Database Connection Strings (`postgres://`, `postgresql://`, `mysql://`, `mongodb://`, `redis://`)
+2. **Linear-Time Anchored Regex:** Confirms structural token boundaries and format validation.
+3. **Shannon & Normalized Entropy:** Ensures false-positive resistance ($H(X) \ge 4.2$, normalized entropy $H_{\text{norm}} \ge 0.85$).
 
 ### Inbound Prompt Injection Sanitization & Nonce Delimitation
 
-* **Unicode Stripping:** Eliminates invisible Unicode tags (`U+E0000`..`U+E007F`), zero-width joiners/spaces, and Trojan Source bidi overrides (`U+202A`..`U+202E`).
+* **Unicode Stripping:** Eliminates invisible Unicode tags (`U+E0000`..`U+E007F`), zero-width joiners/spaces (`U+200B`, `U+200C`, `U+200D`, `U+2060`, `U+FEFF`), Trojan Source bidi overrides (`U+202A`..`U+202E`, `U+2066`..`U+2069`), and variation selectors (`U+FE00`..`U+FE0F`, `U+E0100`..`U+E01EF`).
 * **Cryptographic Spotlighting:** Encloses external content inside random 128-bit hex nonce boundaries (`<<<ARC_UNTRUSTED_CONTENT_<nonce> source="<source>">>>`), escaping nested occurrences.
 
 ### Local Pseudonymization Vault
@@ -203,11 +213,25 @@ Provides the `LocalPseudonymizationVault`:
 
 The policy engine tracks chronological agent interactions as a **Directed Acyclic Graph (DAG)** maintained in `SessionTaintDag` instances indexed by `session_id`.
 
+### Policy Configuration & Custom Allow-Lists (`PolicyConfig`)
+
+Projects can customize runtime governance by placing `.arc/policy.json` or `.arc.json` in their repository root:
+```json
+{
+  "allowed_mcp_servers": ["github", "local-filesystem", "git", "sqlite"],
+  "block_unapproved_mcp": false,
+  "enforce_taint_dag": true,
+  "redact_secrets": true
+}
+```
+`PolicyConfig::load_from_dir(&Path)` automatically resolves project-level configurations, falling back to defaults if omitted.
+
 ### Why a Directed Acyclic Graph (DAG)?
 
 * **Causality & Flow Modeling:** An agent's workflow consists of sequential context-building steps (e.g. `FileRead(.env)` $\to$ `IngestPrompt(web_url)` $\to$ `McpCall(slack)`). Modeling this as a directed graph ensures that policy enforcement preserves causal ancestry—Arc knows *which* prior events contributed to the current action request.
 * **Strict Acyclicity:** Session time and state progression move monotonically forward. Because actions cannot alter past history, the graph is acyclic by design, preventing infinite traversal loops and guaranteeing deterministic, linear-time evaluation ($O(1)$ bitmask checks).
 * **Monotonic Accumulation:** Taint labels are accumulated additively into a bitmask (`u16`). Once `PRIVATE_DATA` or `UNTRUSTED_CONTENT` is introduced into a session, the taint persists until the session is explicitly reset (`arc intercept session <id> --reset`).
+* **Cross-OS Path Normalization:** Paths in `Action::FileRead` are normalized across backslashes (`\`) and forward slashes (`/`), ensuring secrets (`.env`, `.ssh/id_ed25519`, `.aws`) trigger `PRIVATE_DATA | SECRET_MATERIAL` identically across Windows, macOS, and Linux.
 
 **Lethal Trifecta Condition:**
 $$\text{SessionTaints} \supseteq (\text{PRIVATE\_DATA} \cup \text{UNTRUSTED\_CONTENT}) \quad \land \quad \text{SinkClass} \supseteq \text{EXTERNAL\_EGRESS}$$
@@ -218,8 +242,8 @@ When this invariant is triggered, `evaluator.evaluate()` immediately emits `Rule
 
 ## 6. Asset Discovery & CycloneDX v1.6 AI-BOM (`arc-discover`)
 
-- `DiscoveryScanner::audit_directory(&Path) -> AuditReport`: Walks directory structures, parses `.cursor/mcp.json`, `.claude.json`, Windsurf configs, skills (`CLAUDE.md`, `.cursorrules`), and model checkpoints (`.gguf`, `.safetensors`).
-- `generate_cyclonedx_1_6_bom(&AuditReport) -> CycloneDxBom`: Serializes to official CycloneDX v1.6 specification with `ai-model`, `agent-skill`, and `mcp-server` services.
+- `DiscoveryScanner::audit_directory(&Path) -> AuditReport`: Walks directory structures, parses `.cursor/mcp.json`, `.claude.json`, Claude Desktop configs, Windsurf configs, agent skills (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`, `.cursor/rules/*.mdc`, `.prompt.md`), and model checkpoints (`.gguf`, `.safetensors`, `.onnx`, `.pt`, `.bin`).
+- `generate_cyclonedx_1_6_bom(&AuditReport) -> CycloneDxBom`: Serializes to official CycloneDX v1.6 specification with `machine-learning-model` components, `data` components for skills, and `services` for MCP servers.
 
 ---
 
@@ -230,6 +254,15 @@ The 4-gate compound scoring engine (`CompoundAntiSlopsquatEngine`):
 2. **Phantom Watchlist Gate:** Blocks packages on hallucination / recent 404 watchlists.
 3. **Typosquat Gate:** Blocks packages with Levenshtein $\le 2$ or Jaro-Winkler $\ge 0.92$ against top popular packages.
 4. **Provenance Gate:** Blocks packages lacking active repository history ($0$ stars, $0$ commits).
+
+Package command interceptors (`PackageFirewall::parse_command`) support:
+- `npm install`, `npm i`, `npm add`
+- `pnpm add`, `pnpm install`
+- `yarn add`
+- `pip install`, `uv add`, `uv pip install`
+- `python -m pip install`, `python3 -m pip install`
+- `cargo add`
+- `go get`
 
 ---
 

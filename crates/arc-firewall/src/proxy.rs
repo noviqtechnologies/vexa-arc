@@ -129,6 +129,23 @@ impl PackageFirewall {
                     out.push((Ecosystem::Cargo, arg.to_string()));
                 }
             }
+        } else if parts[0] == "go" && parts.len() > 1 && parts[1] == "get" {
+            for &arg in &parts[2..] {
+                if !arg.starts_with('-') {
+                    out.push((Ecosystem::Go, arg.to_string()));
+                }
+            }
+        } else if (parts[0] == "python" || parts[0] == "python3")
+            && parts.len() > 3
+            && parts[1] == "-m"
+            && parts[2] == "pip"
+            && (parts[3] == "install" || parts[3] == "add")
+        {
+            for &arg in &parts[4..] {
+                if !arg.starts_with('-') {
+                    out.push((Ecosystem::Pypi, arg.to_string()));
+                }
+            }
         }
 
         out
@@ -152,6 +169,24 @@ mod tests {
         let pkgs = PackageFirewall::parse_command("pip install requests -r requirements.txt");
         assert_eq!(pkgs.len(), 2);
         assert_eq!(pkgs[0], (Ecosystem::Pypi, "requests".to_string()));
+    }
+
+    #[test]
+    fn test_parse_command_go() {
+        let pkgs = PackageFirewall::parse_command("go get github.com/gin-gonic/gin");
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(
+            pkgs[0],
+            (Ecosystem::Go, "github.com/gin-gonic/gin".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_command_python_module_pip() {
+        let pkgs = PackageFirewall::parse_command("python -m pip install numpy pandas");
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0], (Ecosystem::Pypi, "numpy".to_string()));
+        assert_eq!(pkgs[1], (Ecosystem::Pypi, "pandas".to_string()));
     }
 
     #[test]

@@ -309,7 +309,7 @@ Vault Tokens Registered (1):
 
 ### `arc shield`: Install-Time Anti-Slopsquatting Firewall
 
-Evaluates packages before running `npm install`, `pip install`, or `cargo add`. Arc prevents developers and AI coding agents from installing hallucinated, typosquatted, or malicious packages.
+Evaluates packages before running `npm install`, `pnpm add`, `pip install`, `python -m pip install`, `cargo add`, or `go get`. Arc prevents developers and AI coding agents from installing hallucinated, typosquatted, or malicious packages.
 
 #### Windows (PowerShell):
 ```powershell
@@ -319,11 +319,15 @@ PS C:\vexa-arc\target\release> .\arc.exe shield reactt
 # Option 2: Scoped ecosystem prefix
 PS C:\vexa-arc\target\release> .\arc.exe shield npm:reactt
 PS C:\vexa-arc\target\release> .\arc.exe shield pypi:shadow-agent --dangerous-scripts
+PS C:\vexa-arc\target\release> .\arc.exe shield go:github.com/gin-gonic/gin
 
 # Option 3: Natural CLI command wrapper (paste your full install command!)
 PS C:\vexa-arc\target\release> .\arc.exe shield npm install reactt
+PS C:\vexa-arc\target\release> .\arc.exe shield pnpm add reactt
 PS C:\vexa-arc\target\release> .\arc.exe shield pip install shadow-agent --dangerous-scripts
+PS C:\vexa-arc\target\release> .\arc.exe shield python -m pip install shadow-agent
 PS C:\vexa-arc\target\release> .\arc.exe shield cargo add tokio
+PS C:\vexa-arc\target\release> .\arc.exe shield go get github.com/gin-gonic/gin
 
 # Option 4: Explicit check subcommand (flags like --age-days and --downloads are optional)
 PS C:\vexa-arc\target\release> .\arc.exe shield check reactt
@@ -338,11 +342,15 @@ arc shield reactt
 # Option 2: Scoped ecosystem prefix
 arc shield npm:reactt
 arc shield pypi:shadow-agent --dangerous-scripts
+arc shield go:github.com/gin-gonic/gin
 
 # Option 3: Natural CLI command wrapper (paste your full install command!)
 arc shield npm install reactt
+arc shield pnpm add reactt
 arc shield pip install shadow-agent --dangerous-scripts
+arc shield python -m pip install shadow-agent
 arc shield cargo add tokio
+arc shield go get github.com/gin-gonic/gin
 
 # Option 4: Explicit check subcommand (flags like --age-days and --downloads are optional)
 arc shield check reactt

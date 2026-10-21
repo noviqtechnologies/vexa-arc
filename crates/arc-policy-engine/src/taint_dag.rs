@@ -253,14 +253,17 @@ impl TaintTracker {
     pub fn classify_action_taints(action: &Action) -> (Taint, String) {
         match action {
             Action::FileRead { path } => {
-                let path_str = path.to_string_lossy();
+                let path_str = path.to_string_lossy().to_lowercase().replace('\\', "/");
                 if path_str.contains(".env")
                     || path_str.contains(".ssh")
                     || path_str.contains(".aws")
                     || path_str.contains("credentials")
                     || path_str.contains("secret")
                     || path_str.contains("id_rsa")
+                    || path_str.contains("id_ed25519")
+                    || path_str.contains("id_ecdsa")
                     || path_str.contains("private")
+                    || path_str.contains("token")
                 {
                     (
                         Taint::PRIVATE_DATA | Taint::SECRET_MATERIAL,
@@ -441,5 +444,25 @@ mod tests {
         let explanation = trifecta_violation.unwrap();
         assert!(explanation.summary.contains("Lethal Trifecta detected"));
         assert_eq!(explanation.options.len(), 3);
+    }
+
+    #[test]
+    fn test_windows_path_and_key_taint_classification() {
+        // Windows backslash path to ssh key
+        let action = Action::FileRead {
+            path: PathBuf::from(r"C:\Users\test\.ssh\id_ed25519"),
+        };
+        let (taint, origin) = TaintTracker::classify_action_taints(&action);
+        assert!(taint.contains(Taint::PRIVATE_DATA));
+        assert!(taint.contains(Taint::SECRET_MATERIAL));
+        assert!(origin.contains("id_ed25519"));
+
+        // Windows backslash path to .env
+        let action_env = Action::FileRead {
+            path: PathBuf::from(r"backend\config\.env.local"),
+        };
+        let (taint_env, _) = TaintTracker::classify_action_taints(&action_env);
+        assert!(taint_env.contains(Taint::PRIVATE_DATA));
+        assert!(taint_env.contains(Taint::SECRET_MATERIAL));
     }
 }

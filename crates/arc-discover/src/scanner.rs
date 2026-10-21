@@ -183,6 +183,8 @@ impl DiscoveryScanner {
             || lower == ".mcp.json"
             || lower == "mcp_config.json"
             || lower.ends_with(".claude.json")
+            || lower.ends_with("claude_desktop_config.json")
+            || (lower.contains("windsurf") && lower.ends_with(".json"))
         {
             if let Ok(content) = fs::read_to_string(path) {
                 self.parse_mcp_config(path, &content, mcp_servers);
@@ -195,6 +197,8 @@ impl DiscoveryScanner {
             || lower == ".windsurfrules"
             || lower == "copilot-instructions.md"
             || lower.ends_with(".prompt.md")
+            || lower.ends_with(".mdc")
+            || lower == "agent.md"
         {
             if let Ok(bytes) = fs::read(path) {
                 let mut hasher = Sha256::new();
@@ -212,13 +216,24 @@ impl DiscoveryScanner {
         }
 
         // 3. AI Models and Weights
-        if lower.ends_with(".safetensors") || lower.ends_with(".gguf") {
+        if lower.ends_with(".safetensors")
+            || lower.ends_with(".gguf")
+            || lower.ends_with(".onnx")
+            || lower.ends_with(".pt")
+            || lower.ends_with(".bin")
+        {
             let metadata = fs::metadata(path).ok();
             let size = metadata.map(|m| m.len()).unwrap_or(0);
             let kind = if lower.ends_with(".gguf") {
                 "gguf"
-            } else {
+            } else if lower.ends_with(".safetensors") {
                 "safetensors"
+            } else if lower.ends_with(".onnx") {
+                "onnx"
+            } else if lower.ends_with(".pt") {
+                "pytorch"
+            } else {
+                "binary-weights"
             };
 
             model_assets.push(DiscoveredModelAsset {
@@ -235,6 +250,9 @@ impl DiscoveryScanner {
             || lower.ends_with(".pem")
             || lower.ends_with(".key")
             || lower == "id_rsa"
+            || lower == "id_ed25519"
+            || lower == "id_ecdsa"
+            || lower == "id_dsa"
         {
             if let Ok(bytes) = fs::read(path) {
                 let findings = self.dlp_engine.scan(&bytes);
@@ -375,5 +393,42 @@ mod tests {
         assert_eq!(servers[0].transport, "stdio");
         assert_eq!(servers[1].name, "remote-agent");
         assert_eq!(servers[1].transport, "http/sse");
+    }
+
+    #[test]
+    fn test_agent_skill_and_model_asset_discovery() {
+        let scanner = DiscoveryScanner::new();
+        let mut mcp_servers = Vec::new();
+        let mut agent_skills = Vec::new();
+        let mut model_assets = Vec::new();
+        let mut exposed_secrets = Vec::new();
+
+        let temp_skill = std::env::temp_dir().join("test_security.mdc");
+        std::fs::write(&temp_skill, "# Cursor Agent Rule\nApply security gates").unwrap();
+
+        scanner.inspect_file(
+            &temp_skill,
+            "test_security.mdc",
+            &mut mcp_servers,
+            &mut agent_skills,
+            &mut model_assets,
+            &mut exposed_secrets,
+        );
+
+        assert_eq!(agent_skills.len(), 1);
+        assert_eq!(agent_skills[0].name, "test_security.mdc");
+        let _ = std::fs::remove_file(&temp_skill);
+
+        scanner.inspect_file(
+            Path::new("models/model.onnx"),
+            "model.onnx",
+            &mut mcp_servers,
+            &mut agent_skills,
+            &mut model_assets,
+            &mut exposed_secrets,
+        );
+
+        assert_eq!(model_assets.len(), 1);
+        assert_eq!(model_assets[0].kind, "onnx");
     }
 }

@@ -3,7 +3,7 @@
 [![Rust Edition](https://img.shields.io/badge/Rust-2021%20Edition-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-brightgreen.svg)](#cross-platform-installation--setup)
-[![Tests](https://img.shields.io/badge/Tests-36%2F36%20Passing-success.svg)](#automated-tests--verification)
+[![Tests](https://img.shields.io/badge/Tests-46%2F46%20Passing-success.svg)](#automated-tests--verification)
 [![CycloneDX](https://img.shields.io/badge/CycloneDX-v1.6%20AI--BOM-blueviolet?logo=owasp&logoColor=white)](#2-live-cyclonedx-v16-ai-bom-export-arc-bom)
 [![Docs](https://img.shields.io/badge/Docs-Guides%20%26%20Reference-blueviolet?logo=read-the-docs&logoColor=white)](#-documentation--workflow-guides)
 
@@ -704,7 +704,7 @@ fi
 Vexa Arc includes a comprehensive automated test suite covering all 7 workspace crates and end-to-end integration scenarios:
 
 ```bash
-# Run all workspace unit and integration tests (36 tests)
+# Run all workspace unit and integration tests (46 tests)
 cargo test --workspace
 
 # Run integration tests specifically
@@ -713,13 +713,13 @@ cargo test --test integration_tests
 
 ### Test Suite Validations:
 - **`arc-cli` (5 tests)**: Positional parameter resolution, secret directory collection, shield blocked & permitted packages, CLI audit execution, multi-step session persistence and Lethal Trifecta enforcement.
-- **`integration_tests` (5 tests)**: E2E compound anti-slopsquatting gates, inbound prompt injection sanitization and cryptographic spotlighting, Lethal Trifecta runtime governance, asset discovery & CycloneDX v1.6 AI-BOM export, DLP secret redaction and vault lifecycle.
+- **`integration_tests` (9 tests)**: E2E compound anti-slopsquatting gates, inbound prompt injection sanitization and cryptographic spotlighting, Lethal Trifecta runtime governance, asset discovery & CycloneDX v1.6 AI-BOM export, DLP secret redaction and vault lifecycle, extended secret detection and vaulting (Stripe, GCP, DB URIs), cross-platform package manager shimming (`go get`, `python -m pip`, `pnpm`), dynamic schema rug-pull quarantine (`ARC-RUG-001`), and unapproved MCP server blocking (`ARC-MCP-001`).
 - **`arc-core` (5 tests)**: MCP 3D capability profiling and risk bands, monotonic taint bitflags, `ActionEvent` normalization, self-explaining `Verdict` formats, RFC 8785 JSON Canonicalization Scheme (JCS) hash consistency.
-- **`arc-discover` (2 tests)**: CycloneDX v1.6 AI-BOM serialization conformity, multi-origin MCP configuration and asset discovery.
-- **`arc-dlp` (7 tests)**: Invisible Unicode and Trojan Source bidi sanitization, nonce-delimited spotlighting, normalized and raw Shannon entropy calculation, local pseudonymization vault tokenization and rehydration, multi-pattern secret detection.
-- **`arc-firewall` (8 tests)**: `npm`, `pip`, and `cargo` command parsing, target/command resolver, established package fast path, Phantom 404 gate rejection, lifecycle scripts gate rejection, typosquat similarity rejection and suggested remediation actions.
+- **`arc-discover` (3 tests)**: CycloneDX v1.6 AI-BOM serialization conformity, multi-origin MCP configuration and asset discovery, modern agent rule (`.mdc`) and model (`.onnx`) asset discovery.
+- **`arc-dlp` (8 tests)**: Invisible Unicode and Trojan Source bidi sanitization, nonce-delimited spotlighting, normalized and raw Shannon entropy calculation, local pseudonymization vault tokenization and rehydration, multi-pattern secret detection, and extended credential types (Stripe live keys, Google Cloud API keys, Database URIs, PyPI tokens, npm tokens).
+- **`arc-firewall` (10 tests)**: `npm`, `pnpm`, `yarn`, `pip`, `python -m pip`, `cargo`, and `go get` command parsing, target/command resolver, established package fast path, Phantom 404 gate rejection, lifecycle scripts gate rejection, typosquat similarity rejection and suggested remediation actions.
 - **`arc-hooks` (1 test)**: MCP JSON-RPC 2.0 request parsing and error response structure.
-- **`arc-policy-engine` (3 tests)**: Stateful Taint DAG Lethal Trifecta trigger, unapproved MCP server block, Lethal Trifecta policy evaluation.
+- **`arc-policy-engine` (5 tests)**: Stateful Taint DAG Lethal Trifecta trigger, unapproved MCP server block, Lethal Trifecta policy evaluation, policy configuration serialization and disk roundtrip (`.arc/policy.json`), Windows backslash path and SSH key taint classification.
 
 ---
 

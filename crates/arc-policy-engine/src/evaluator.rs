@@ -6,7 +6,7 @@ use std::sync::RwLock;
 
 use crate::taint_dag::TaintTracker;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PolicyConfig {
     pub allowed_mcp_servers: HashSet<String>,
     pub block_unapproved_mcp: bool,
@@ -28,6 +28,36 @@ impl Default for PolicyConfig {
             enforce_taint_dag: true,
             redact_secrets: true,
         }
+    }
+}
+
+impl PolicyConfig {
+    /// Loads a policy configuration from an optional project directory (.arc/policy.json or .arc.json)
+    /// Falling back to the default configuration if the file does not exist.
+    pub fn load_from_dir(dir: &std::path::Path) -> Self {
+        let candidate_paths = [dir.join(".arc").join("policy.json"), dir.join(".arc.json")];
+
+        for path in &candidate_paths {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Ok(cfg) = serde_json::from_str::<PolicyConfig>(&content) {
+                        return cfg;
+                    }
+                }
+            }
+        }
+
+        Self::default()
+    }
+
+    /// Saves the policy configuration to .arc/policy.json in the specified directory.
+    pub fn save_to_dir(&self, dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        let arc_dir = dir.join(".arc");
+        std::fs::create_dir_all(&arc_dir)?;
+        let path = arc_dir.join("policy.json");
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(&path, json)?;
+        Ok(path)
     }
 }
 
@@ -267,5 +297,30 @@ mod tests {
             assert_eq!(rule.0, "ARC-LTT-001");
             assert!(explanation.summary.contains("Lethal Trifecta detected"));
         }
+    }
+
+    #[test]
+    fn test_policy_config_serialization_and_roundtrip() {
+        let temp_dir = std::env::temp_dir().join("vexa_arc_test_policy");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let mut allowed = HashSet::new();
+        allowed.insert("custom-mcp".to_string());
+
+        let cfg = PolicyConfig {
+            allowed_mcp_servers: allowed,
+            block_unapproved_mcp: true,
+            enforce_taint_dag: true,
+            redact_secrets: true,
+        };
+
+        let saved_path = cfg.save_to_dir(&temp_dir).expect("Failed to save policy");
+        assert!(saved_path.exists());
+
+        let loaded = PolicyConfig::load_from_dir(&temp_dir);
+        assert!(loaded.block_unapproved_mcp);
+        assert!(loaded.allowed_mcp_servers.contains("custom-mcp"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
