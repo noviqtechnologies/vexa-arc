@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+/prd
+/images
+/.sca-cache
+/misc
+/design
