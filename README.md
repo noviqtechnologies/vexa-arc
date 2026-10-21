@@ -44,23 +44,22 @@
 > ```bash
 > cargo install --git https://github.com/noviqtechnologies/vexa-arc.git arc-cli
 > 
-> # Navigate to any repository or project and audit:
-> cd /path/to/your-project
-> arc audit
+> # ⚡ Test the Pre-Execution Firewall (catches hallucinated packages in < 5ms):
+> arc shield npm install reactt
 > 
-> # Or audit any workspace directly from anywhere:
-> arc audit --path ./my-project
+> # 🔍 Audit any project for AI assets, MCP configs, and rules:
+> arc audit --path /path/to/project
 > ```
 > 
 > **2. Evaluate from Source in this Cloned Repository:**
 > ```bash
-> # Run an instant audit:
-> cargo run --bin arc -- audit
-> 
-> # Check a package before installing:
+> # ⚡ Test the firewall:
 > cargo run --bin arc -- shield npm install reactt
 > 
-> # Test prompt injection and secret vaulting:
+> # 🔍 Run an instant local audit:
+> cargo run --bin arc -- audit
+> 
+> # 🔒 Test secret detection and vault tokenization:
 > cargo run --bin arc -- scan-secrets --path .env --redact
 > ```
 > *(See [Prerequisites by OS](#prerequisites-by-os) below for toolchain setup).*
