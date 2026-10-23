@@ -17,7 +17,7 @@ The Vexa Arc team is committed to ensuring the safety of autonomous agent workfl
 
 ### Reporting Channels
 
-1. **Email Disclosure:** Send details to [security@vexasec.io](mailto:security@vexasec.io) or [contact@noviqtech.com](mailto:contact@noviqtech.com).
+1. **Email Disclosure:** Send details to [contact@vexasec.io](mailto:security@vexasec.io)
 2. **PGP Encryption:** If reporting sensitive details or reproduction exploits, request our PGP public key via the contact email.
 
 ### What to Include
