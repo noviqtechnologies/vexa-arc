@@ -336,9 +336,30 @@ impl TaintTracker {
                 }
             }
             Action::PromptSubmit { text, source } => {
+                let is_explicit_user = source
+                    .as_deref()
+                    .map(|s| {
+                        let s_lower = s.to_lowercase();
+                        matches!(
+                            s_lower.as_str(),
+                            "user"
+                                | "developer"
+                                | "operator"
+                                | "admin"
+                                | "local"
+                                | "cli"
+                                | "prompt"
+                                | "human"
+                        )
+                    })
+                    .unwrap_or(false);
+
                 let is_untrusted_source = source
                     .as_deref()
                     .map(|s| {
+                        if is_explicit_user {
+                            return false;
+                        }
                         let s_lower = s.to_lowercase();
                         s_lower.contains("untrusted")
                             || s_lower.contains("issue")
@@ -346,15 +367,25 @@ impl TaintTracker {
                             || s_lower.contains("pr")
                             || s_lower.contains("external")
                             || s_lower.contains("chat")
+                            || s_lower.contains("ticket")
+                            || s_lower.contains("scraper")
+                            || s_lower.contains("crawl")
+                            || s_lower.contains("slack")
+                            || s_lower.contains("discord")
+                            || s_lower.contains("webhook")
+                            || s_lower.contains("remote")
+                            || s_lower.contains("fetch")
                     })
                     .unwrap_or(false);
 
+                // Detection of URLs and issue references in raw text is a legacy best-effort heuristic
+                // for backward compatibility when explicit provenance is not provided.
                 let text_lower = text.to_lowercase();
                 let has_url_or_issue = text_lower.contains("issue #")
                     || text_lower.contains("http://")
                     || text_lower.contains("https://");
 
-                if is_untrusted_source || has_url_or_issue {
+                if is_untrusted_source || (!is_explicit_user && has_url_or_issue) {
                     let origin = source
                         .clone()
                         .unwrap_or_else(|| "prompt_with_external_url_or_issue".to_string());
@@ -369,14 +400,28 @@ impl TaintTracker {
 
     /// Classifies an ActionEvent taking into account explicit provenance metadata.
     pub fn classify_event_taints(event: &ActionEvent) -> (Taint, String) {
-        let (mut taint, mut origin) = Self::classify_action_taints(&event.action);
-        if let arc_core::event::EventProvenance::UntrustedExternal { source } = &event.provenance {
-            taint.insert(Taint::UNTRUSTED_CONTENT);
-            if origin.is_empty() {
-                origin = format!("provenance:{source}");
+        match &event.provenance {
+            arc_core::event::EventProvenance::UntrustedExternal { source } => {
+                let (mut taint, mut origin) = Self::classify_action_taints(&event.action);
+                taint.insert(Taint::UNTRUSTED_CONTENT);
+                if origin.is_empty() {
+                    origin = format!("provenance:{source}");
+                }
+                (taint, origin)
+            }
+            arc_core::event::EventProvenance::TrustedInternal { source } => {
+                let (mut taint, mut origin) = Self::classify_action_taints(&event.action);
+                taint.remove(Taint::UNTRUSTED_CONTENT);
+                if origin.is_empty() {
+                    origin = format!("trusted_internal:{source}");
+                }
+                (taint, origin)
+            }
+            arc_core::event::EventProvenance::UserExplicit => {
+                let (taint, origin) = Self::classify_action_taints(&event.action);
+                (taint, origin)
             }
         }
-        (taint, origin)
     }
 
     /// Classifies the sink capability of an action.

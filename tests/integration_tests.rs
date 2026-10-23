@@ -883,3 +883,431 @@ fn test_cli_session_dir_explicit_override_and_isolation() {
 
     let _ = fs::remove_dir_all(&temp_session_dir);
 }
+
+#[test]
+fn test_cli_session_storage_fail_closed_on_regular_file() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_file = std::env::temp_dir().join(format!("arc_fake_sess_file_{ts}.txt"));
+    fs::write(&temp_file, b"i am a regular file, not a directory").unwrap();
+
+    let session = format!("sess-fail-closed-{ts}");
+
+    // 1. Direct --session-dir pointing to regular file must fail closed (exit 1)
+    let out = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "eval",
+            "read",
+            ".env",
+            "--session",
+            &session,
+            "--session-dir",
+            temp_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run arc intercept");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "Command must fail closed with exit 1 when session-dir is a file"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("file, not a directory") || stderr.contains("Session storage failure"),
+        "Error output must explain storage failure"
+    );
+
+    // 2. JSON mode must report success: false and error, exit 1
+    let json_out = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "eval",
+            "read",
+            ".env",
+            "--session",
+            &session,
+            "--session-dir",
+            temp_file.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("failed to run arc intercept with json");
+
+    assert_eq!(json_out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&json_out.stdout);
+    assert!(stdout.contains("\"success\": false"));
+    assert!(stdout.contains("error"));
+
+    // 3. Multi-process cross-process validation: ARC_SESSION_DIR set to regular file
+    // All 3 steps must fail closed (exit 1), never allowing egress with exit 0
+    let s1 = Command::new(arc_bin)
+        .env("ARC_SESSION_DIR", temp_file.to_str().unwrap())
+        .args(["intercept", "eval", "read", ".env", "--session", &session])
+        .output()
+        .unwrap();
+    assert_eq!(s1.status.code(), Some(1), "Step 1 (read) must fail closed");
+
+    let s2 = Command::new(arc_bin)
+        .env("ARC_SESSION_DIR", temp_file.to_str().unwrap())
+        .args([
+            "intercept",
+            "prompt",
+            "untrusted external payload",
+            "--session",
+            &session,
+            "--untrusted",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        s2.status.code(),
+        Some(1),
+        "Step 2 (prompt) must fail closed"
+    );
+
+    let s3 = Command::new(arc_bin)
+        .env("ARC_SESSION_DIR", temp_file.to_str().unwrap())
+        .args([
+            "intercept",
+            "eval",
+            "slack/slack_post_message",
+            "--session",
+            &session,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        s3.status.code(),
+        Some(1),
+        "Step 3 (egress) must fail closed"
+    );
+
+    let _ = fs::remove_file(&temp_file);
+}
+
+#[test]
+fn test_cli_session_storage_fail_closed_on_corrupt_file() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_session_dir = std::env::temp_dir().join(format!("arc_corrupt_sess_{ts}"));
+    fs::create_dir_all(&temp_session_dir).unwrap();
+
+    let session = format!("sess-corrupt-{ts}");
+    let corrupt_file = temp_session_dir.join(format!("{session}.json"));
+    fs::write(&corrupt_file, b"{ CORRUPT NOT VALID JSON ").unwrap();
+
+    // 1. Intercept eval with corrupt session file must fail closed (exit 1)
+    let out = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "eval",
+            "read",
+            ".env",
+            "--session",
+            &session,
+            "--session-dir",
+            temp_session_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run arc intercept");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "Must fail closed on corrupt session file"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("corrupt") || stderr.contains("unreadable"),
+        "Stderr must report corrupt session file"
+    );
+
+    // 2. Intercept session inspector with corrupt file must fail closed (exit 1)
+    let sess_inspect = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "session",
+            &session,
+            "--session-dir",
+            temp_session_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run arc intercept session");
+
+    assert_eq!(
+        sess_inspect.status.code(),
+        Some(1),
+        "Session inspector must fail closed on corrupt file"
+    );
+
+    let _ = fs::remove_dir_all(&temp_session_dir);
+}
+
+#[test]
+fn test_cli_provenance_trust_separation_matrix() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+
+    // Case 1: --source user (Direct user input) must preserve UserExplicit and NOT trigger lethal trifecta
+    {
+        let session = format!(
+            "sess-user-prov-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let s1 = Command::new(arc_bin)
+            .args(["intercept", "eval", "read", ".env", "--session", &session])
+            .output()
+            .unwrap();
+        assert_eq!(s1.status.code(), Some(0));
+
+        let s2 = Command::new(arc_bin)
+            .args([
+                "intercept",
+                "prompt",
+                "normal user supplied text",
+                "--session",
+                &session,
+                "--source",
+                "user",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(s2.status.code(), Some(0));
+
+        let s3 = Command::new(arc_bin)
+            .args([
+                "intercept",
+                "eval",
+                "slack/slack_post_message",
+                "--session",
+                &session,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            s3.status.code(),
+            Some(0),
+            "--source user must NOT trigger lethal trifecta block"
+        );
+    }
+
+    // Case 2: --untrusted --source user must explicitly mark untrusted and BLOCK egress
+    {
+        let session = format!(
+            "sess-untrusted-user-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        Command::new(arc_bin)
+            .args(["intercept", "eval", "read", ".env", "--session", &session])
+            .output()
+            .unwrap();
+
+        Command::new(arc_bin)
+            .args([
+                "intercept",
+                "prompt",
+                "compromised user prompt",
+                "--session",
+                &session,
+                "--source",
+                "user",
+                "--untrusted",
+            ])
+            .output()
+            .unwrap();
+
+        let s3 = Command::new(arc_bin)
+            .args([
+                "intercept",
+                "eval",
+                "slack/slack_post_message",
+                "--session",
+                &session,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            s3.status.code(),
+            Some(1),
+            "--untrusted flag must override and trigger lethal trifecta"
+        );
+    }
+
+    // Case 3: --source github_issue (known external source) defaults to untrusted and BLOCKS egress
+    {
+        let session = format!(
+            "sess-gh-issue-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        Command::new(arc_bin)
+            .args(["intercept", "eval", "read", ".env", "--session", &session])
+            .output()
+            .unwrap();
+
+        Command::new(arc_bin)
+            .args([
+                "intercept",
+                "prompt",
+                "Issue description payload",
+                "--session",
+                &session,
+                "--source",
+                "github_issue",
+            ])
+            .output()
+            .unwrap();
+
+        let s3 = Command::new(arc_bin)
+            .args([
+                "intercept",
+                "eval",
+                "slack/slack_post_message",
+                "--session",
+                &session,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            s3.status.code(),
+            Some(1),
+            "known external source github_issue must default to untrusted and trigger lethal trifecta"
+        );
+    }
+
+    // Case 4: --source custom_internal_tool (unrecognized source without --untrusted) preserves UserExplicit and ALLOWS
+    {
+        let session = format!(
+            "sess-unknown-src-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        Command::new(arc_bin)
+            .args(["intercept", "eval", "read", ".env", "--session", &session])
+            .output()
+            .unwrap();
+
+        Command::new(arc_bin)
+            .args([
+                "intercept",
+                "prompt",
+                "internal pipeline metrics",
+                "--session",
+                &session,
+                "--source",
+                "custom_internal_tool",
+            ])
+            .output()
+            .unwrap();
+
+        let s3 = Command::new(arc_bin)
+            .args([
+                "intercept",
+                "eval",
+                "slack/slack_post_message",
+                "--session",
+                &session,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            s3.status.code(),
+            Some(0),
+            "unrecognized source metadata without --untrusted must preserve UserExplicit"
+        );
+    }
+}
+
+#[test]
+fn test_cli_schema_malformed_input_rejected() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let session = format!(
+        "sess-schema-malformed-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    // 1. Typo/opaque invalid string must be rejected with exit code 1
+    let out = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "mcp",
+            "slack",
+            "read_channel",
+            "--session",
+            &session,
+            "--schema",
+            "not-a-valid-schema",
+        ])
+        .output()
+        .expect("failed to run arc intercept mcp");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "Malformed schema string must be rejected with exit code 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Invalid schema input"),
+        "Stderr must describe invalid schema"
+    );
+
+    // 2. Malformed JSON schema string must be rejected with exit code 1
+    let out2 = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "mcp",
+            "slack",
+            "read_channel",
+            "--session",
+            &session,
+            "--schema",
+            "{ invalid json string",
+        ])
+        .output()
+        .expect("failed to run arc intercept mcp");
+
+    assert_eq!(out2.status.code(), Some(1));
+
+    // 3. Valid JSON schema string must be accepted (exit 0)
+    let session_valid = format!("{session}-valid");
+    let out3 = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "mcp",
+            "slack",
+            "read_channel",
+            "--session",
+            &session_valid,
+            "--schema",
+            "{\"type\":\"object\"}",
+        ])
+        .output()
+        .expect("failed to run arc intercept mcp with valid json schema");
+
+    assert_eq!(out3.status.code(), Some(0));
+}

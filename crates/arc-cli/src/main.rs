@@ -521,13 +521,15 @@ fn main() {
                 project_local,
                 json,
             } => {
-                run_intercept_session_with_dir(
+                if !run_intercept_session_with_dir(
                     &session_id,
                     reset,
                     json,
                     session_dir.as_deref(),
                     project_local,
-                );
+                ) {
+                    std::process::exit(1);
+                }
             }
         },
         Commands::Version => {
@@ -987,18 +989,62 @@ pub struct InterceptEvalOptions<'a> {
     pub json: bool,
 }
 
-fn get_session_storage_dir(override_dir: Option<&Path>, project_local: bool) -> PathBuf {
+fn check_session_dir_usable(dir: &Path) -> Result<(), String> {
+    if dir.exists() && !dir.is_dir() {
+        return Err(format!(
+            "Session storage path '{}' exists but is a file, not a directory",
+            dir.display()
+        ));
+    }
+    fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "Failed to create session storage directory '{}': {e}",
+            dir.display()
+        )
+    })?;
+    if !dir.is_dir() {
+        return Err(format!(
+            "Session storage path '{}' is not a valid directory",
+            dir.display()
+        ));
+    }
+    // Test write permission by writing and removing a temporary probe file
+    let probe_name = format!(
+        ".arc_probe_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let probe_path = dir.join(probe_name);
+    match fs::write(&probe_path, b"probe") {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe_path);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "Session storage directory '{}' is unwritable: {e}",
+            dir.display()
+        )),
+    }
+}
+
+fn resolve_session_storage_dir(
+    override_dir: Option<&Path>,
+    project_local: bool,
+) -> Result<PathBuf, String> {
     // 1. Explicit override passed via CLI argument
     if let Some(dir) = override_dir {
-        let _ = fs::create_dir_all(dir);
-        return dir.to_path_buf();
+        check_session_dir_usable(dir)?;
+        return Ok(dir.to_path_buf());
     }
 
     // 2. Explicit environment variable ARC_SESSION_DIR
     if let Ok(env_dir) = std::env::var("ARC_SESSION_DIR") {
         let pb = PathBuf::from(env_dir);
-        let _ = fs::create_dir_all(&pb);
-        return pb;
+        check_session_dir_usable(&pb)?;
+        return Ok(pb);
     }
 
     // 3. Opt-in project-local mode (via --project-local flag or ARC_PROJECT_LOCAL=1)
@@ -1008,14 +1054,14 @@ fn get_session_storage_dir(override_dir: Option<&Path>, project_local: bool) -> 
 
     if project_local || env_local {
         let local_arc = Path::new(".arc").join("sessions");
-        let _ = fs::create_dir_all(&local_arc);
-        return local_arc;
+        check_session_dir_usable(&local_arc)?;
+        return Ok(local_arc);
     }
 
     // 4. If current working directory already contains .arc/sessions, preserve project-local continuity
     let cwd_local = Path::new(".arc").join("sessions");
-    if cwd_local.is_dir() {
-        return cwd_local;
+    if cwd_local.is_dir() && check_session_dir_usable(&cwd_local).is_ok() {
+        return Ok(cwd_local);
     }
 
     // 5. OS-appropriate user data directory:
@@ -1044,43 +1090,112 @@ fn get_session_storage_dir(override_dir: Option<&Path>, project_local: bool) -> 
 
     if let Ok(user_dir) = base_user_dir {
         let arc_dir = user_dir.join("vexa-arc").join("sessions");
-        if fs::create_dir_all(&arc_dir).is_ok() {
-            return arc_dir;
+        if check_session_dir_usable(&arc_dir).is_ok() {
+            return Ok(arc_dir);
         }
     }
 
     // 6. Fallback: system temp directory
     let temp_arc = std::env::temp_dir().join("vexa-arc").join("sessions");
-    let _ = fs::create_dir_all(&temp_arc);
-    temp_arc
+    check_session_dir_usable(&temp_arc)?;
+    Ok(temp_arc)
 }
 
-fn parse_schema_fingerprint(schema_input: Option<&str>) -> Option<[u8; 32]> {
-    let raw = schema_input?.trim();
+#[allow(dead_code)]
+fn get_session_storage_dir(override_dir: Option<&Path>, project_local: bool) -> PathBuf {
+    resolve_session_storage_dir(override_dir, project_local)
+        .unwrap_or_else(|_| std::env::temp_dir().join("vexa-arc").join("sessions"))
+}
+
+fn parse_schema_fingerprint(schema_input: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+    let Some(raw_str) = schema_input else {
+        return Ok(None);
+    };
+    let raw = raw_str.trim();
     if raw.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Check if it's 64-char hex
     if raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
         if let Ok(bytes) = hex::decode(raw) {
             if let Ok(arr) = bytes.try_into() {
-                return Some(arr);
+                return Ok(Some(arr));
             }
         }
     }
     // Check if it's a file path containing JSON schema
-    let json_bytes = if let Ok(content) = fs::read(raw) {
-        content
-    } else {
-        raw.as_bytes().to_vec()
-    };
-    if let Ok(hash) = arc_core::compute_jcs_schema_hash(&json_bytes) {
-        return Some(hash);
+    let path = Path::new(raw);
+    if path.is_file() {
+        let content = fs::read(path)
+            .map_err(|e| format!("Cannot read schema file '{}': {e}", path.display()))?;
+        let hash = arc_core::compute_jcs_schema_hash(&content)
+            .map_err(|e| format!("Invalid JSON schema in file '{}': {e}", path.display()))?;
+        return Ok(Some(hash));
     }
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&json_bytes);
-    Some(hasher.finalize().into())
+
+    // Check if it's a raw JSON schema payload
+    if raw.starts_with('{') || raw.starts_with('[') {
+        let hash = arc_core::compute_jcs_schema_hash(raw.as_bytes())
+            .map_err(|e| format!("Invalid JSON schema payload: {e}"))?;
+        return Ok(Some(hash));
+    }
+
+    // Try parsing as JSON anyway in case of whitespace or formatting
+    if let Ok(hash) = arc_core::compute_jcs_schema_hash(raw.as_bytes()) {
+        return Ok(Some(hash));
+    }
+
+    Err(format!(
+        "Invalid schema input '{raw}'. Expected a 64-character hex SHA-256 fingerprint, a path to a JSON schema file, or a valid JSON schema string."
+    ))
+}
+
+pub fn classify_cli_provenance(
+    untrusted: bool,
+    source: Option<&str>,
+) -> arc_core::event::EventProvenance {
+    if untrusted {
+        let src = source.unwrap_or("untrusted_external").to_string();
+        arc_core::event::EventProvenance::UntrustedExternal { source: src }
+    } else if let Some(src) = source {
+        let src_lower = src.to_lowercase();
+        if matches!(
+            src_lower.as_str(),
+            "user" | "developer" | "operator" | "admin" | "local" | "cli" | "prompt" | "human"
+        ) {
+            arc_core::event::EventProvenance::UserExplicit
+        } else if src_lower.contains("untrusted")
+            || src_lower.contains("issue")
+            || src_lower.contains("web")
+            || src_lower.contains("pr")
+            || src_lower.contains("external")
+            || src_lower.contains("chat")
+            || src_lower.contains("ticket")
+            || src_lower.contains("scraper")
+            || src_lower.contains("crawl")
+            || src_lower.contains("slack")
+            || src_lower.contains("discord")
+            || src_lower.contains("webhook")
+            || src_lower.contains("remote")
+            || src_lower.contains("fetch")
+        {
+            arc_core::event::EventProvenance::UntrustedExternal {
+                source: src.to_string(),
+            }
+        } else if matches!(
+            src_lower.as_str(),
+            "internal" | "trusted_internal" | "pipeline" | "ci" | "local_repo"
+        ) {
+            arc_core::event::EventProvenance::TrustedInternal {
+                source: src.to_string(),
+            }
+        } else {
+            // Unrecognized custom source metadata without --untrusted preserves UserExplicit
+            arc_core::event::EventProvenance::UserExplicit
+        }
+    } else {
+        arc_core::event::EventProvenance::UserExplicit
+    }
 }
 
 fn resolve_action_params(
@@ -1253,8 +1368,8 @@ fn format_added_taints(taints: Taint) -> String {
 }
 
 #[allow(dead_code)]
-fn run_intercept_session(session_id: &str, reset: bool, json: bool) {
-    run_intercept_session_with_dir(session_id, reset, json, None, false);
+fn run_intercept_session(session_id: &str, reset: bool, json: bool) -> bool {
+    run_intercept_session_with_dir(session_id, reset, json, None, false)
 }
 
 fn run_intercept_session_with_dir(
@@ -1263,24 +1378,63 @@ fn run_intercept_session_with_dir(
     json: bool,
     session_dir: Option<&Path>,
     project_local: bool,
-) {
-    let storage_dir = get_session_storage_dir(session_dir, project_local);
+) -> bool {
+    let storage_dir = match resolve_session_storage_dir(session_dir, project_local) {
+        Ok(dir) => dir,
+        Err(err) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": format!("Session storage error: {err}"), "session_id": session_id, "success": false })
+                );
+            } else {
+                eprintln!("Error: Session storage failure: {err}");
+            }
+            return false;
+        }
+    };
     let evaluator = PolicyEvaluator::default();
-    let _ = evaluator.load_session_state(&storage_dir, session_id);
 
     if reset {
-        let cleared = evaluator
-            .clear_session_state(Some(&storage_dir), session_id)
-            .unwrap_or(false);
+        match evaluator.clear_session_state(Some(&storage_dir), session_id) {
+            Ok(cleared) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "session_id": session_id, "cleared": cleared, "success": true })
+                    );
+                } else {
+                    println!("\nSession '{session_id}' state cleared successfully.");
+                }
+                return true;
+            }
+            Err(err) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": format!("Failed to clear session state: {err}"), "session_id": session_id, "success": false })
+                    );
+                } else {
+                    eprintln!("Error: Failed to clear session '{session_id}': {err}");
+                }
+                return false;
+            }
+        }
+    }
+
+    if let Err(err) = evaluator.load_session_state(&storage_dir, session_id) {
         if json {
             println!(
                 "{}",
-                serde_json::json!({ "session_id": session_id, "cleared": cleared })
+                serde_json::json!({ "error": format!("Session state file is corrupt or unreadable: {err}"), "session_id": session_id, "storage_dir": storage_dir.display().to_string(), "corrupt": true, "success": false })
             );
         } else {
-            println!("\nSession '{session_id}' state cleared successfully.");
+            eprintln!(
+                "Error: Session state for '{session_id}' in '{}' is corrupt or unreadable: {err}",
+                storage_dir.display()
+            );
         }
-        return;
+        return false;
     }
 
     let dag = evaluator.taint_tracker.get_or_create(session_id);
@@ -1288,7 +1442,7 @@ fn run_intercept_session_with_dir(
 
     if json {
         println!("{}", serde_json::to_string_pretty(&dag).unwrap_or_default());
-        return;
+        return true;
     }
 
     println!("\n═══════════════════════════════════════════════════════════");
@@ -1317,6 +1471,7 @@ fn run_intercept_session_with_dir(
         }
     }
     println!("═══════════════════════════════════════════════════════════\n");
+    true
 }
 
 #[allow(dead_code)]
@@ -1355,24 +1510,106 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
     ) {
         Ok(res) => res,
         Err(err) => {
-            eprintln!("Error: {err}");
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "error": format!("Parameter error: {err}"),
+                    "session_id": session,
+                    "success": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
+                );
+            } else {
+                eprintln!("Error: {err}");
+            }
             return false;
         }
     };
 
-    let storage_dir = get_session_storage_dir(opts.session_dir, opts.project_local);
+    let storage_dir = match resolve_session_storage_dir(opts.session_dir, opts.project_local) {
+        Ok(dir) => dir,
+        Err(err) => {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "error": format!("Session storage failure: {err}"),
+                    "session_id": session,
+                    "success": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
+                );
+            } else {
+                eprintln!("Error: Session storage failure: {err}");
+            }
+            return false;
+        }
+    };
+
     let evaluator = PolicyEvaluator::default();
 
     if opts.reset {
-        let _ = evaluator.clear_session_state(Some(&storage_dir), session);
+        if let Err(err) = evaluator.clear_session_state(Some(&storage_dir), session) {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "error": format!("Failed to clear session state: {err}"),
+                    "session_id": session,
+                    "storage_dir": storage_dir.display().to_string(),
+                    "success": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
+                );
+            } else {
+                eprintln!("Error: Failed to clear session '{session}': {err}");
+            }
+            return false;
+        }
     } else {
-        let _ = evaluator.load_session_state(&storage_dir, session);
+        if let Err(err) = evaluator.load_session_state(&storage_dir, session) {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "error": format!("Session state file is corrupt or unreadable: {err}"),
+                    "session_id": session,
+                    "storage_dir": storage_dir.display().to_string(),
+                    "corrupt": true,
+                    "success": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
+                );
+            } else {
+                eprintln!("Error: Session state file for '{session}' in '{}' is corrupt or unreadable: {err}", storage_dir.display());
+            }
+            return false;
+        }
     }
 
     let prev_dag = evaluator.taint_tracker.get_or_create(session);
     let prev_taints = prev_dag.current_taints;
 
-    let schema_root = parse_schema_fingerprint(opts.schema);
+    let schema_root = match parse_schema_fingerprint(opts.schema) {
+        Ok(s) => s,
+        Err(err) => {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "error": format!("Invalid schema parameter: {err}"),
+                    "session_id": session,
+                    "success": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
+                );
+            } else {
+                eprintln!("Error: Invalid schema parameter: {err}");
+            }
+            return false;
+        }
+    };
 
     let action = match kind.to_lowercase().as_str() {
         "file_read" | "read" => Action::FileRead {
@@ -1419,16 +1656,38 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
         action,
     );
 
-    if opts.untrusted || opts.source.is_some() {
-        let src = opts.source.unwrap_or("untrusted_external").to_string();
-        event = event
-            .with_provenance(arc_core::event::EventProvenance::UntrustedExternal { source: src });
-    }
+    let provenance = classify_cli_provenance(opts.untrusted, opts.source);
+    event = event.with_provenance(provenance);
 
     let verdict = evaluator.evaluate(&event);
 
-    // Persist session state to disk
-    let session_file = evaluator.save_session_state(&storage_dir, session).ok();
+    // Persist session state to disk - must fail closed if persistence fails
+    let session_file = match evaluator.save_session_state(&storage_dir, session) {
+        Ok(path) => path,
+        Err(err) => {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "error": format!("Failed to persist session state: {err}"),
+                    "session_id": session,
+                    "storage_dir": storage_dir.display().to_string(),
+                    "verdict": verdict,
+                    "saved": false,
+                    "success": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
+                );
+            } else {
+                eprintln!(
+                    "Error: Failed to persist session state for '{session}' in '{}': {err}",
+                    storage_dir.display()
+                );
+                eprintln!("Failing closed to prevent unpersisted taint governance loss.");
+            }
+            return false;
+        }
+    };
 
     let updated_dag = evaluator.taint_tracker.get_or_create(session);
     let current_taints = updated_dag.current_taints;
@@ -1446,7 +1705,7 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
                 "newly_added": format_added_taints(newly_added_taints),
                 "history_count": updated_dag.history.len(),
             },
-            "session_file": session_file.map(|p| p.display().to_string()),
+            "session_file": session_file.display().to_string(),
         });
         println!(
             "{}",
@@ -1459,9 +1718,7 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
     println!("                    ARC RUNTIME ACTION INTERCEPT                       ");
     println!("═══════════════════════════════════════════════════════════════════════");
     println!(" Session ID:    {session}");
-    if let Some(ref path) = session_file {
-        println!(" Session File:  {}", path.display());
-    }
+    println!(" Session File:  {}", session_file.display());
     if kind == "mcp_call" {
         println!(" Action:        {kind} ➔ {server}:{target}");
     } else {

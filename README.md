@@ -3,7 +3,7 @@
 [![Rust Edition](https://img.shields.io/badge/Rust-2021%20Edition-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-brightgreen.svg)](#cross-platform-installation--setup)
-[![Tests](https://img.shields.io/badge/Tests-55%2F55%20Passing-success.svg)](#automated-tests--verification)
+[![Tests](https://img.shields.io/badge/Tests-59%2F59%20Passing-success.svg)](#automated-tests--verification)
 [![CycloneDX](https://img.shields.io/badge/CycloneDX-v1.6%20AI--BOM-blueviolet?logo=owasp&logoColor=white)](#2-live-cyclonedx-v16-ai-bom-export-arc-bom)
 [![Docs](https://img.shields.io/badge/Docs-Guides%20%26%20Reference-blueviolet?logo=read-the-docs&logoColor=white)](#-documentation--workflow-guides)
 
@@ -536,6 +536,11 @@ arc intercept <SUBCOMMAND> [OPTIONS]
 
 Common options for `arc intercept`:
 - `-s, --session <ID>`: Host session identifier (default: `default-session`)
+- `--source <NAME>`: Content source/provenance (e.g. `user`, `github_issue`, `web_scraper`). Known user sources (`user`, `developer`, `local`) maintain direct user provenance; external sources (`github_issue`, `web_scraper`) default to untrusted external.
+- `--untrusted`: Explicitly mark ingested action/prompt content as untrusted external input.
+- `--schema <SCHEMA>`: MCP tool schema fingerprint (64-char hex SHA-256 hash, path to JSON schema file, or raw JSON schema). Typos and malformed schemas are rejected fail-closed.
+- `--session-dir <DIR>`: Custom session storage directory (fails closed if path is invalid, unwritable, or a file; also configurable via `ARC_SESSION_DIR`).
+- `--project-local`: Opt-in storage in `.arc/sessions`.
 - `--reset`: Reset session state before evaluating
 - `--json`: Output verdict and remediation options as JSON
 
@@ -704,7 +709,7 @@ fi
 Vexa Arc includes a comprehensive automated test suite covering all 7 workspace crates and end-to-end integration scenarios:
 
 ```bash
-# Run all workspace unit and integration tests (55 tests)
+# Run all workspace unit and integration tests (59 tests)
 cargo test --workspace
 
 # Run integration tests specifically
@@ -713,7 +718,7 @@ cargo test --test integration_tests
 
 ### Test Suite Validations:
 - **`arc-cli` (5 tests)**: Positional parameter resolution, working-directory-independent secret directory collection, shield blocked & permitted packages, CLI audit execution, multi-step session persistence and Lethal Trifecta enforcement.
-- **`integration_tests` (15 tests)**: E2E compound anti-slopsquatting gates, inbound prompt injection sanitization and cryptographic spotlighting, Lethal Trifecta runtime governance, asset discovery & CycloneDX v1.6 AI-BOM export, DLP secret redaction and vault lifecycle, extended secret detection and vaulting (Stripe, GCP, DB URIs), cross-platform package manager shimming (`go get`, `python -m pip`, `pnpm`), dynamic schema rug-pull quarantine (`ARC-RUG-001`), unapproved MCP server blocking (`ARC-MCP-001`), CLI secret scan exit codes and stdout redaction, CLI audit path validation and non-zero exit codes, failed AI-BOM export and read-only destination exit codes, executable CLI schema rug-pull quarantine and cross-session baseline isolation, provenance-aware prompt taint classification and Lethal Trifecta enforcement, and explicit cross-platform session storage directory overrides.
+- **`integration_tests` (19 tests)**: E2E compound anti-slopsquatting gates, inbound prompt injection sanitization and cryptographic spotlighting, Lethal Trifecta runtime governance, asset discovery & CycloneDX v1.6 AI-BOM export, DLP secret redaction and vault lifecycle, extended secret detection and vaulting (Stripe, GCP, DB URIs), cross-platform package manager shimming (`go get`, `python -m pip`, `pnpm`), dynamic schema rug-pull quarantine (`ARC-RUG-001`), unapproved MCP server blocking (`ARC-MCP-001`), CLI secret scan exit codes and stdout redaction, CLI audit path validation and non-zero exit codes, failed AI-BOM export and read-only destination exit codes, executable CLI schema rug-pull quarantine and cross-session baseline isolation, provenance-aware prompt taint classification and Lethal Trifecta enforcement, explicit cross-platform session storage directory overrides, fail-closed session storage resolution on regular files and multi-process egress prevention, fail-closed handling on corrupt session files and session inspection, full provenance trust separation matrix for direct user vs untrusted external content, and malformed schema fingerprint rejection.
 - **`arc-core` (5 tests)**: MCP 3D capability profiling and risk bands, monotonic taint bitflags, `ActionEvent` normalization and provenance metadata, self-explaining `Verdict` formats, RFC 8785 JSON Canonicalization Scheme (JCS) hash consistency.
 - **`arc-discover` (4 tests)**: CycloneDX v1.6 AI-BOM serialization conformity, multi-origin MCP configuration and asset discovery, modern agent rule (`.mdc`) and model (`.onnx`) asset discovery, audit directory validation and non-directory error handling.
 - **`arc-dlp` (8 tests)**: Invisible Unicode and Trojan Source bidi sanitization, nonce-delimited spotlighting, normalized and raw Shannon entropy calculation, local pseudonymization vault tokenization and rehydration, multi-pattern secret detection, and extended credential types (Stripe live keys, Google Cloud API keys, Database URIs, PyPI tokens, npm tokens).
