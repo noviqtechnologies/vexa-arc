@@ -13,43 +13,224 @@ pub struct TaintEntry {
     pub timestamp_ms: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A node in the causal data-flow graph (FR-TAINT-002)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalNode {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<uuid::Uuid>,
+    pub action_summary: String,
+    pub taints_introduced: Taint,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<arc_core::Capability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_node_ids: Vec<String>,
+    pub timestamp_ms: u64,
+}
+
+pub const MAX_SESSION_HISTORY: usize = 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTaintDag {
     pub session_id: String,
     pub current_taints: Taint,
     pub history: Vec<TaintEntry>,
     #[serde(default)]
     pub known_schemas: HashMap<String, [u8; 32]>,
+    #[serde(default)]
+    pub causal_nodes: Vec<CausalNode>,
+    #[serde(default)]
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+}
+
+impl Default for SessionTaintDag {
+    fn default() -> Self {
+        Self::new("default")
+    }
+}
+
+/// Multi-process cross-platform file locking for session safety (NFR-REL-002)
+pub struct SessionLock {
+    lock_file: PathBuf,
+}
+
+impl SessionLock {
+    pub fn acquire(dir: &Path, session_id: &str) -> std::io::Result<Self> {
+        let safe_name: String = session_id
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let lock_file = dir.join(format!("{safe_name}.lock"));
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_file)
+            {
+                Ok(_) => return Ok(SessionLock { lock_file }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Check for stale lock (older than 10 seconds)
+                    if let Ok(meta) = std::fs::metadata(&lock_file) {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(elapsed) = modified.elapsed() {
+                                if elapsed > std::time::Duration::from_secs(10) {
+                                    let _ = std::fs::remove_file(&lock_file);
+                                }
+                            }
+                        }
+                    }
+                    if start.elapsed() > std::time::Duration::from_secs(3) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("Timed out acquiring lock on session '{session_id}'"),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_file);
+    }
 }
 
 impl SessionTaintDag {
     pub fn new(session_id: impl Into<String>) -> Self {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         Self {
             session_id: session_id.into(),
             current_taints: Taint::empty(),
             history: Vec::new(),
             known_schemas: HashMap::new(),
+            causal_nodes: Vec::new(),
+            created_at_ms: now,
+            expires_at_ms: Some(now + 24 * 3600 * 1000), // 24-hour default TTL
+        }
+    }
+
+    /// Check if session has expired
+    pub fn is_expired(&self) -> bool {
+        if let Some(exp) = self.expires_at_ms {
+            let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            now > exp
+        } else {
+            false
         }
     }
 
     /// Monotonically adds taint labels to the session.
-    /// In accordance with ADR-004, taints are never cleared during an active session.
     pub fn add_taint(&mut self, taint: Taint, origin: impl Into<String>) {
         if taint.is_empty() {
             return;
         }
 
         self.current_taints.insert(taint);
+        let origin_str = origin.into();
         self.history.push(TaintEntry {
             taint,
-            origin: origin.into(),
+            origin: origin_str.clone(),
             timestamp_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
         });
+
+        // Add to causal graph
+        let parent_ids: Vec<String> = self
+            .causal_nodes
+            .iter()
+            .rev()
+            .take(3)
+            .map(|n| n.node_id.clone())
+            .collect();
+
+        self.causal_nodes.push(CausalNode {
+            node_id: uuid::Uuid::now_v7().to_string(),
+            event_id: None,
+            action_summary: origin_str,
+            taints_introduced: taint,
+            capabilities: Vec::new(),
+            parent_node_ids: parent_ids,
+            timestamp_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+        });
+
+        // Bound history and graph size (NFR-PERF-003)
+        if self.history.len() > MAX_SESSION_HISTORY {
+            self.history
+                .drain(0..(self.history.len() - MAX_SESSION_HISTORY));
+        }
+        if self.causal_nodes.len() > MAX_SESSION_HISTORY {
+            self.causal_nodes
+                .drain(0..(self.causal_nodes.len() - MAX_SESSION_HISTORY));
+        }
     }
 
-    /// Serializes and writes this session's state to disk under the specified directory.
+    /// Records an ActionEvent with full causal fidelity (FR-TAINT-002)
+    pub fn record_causal_event(&mut self, event: &ActionEvent, taints: Taint, origin: &str) {
+        if !taints.is_empty() {
+            self.current_taints.insert(taints);
+            self.history.push(TaintEntry {
+                taint: taints,
+                origin: origin.to_string(),
+                timestamp_ms: event.observed_at_unix_ms,
+            });
+        }
+
+        let parent_ids: Vec<String> = if let Some(p_id) = event.parent_event_id {
+            self.causal_nodes
+                .iter()
+                .filter(|n| n.event_id == Some(p_id))
+                .map(|n| n.node_id.clone())
+                .collect()
+        } else {
+            self.causal_nodes
+                .iter()
+                .rev()
+                .take(2)
+                .map(|n| n.node_id.clone())
+                .collect()
+        };
+
+        self.causal_nodes.push(CausalNode {
+            node_id: uuid::Uuid::now_v7().to_string(),
+            event_id: Some(event.event_id),
+            action_summary: if origin.is_empty() {
+                format!("{:?}", event.action)
+            } else {
+                origin.to_string()
+            },
+            taints_introduced: taints,
+            capabilities: event.capabilities.clone(),
+            parent_node_ids: parent_ids,
+            timestamp_ms: event.observed_at_unix_ms,
+        });
+
+        if self.history.len() > MAX_SESSION_HISTORY {
+            self.history
+                .drain(0..(self.history.len() - MAX_SESSION_HISTORY));
+        }
+        if self.causal_nodes.len() > MAX_SESSION_HISTORY {
+            self.causal_nodes
+                .drain(0..(self.causal_nodes.len() - MAX_SESSION_HISTORY));
+        }
+    }
+
+    /// Serializes and writes this session's state to disk atomically (NFR-REL-001)
     pub fn save_to_dir(&self, dir: &Path) -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(dir)?;
+        let _lock = SessionLock::acquire(dir, &self.session_id)?;
+
         let safe_name: String = self
             .session_id
             .chars()
@@ -61,13 +242,24 @@ impl SessionTaintDag {
                 }
             })
             .collect();
-        let path = dir.join(format!("{safe_name}.json"));
+        let target_path = dir.join(format!("{safe_name}.json"));
+        let temp_path = dir.join(format!("{safe_name}.tmp.{}", uuid::Uuid::now_v7()));
+
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&path, json)?;
-        Ok(path)
+        std::fs::write(&temp_path, json.as_bytes())?;
+
+        #[cfg(windows)]
+        {
+            if target_path.exists() {
+                let _ = std::fs::remove_file(&target_path);
+            }
+        }
+
+        std::fs::rename(&temp_path, &target_path)?;
+        Ok(target_path)
     }
 
-    /// Loads a session's state from disk if it exists.
+    /// Loads a session's state from disk if it exists, acquiring a lock for safety.
     pub fn load_from_dir(dir: &Path, session_id: &str) -> std::io::Result<Option<Self>> {
         let safe_name: String = session_id
             .chars()
@@ -83,13 +275,20 @@ impl SessionTaintDag {
         if !path.exists() {
             return Ok(None);
         }
+
+        let _lock = SessionLock::acquire(dir, session_id)?;
         let content = std::fs::read_to_string(&path)?;
         let dag: Self = serde_json::from_str(&content).map_err(std::io::Error::other)?;
+        if dag.is_expired() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(None);
+        }
         Ok(Some(dag))
     }
 
     /// Removes a session's persisted file from disk.
     pub fn delete_from_dir(dir: &Path, session_id: &str) -> std::io::Result<bool> {
+        let _lock = SessionLock::acquire(dir, session_id)?;
         let safe_name: String = session_id
             .chars()
             .map(|c| {
@@ -109,9 +308,7 @@ impl SessionTaintDag {
         }
     }
 
-    /// Evaluates whether the requested sink triggers the Lethal Trifecta:
-    /// SessionTaints has PRIVATE_DATA (or SECRET_MATERIAL) AND UNTRUSTED_CONTENT
-    /// AND target sink has EXTERNAL_EGRESS or DESTRUCTIVE
+    /// Evaluates whether the requested sink triggers the Lethal Trifecta with Causal Trace:
     pub fn check_lethal_trifecta(&self, sink: SinkClass) -> Option<Explanation> {
         let has_private = self.current_taints.contains(Taint::PRIVATE_DATA)
             || self.current_taints.contains(Taint::SECRET_MATERIAL)
@@ -153,8 +350,25 @@ impl SessionTaintDag {
                 format!("'{}'", untrusted_origins.join("', '"))
             };
 
+            // Generate causal chain explanation (FR-TAINT-002 / FR-CORE-002)
+            let mut causal_chain = String::new();
+            if !self.causal_nodes.is_empty() {
+                causal_chain.push_str("\nCausal Ancestry Graph:\n");
+                for node in self
+                    .causal_nodes
+                    .iter()
+                    .filter(|n| !n.taints_introduced.is_empty())
+                    .take(5)
+                {
+                    causal_chain.push_str(&format!(
+                        "  → [{:?}] {} (Taints: {:?})\n",
+                        node.timestamp_ms, node.action_summary, node.taints_introduced
+                    ));
+                }
+            }
+
             let reason = format!(
-                "Lethal Trifecta detected. Session has accessed private context ({p_summary}) and ingested untrusted external context ({u_summary}). Outbound network or destructive action was blocked to prevent indirect prompt injection data exfiltration."
+                "Lethal Trifecta detected. Session has accessed private context ({p_summary}) and ingested untrusted external context ({u_summary}). Outbound network or destructive action was blocked to prevent indirect prompt injection data exfiltration.{causal_chain}"
             );
 
             let options = vec![
@@ -220,13 +434,11 @@ impl TaintTracker {
 
     pub fn record_event_and_update_taints(&self, event: &ActionEvent) -> Taint {
         let (taint, origin) = Self::classify_event_taints(event);
-        if !taint.is_empty() {
-            let mut guard = self.sessions.write().unwrap();
-            let session = guard
-                .entry(event.host_session_id.clone())
-                .or_insert_with(|| SessionTaintDag::new(&event.host_session_id));
-            session.add_taint(taint, origin);
-        }
+        let mut guard = self.sessions.write().unwrap();
+        let session = guard
+            .entry(event.host_session_id.clone())
+            .or_insert_with(|| SessionTaintDag::new(&event.host_session_id));
+        session.record_causal_event(event, taint, &origin);
         taint
     }
 
@@ -234,6 +446,16 @@ impl TaintTracker {
         let sink = Self::classify_sink(action);
         let guard = self.sessions.read().unwrap();
         if let Some(session) = guard.get(session_id) {
+            session.check_lethal_trifecta(sink)
+        } else {
+            None
+        }
+    }
+
+    pub fn check_event_trifecta(&self, event: &ActionEvent) -> Option<Explanation> {
+        let sink = Self::classify_event_sink(event);
+        let guard = self.sessions.read().unwrap();
+        if let Some(session) = guard.get(&event.host_session_id) {
             session.check_lethal_trifecta(sink)
         } else {
             None
@@ -417,11 +639,50 @@ impl TaintTracker {
                 }
                 (taint, origin)
             }
+            arc_core::event::EventProvenance::Authenticated(auth) => {
+                let (mut taint, mut origin) = Self::classify_action_taints(&event.action);
+                if auth.confidence == arc_core::ProvenanceConfidence::Untrusted {
+                    taint.insert(Taint::UNTRUSTED_CONTENT);
+                }
+                match auth.source_type {
+                    arc_core::ProvenanceSourceType::RemoteContent => {
+                        taint.insert(Taint::UNTRUSTED_CONTENT);
+                    }
+                    arc_core::ProvenanceSourceType::LocalFile => {
+                        taint.insert(Taint::PRIVATE_DATA);
+                    }
+                    _ => {}
+                }
+                if origin.is_empty() {
+                    origin = format!("auth:{:?}:{}", auth.source_type, auth.source_identity);
+                }
+                (taint, origin)
+            }
             arc_core::event::EventProvenance::UserExplicit => {
                 let (taint, origin) = Self::classify_action_taints(&event.action);
                 (taint, origin)
             }
         }
+    }
+
+    /// Classifies an ActionEvent into a SinkClass using both action structure and explicit capabilities.
+    pub fn classify_event_sink(event: &ActionEvent) -> SinkClass {
+        let mut sink = Self::classify_sink(&event.action);
+        for cap in &event.capabilities {
+            match cap {
+                arc_core::Capability::NetworkEgress | arc_core::Capability::ExternalMessaging => {
+                    sink.insert(SinkClass::EXTERNAL_EGRESS);
+                }
+                arc_core::Capability::FileDelete => {
+                    sink.insert(SinkClass::DESTRUCTIVE);
+                }
+                arc_core::Capability::ProcessExecution => {
+                    sink.insert(SinkClass::CODE_EXECUTION);
+                }
+                _ => {}
+            }
+        }
+        sink
     }
 
     /// Classifies the sink capability of an action.
