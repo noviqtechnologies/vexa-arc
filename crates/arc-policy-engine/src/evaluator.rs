@@ -6,12 +6,34 @@ use std::sync::RwLock;
 
 use crate::taint_dag::TaintTracker;
 
+fn default_policy_version() -> String {
+    "1.0.0".to_string()
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySource {
+    BuiltInDefault,
+    UserGlobal,
+    ProjectLocal,
+    SignedOrganization,
+    EmergencyDeny,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PolicyConfig {
+    #[serde(default = "default_policy_version")]
+    pub version: String,
+    #[serde(default)]
+    pub source: Option<PolicySource>,
     pub allowed_mcp_servers: HashSet<String>,
     pub block_unapproved_mcp: bool,
     pub enforce_taint_dag: bool,
     pub redact_secrets: bool,
+    #[serde(default)]
+    pub emergency_deny_servers: HashSet<String>,
 }
 
 impl Default for PolicyConfig {
@@ -23,40 +45,114 @@ impl Default for PolicyConfig {
         allowed.insert("sqlite".to_string());
 
         Self {
+            version: default_policy_version(),
+            source: Some(PolicySource::BuiltInDefault),
             allowed_mcp_servers: allowed,
             block_unapproved_mcp: false,
             enforce_taint_dag: true,
             redact_secrets: true,
+            emergency_deny_servers: HashSet::new(),
         }
     }
 }
 
 impl PolicyConfig {
-    /// Loads a policy configuration from an optional project directory (.arc/policy.json or .arc.json)
-    /// Falling back to the default configuration if the file does not exist.
-    pub fn load_from_dir(dir: &std::path::Path) -> Self {
-        let candidate_paths = [dir.join(".arc").join("policy.json"), dir.join(".arc.json")];
+    /// Loads policy with documented precedence (FR-CORE-005):
+    /// BuiltInDefault < UserGlobal (~/.arc/policy.json) < ProjectLocal (.arc/policy.json) < SignedOrganization
+    pub fn load_with_precedence(project_dir: Option<&std::path::Path>) -> Self {
+        let mut effective = Self::default();
 
-        for path in &candidate_paths {
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    if let Ok(cfg) = serde_json::from_str::<PolicyConfig>(&content) {
-                        return cfg;
+        // 1. Check user global path (~/.arc/policy.json)
+        if let Some(user_home) = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+        {
+            let user_cfg = user_home.join(".arc").join("policy.json");
+            if user_cfg.exists() {
+                if let Ok(content) = std::fs::read_to_string(&user_cfg) {
+                    if let Ok(mut parsed) = serde_json::from_str::<PolicyConfig>(&content) {
+                        parsed.source = Some(PolicySource::UserGlobal);
+                        effective.merge_lower_precedence(parsed);
                     }
                 }
             }
         }
 
-        Self::default()
+        // 2. Check project local path (.arc/policy.json or .arc.json)
+        if let Some(dir) = project_dir {
+            let candidate_paths = [dir.join(".arc").join("policy.json"), dir.join(".arc.json")];
+            for path in &candidate_paths {
+                if path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        if let Ok(mut parsed) = serde_json::from_str::<PolicyConfig>(&content) {
+                            parsed.source = Some(PolicySource::ProjectLocal);
+                            effective.merge_lower_precedence(parsed);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 3. Check signed organization policy (.arc/signed_policy.json)
+            let org_path = dir.join(".arc").join("signed_policy.json");
+            if org_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&org_path) {
+                    if let Ok(mut parsed) = serde_json::from_str::<PolicyConfig>(&content) {
+                        parsed.source = Some(PolicySource::SignedOrganization);
+                        effective.merge_lower_precedence(parsed);
+                    }
+                }
+            }
+        }
+
+        effective
     }
 
-    /// Saves the policy configuration to .arc/policy.json in the specified directory.
+    /// Merges higher precedence config over current config, preserving emergency deny rules
+    pub fn merge_lower_precedence(&mut self, higher: PolicyConfig) {
+        self.version = higher.version;
+        self.source = higher.source;
+        self.block_unapproved_mcp = higher.block_unapproved_mcp;
+        self.enforce_taint_dag = higher.enforce_taint_dag;
+        self.redact_secrets = higher.redact_secrets;
+
+        // Emergency deny rules cannot be removed by local policy
+        for s in higher.emergency_deny_servers {
+            self.emergency_deny_servers.insert(s);
+        }
+
+        // Allowed servers from higher precedence
+        self.allowed_mcp_servers = higher.allowed_mcp_servers;
+        // Strip emergency denied servers from allow list
+        for denied in &self.emergency_deny_servers {
+            self.allowed_mcp_servers.remove(denied);
+        }
+    }
+
+    /// Loads a policy configuration from an optional project directory (.arc/policy.json or .arc.json)
+    /// Falling back to the default configuration if the file does not exist.
+    pub fn load_from_dir(dir: &std::path::Path) -> Self {
+        Self::load_with_precedence(Some(dir))
+    }
+
+    /// Saves the policy configuration to .arc/policy.json in the specified directory atomically (NFR-REL-001).
     pub fn save_to_dir(&self, dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
         let arc_dir = dir.join(".arc");
         std::fs::create_dir_all(&arc_dir)?;
         let path = arc_dir.join("policy.json");
+        let temp_path = arc_dir.join(format!("policy.tmp.{}", uuid::Uuid::now_v7()));
+
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&path, json)?;
+        std::fs::write(&temp_path, json.as_bytes())?;
+
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        std::fs::rename(&temp_path, &path)?;
         Ok(path)
     }
 }
@@ -130,8 +226,25 @@ impl PolicyEvaluator {
         let cfg = self.config.read().unwrap().clone();
         let session_id = &event.host_session_id;
 
-        // 1. Check MCP allow-list
+        // 1. Check MCP allow-list and emergency deny rules
         if let Action::McpToolCall { ref server, .. } = event.action {
+            if cfg.emergency_deny_servers.contains(&server.config_name) {
+                return Verdict::Deny {
+                    rule: RuleId("ARC-EMG-001".to_string()),
+                    explanation: Explanation::new(
+                        format!(
+                            "Emergency Deny: MCP server '{}' is blocked by emergency security policy.",
+                            server.config_name
+                        ),
+                        vec![
+                            "Contact security administration for emergency policy exceptions.".to_string(),
+                            "Inspect tool server integrity before requesting unblock.".to_string(),
+                        ],
+                        Some("https://docs.vexa.ai/arc/policies/ARC-EMG-001".to_string()),
+                    ),
+                };
+            }
+
             if cfg.block_unapproved_mcp && !cfg.allowed_mcp_servers.contains(&server.config_name) {
                 return Verdict::Deny {
                     rule: RuleId("ARC-MCP-001".to_string()),
@@ -178,8 +291,7 @@ impl PolicyEvaluator {
 
         // 2. Check Stateful Taint DAG for Lethal Trifecta (Private Data + Untrusted Context -> External Egress)
         if cfg.enforce_taint_dag {
-            if let Some(explanation) = self.taint_tracker.check_trifecta(session_id, &event.action)
-            {
+            if let Some(explanation) = self.taint_tracker.check_event_trifecta(event) {
                 return Verdict::Deny {
                     rule: RuleId("ARC-LTT-001".to_string()),
                     explanation,
@@ -327,8 +439,7 @@ mod tests {
         let cfg = PolicyConfig {
             allowed_mcp_servers: allowed,
             block_unapproved_mcp: true,
-            enforce_taint_dag: true,
-            redact_secrets: true,
+            ..Default::default()
         };
 
         let saved_path = cfg.save_to_dir(&temp_dir).expect("Failed to save policy");
@@ -417,6 +528,50 @@ mod tests {
             assert_eq!(rule.0, "ARC-RUG-001");
         } else {
             panic!("Expected Quarantine verdict");
+        }
+    }
+
+    #[test]
+    fn test_policy_precedence_and_emergency_deny() {
+        let mut base = PolicyConfig::default();
+        let mut emergency = PolicyConfig::default();
+        emergency
+            .emergency_deny_servers
+            .insert("rogue-corp-mcp".to_string());
+        base.merge_lower_precedence(emergency);
+
+        // Even if local policy tries to allow rogue-corp-mcp:
+        let mut local_override = PolicyConfig::default();
+        local_override
+            .allowed_mcp_servers
+            .insert("rogue-corp-mcp".to_string());
+        base.merge_lower_precedence(local_override);
+
+        assert!(!base.allowed_mcp_servers.contains("rogue-corp-mcp"));
+        assert!(base.emergency_deny_servers.contains("rogue-corp-mcp"));
+
+        let evaluator = PolicyEvaluator::new(base);
+        let event = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "sess-emergency",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "rogue-corp-mcp".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: None,
+                },
+                tool: "run".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let verdict = evaluator.evaluate(&event);
+        assert!(verdict.is_denied());
+        if let Verdict::Deny { rule, .. } = verdict {
+            assert_eq!(rule.0, "ARC-EMG-001");
+        } else {
+            panic!("Expected emergency deny");
         }
     }
 }
