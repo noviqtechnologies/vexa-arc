@@ -1567,25 +1567,26 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
             }
             return false;
         }
-    } else {
-        if let Err(err) = evaluator.load_session_state(&storage_dir, session) {
-            if opts.json {
-                let json_output = serde_json::json!({
-                    "error": format!("Session state file is corrupt or unreadable: {err}"),
-                    "session_id": session,
-                    "storage_dir": storage_dir.display().to_string(),
-                    "corrupt": true,
-                    "success": false,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
-                );
-            } else {
-                eprintln!("Error: Session state file for '{session}' in '{}' is corrupt or unreadable: {err}", storage_dir.display());
-            }
-            return false;
+    } else if let Err(err) = evaluator.load_session_state(&storage_dir, session) {
+        if opts.json {
+            let json_output = serde_json::json!({
+                "error": format!("Session state file is corrupt or unreadable: {err}"),
+                "session_id": session,
+                "storage_dir": storage_dir.display().to_string(),
+                "corrupt": true,
+                "success": false,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json_output).unwrap_or_default()
+            );
+        } else {
+            eprintln!(
+                "Error: Session state file for '{session}' in '{}' is corrupt or unreadable: {err}",
+                storage_dir.display()
+            );
         }
+        return false;
     }
 
     let prev_dag = evaluator.taint_tracker.get_or_create(session);
