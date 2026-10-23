@@ -786,7 +786,7 @@ fn run_trace(
         println!("Event / Action:     {}", node.action_summary);
         println!("Node ID:            {}", node.node_id);
         if let Some(id) = node.event_id {
-            println!("Event UUID:         {}", id);
+            println!("Event UUID:         {id}");
         }
         println!("Taints Introduced:  {:?}", node.taints_introduced);
         println!("Capabilities:       {:?}", node.capabilities);
@@ -937,7 +937,7 @@ fn run_test(json: bool) -> bool {
         println!("=======================================================");
         for (name, passed) in &results {
             let status = if *passed { "PASS [OK]" } else { "FAIL [X]" };
-            println!("{:<48} : {}", name, status);
+            println!("{name:<48} : {status}");
         }
         println!("=======================================================");
         if all_passed {
