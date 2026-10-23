@@ -345,8 +345,7 @@ fn test_e2e_unapproved_mcp_server_block() {
     let cfg = PolicyConfig {
         allowed_mcp_servers: allowed,
         block_unapproved_mcp: true,
-        enforce_taint_dag: true,
-        redact_secrets: true,
+        ..Default::default()
     };
 
     let evaluator = PolicyEvaluator::new(cfg);
@@ -1310,4 +1309,158 @@ fn test_cli_schema_malformed_input_rejected() {
         .expect("failed to run arc intercept mcp with valid json schema");
 
     assert_eq!(out3.status.code(), Some(0));
+}
+
+#[test]
+fn test_cli_doctor_and_adversarial_test_commands() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+
+    // 1. arc doctor --json produces valid diagnostic schema
+    let out_doc = Command::new(arc_bin)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run arc doctor");
+
+    assert_eq!(out_doc.status.code(), Some(0));
+    let stdout_doc = String::from_utf8_lossy(&out_doc.stdout);
+    let json_doc: serde_json::Value =
+        serde_json::from_str(&stdout_doc).expect("arc doctor --json must be valid JSON");
+    assert_eq!(json_doc["status"], "healthy");
+    assert_eq!(json_doc["version"], "1.0.0");
+    assert!(json_doc["supported_adapters"].as_array().unwrap().len() >= 4);
+
+    // 2. arc test --json runs adversarial test suite
+    let out_test = Command::new(arc_bin)
+        .args(["test", "--json"])
+        .output()
+        .expect("failed to run arc test");
+
+    assert_eq!(out_test.status.code(), Some(0));
+    let stdout_test = String::from_utf8_lossy(&out_test.stdout);
+    let json_test: serde_json::Value =
+        serde_json::from_str(&stdout_test).expect("arc test --json must be valid JSON");
+    assert_eq!(json_test["all_passed"], true);
+    assert_eq!(json_test["tests"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn test_cli_trace_causal_graph_inspection() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let session = format!(
+        "sess-trace-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    // Step 1: Read .env (introduces PRIVATE_DATA)
+    let out1 = Command::new(arc_bin)
+        .args(["intercept", "read", ".env", "--session", &session])
+        .output()
+        .expect("failed to run arc intercept read");
+    assert_eq!(out1.status.code(), Some(0));
+
+    // Step 2: Query trace for the session
+    let out_trace = Command::new(arc_bin)
+        .args(["trace", "latest", "--session", &session, "--json"])
+        .output()
+        .expect("failed to run arc trace");
+
+    assert_eq!(out_trace.status.code(), Some(0));
+    let stdout_trace = String::from_utf8_lossy(&out_trace.stdout);
+    let json_trace: serde_json::Value =
+        serde_json::from_str(&stdout_trace).expect("arc trace must produce valid JSON");
+    assert_eq!(json_trace["session_id"], session);
+    assert!(json_trace["causal_graph_size"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn test_complete_path_latency_benchmark() {
+    // Benchmark meeting NFR-PERF-001 requirements:
+    // Complete protected path: message parsing -> capability mapping -> policy evaluation ->
+    // schema verification -> DLP secret redaction -> response formatting.
+    use arc_hooks::broker::{ClientMessageOutcome, McpStdioBroker};
+    use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
+
+    let evaluator = PolicyEvaluator::new(PolicyConfig::default());
+    let mut broker = McpStdioBroker::new("benchmark-server", "sess-perf-benchmark", evaluator);
+
+    // Warm-up iteration
+    let sample_payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "bench-warmup",
+        "method": "tools/call",
+        "params": {
+            "name": "read_and_process",
+            "arguments": {
+                "file": "config.yaml",
+                "secret_key": "AKIAIOSFODNN7EXAMPLE",
+                "content": "A".repeat(1024)
+            }
+        }
+    })
+    .to_string();
+
+    let _ = broker.handle_client_message(&sample_payload);
+
+    let iterations = 200;
+    let mut durations: Vec<std::time::Duration> = Vec::with_capacity(iterations);
+
+    let test_payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "bench-iter",
+        "method": "tools/call",
+        "params": {
+            "name": "read_and_process",
+            "arguments": {
+                "file": "data.json",
+                "key": "AKIAIOSFODNN7EXAMPLE",
+                "payload": "Benchmarking complete path across adapter and engine".repeat(20)
+            }
+        }
+    })
+    .to_string();
+
+    for i in 0..iterations {
+        let start = std::time::Instant::now();
+        let outcome = broker.handle_client_message(&test_payload);
+        let elapsed = start.elapsed();
+        durations.push(elapsed);
+
+        match outcome {
+            ClientMessageOutcome::Forward(forwarded) => {
+                assert!(!forwarded.contains("AKIAIOSFODNN7EXAMPLE"));
+            }
+            _ => panic!("Iteration {i} failed unexpectedly"),
+        }
+    }
+
+    durations.sort();
+    let p50 = durations[iterations / 2];
+    let p95 = durations[(iterations * 95) / 100];
+    let p99 = durations[(iterations * 99) / 100];
+
+    println!(
+        "\n--- Complete-Path Latency Benchmark (NFR-PERF-001) --- \n\
+         Iterations: {}\n\
+         p50:  {:.3} ms\n\
+         p95:  {:.3} ms\n\
+         p99:  {:.3} ms\n\
+         Platform: {} ({})\n\
+         -------------------------------------------------------",
+        iterations,
+        p50.as_secs_f64() * 1000.0,
+        p95.as_secs_f64() * 1000.0,
+        p99.as_secs_f64() * 1000.0,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
+    // Assert p99 latency is within PRD budget (p99 <= 25ms)
+    assert!(
+        p99.as_secs_f64() * 1000.0 <= 25.0,
+        "Complete path p99 must meet PRD budget of <= 25ms, got {:.3} ms",
+        p99.as_secs_f64() * 1000.0
+    );
 }

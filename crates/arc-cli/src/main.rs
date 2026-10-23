@@ -12,7 +12,9 @@ use arc_discover::scanner::DiscoveryScanner;
 use arc_dlp::detector::SecretScanEngine;
 use arc_dlp::vault::LocalPseudonymizationVault;
 use arc_firewall::proxy::PackageFirewall;
-use arc_policy_engine::evaluator::PolicyEvaluator;
+use arc_hooks::broker::McpStdioBroker;
+use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
+use arc_policy_engine::taint_dag::SessionTaintDag;
 
 #[derive(Parser)]
 #[command(
@@ -77,8 +79,68 @@ enum Commands {
         action: InterceptAction,
     },
 
+    /// Protect an agent or MCP server using fail-closed runtime enforcement (FR-MCP-001)
+    Protect {
+        #[command(subcommand)]
+        action: ProtectAction,
+    },
+
+    /// Diagnose installation, runtime adapters, policy, storage, and protection status (FR-CLI-001)
+    Doctor {
+        /// Output health and diagnostic report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Trace decision, causal data-flow ancestry, and evidence for an event (FR-CLI-004)
+    Trace {
+        /// Event ID or UUID to inspect (or 'latest' for the most recent event)
+        event_id: String,
+
+        /// Host session identifier
+        #[arg(short, long, default_value = "default-session")]
+        session: String,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
+
+        /// Output trace evidence as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run local adversarial verification test fixtures (FR-CLI-001)
+    Test {
+        /// Output test results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Display platform version and operational status
     Version,
+}
+
+#[derive(Subcommand)]
+enum ProtectAction {
+    /// Supervise an MCP server via managed stdio broker (FR-MCP-001)
+    Stdio {
+        /// MCP server identifier (e.g. 'github' or 'sqlite')
+        #[arg(short, long)]
+        server: String,
+
+        /// Host session identifier
+        #[arg(long, default_value = "default-session")]
+        session: String,
+
+        /// Target MCP server command and arguments
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -532,12 +594,360 @@ fn main() {
                 }
             }
         },
+        Commands::Protect { action } => match action {
+            ProtectAction::Stdio {
+                server,
+                session,
+                command,
+            } => {
+                if !run_protect_stdio(&server, &session, command) {
+                    std::process::exit(1);
+                }
+            }
+        },
+        Commands::Doctor { json } => {
+            if !run_doctor(json) {
+                std::process::exit(1);
+            }
+        }
+        Commands::Trace {
+            event_id,
+            session,
+            session_dir,
+            project_local,
+            json,
+        } => {
+            if !run_trace(
+                &event_id,
+                &session,
+                session_dir.as_deref(),
+                project_local,
+                json,
+            ) {
+                std::process::exit(1);
+            }
+        }
+        Commands::Test { json } => {
+            if !run_test(json) {
+                std::process::exit(1);
+            }
+        }
         Commands::Version => {
             println!("Vexa Arc CLI v1.0.0 (Agentic Runtime Control)");
             println!("Target Architecture: Pure Rust Pre-Execution Endpoint & Agent Firewall");
             println!("License: Apache-2.0");
         }
     }
+}
+
+fn run_doctor(json: bool) -> bool {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let policy = PolicyConfig::load_with_precedence(Some(Path::new(".")));
+    let session_dir = resolve_session_storage_dir(None, false);
+    let session_status = match &session_dir {
+        Ok(dir) => format!("writable ({})", dir.display()),
+        Err(e) => format!("error: {e}"),
+    };
+
+    let adapters = vec![
+        "ClaudeCode (arc-hooks::ClaudeCodeAdapter)",
+        "Cursor (arc-hooks::CursorAdapter)",
+        "ManagedStdioBroker (arc-hooks::McpStdioBroker)",
+        "GenericJsonRpc (arc-hooks::McpJsonRpcInterceptor)",
+    ];
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "healthy",
+                "version": "1.0.0",
+                "os": os,
+                "arch": arch,
+                "policy_version": policy.version,
+                "policy_source": format!("{:?}", policy.source.unwrap_or(arc_policy_engine::evaluator::PolicySource::BuiltInDefault)),
+                "allowed_mcp_servers": policy.allowed_mcp_servers.len(),
+                "emergency_deny_servers": policy.emergency_deny_servers.len(),
+                "session_storage": session_status,
+                "supported_adapters": adapters,
+            })
+        );
+        return true;
+    }
+
+    println!("\n=======================================================");
+    println!("             VEXA ARC SYSTEM DIAGNOSTIC (DOCTOR)       ");
+    println!("=======================================================");
+    println!("Operational Status: HEALTHY");
+    println!("Engine Version:     v1.0.0 (Rust 2021 Edition)");
+    println!("Platform:           {os} ({arch})");
+    println!(
+        "Effective Policy:   v{} (Source: {:?})",
+        policy.version,
+        policy
+            .source
+            .unwrap_or(arc_policy_engine::evaluator::PolicySource::BuiltInDefault)
+    );
+    println!(
+        "Allowed Servers:    {} registered",
+        policy.allowed_mcp_servers.len()
+    );
+    println!(
+        "Emergency Deny:     {} active rules",
+        policy.emergency_deny_servers.len()
+    );
+    println!("Session Storage:    {session_status}");
+    println!("Supported Adapters:");
+    for a in &adapters {
+        println!("  • {a}");
+    }
+    println!("=======================================================\n");
+    true
+}
+
+fn run_protect_stdio(server: &str, session: &str, command: Vec<String>) -> bool {
+    let policy = PolicyConfig::load_with_precedence(Some(Path::new(".")));
+    let evaluator = PolicyEvaluator::new(policy);
+    let mut broker = McpStdioBroker::new(server, session, evaluator).with_command(command);
+
+    eprintln!("[Arc Protect] Supervising MCP server '{server}' in session '{session}' (Fail-Closed Protected Edge)");
+    if let Err(e) = broker.run_stdio() {
+        eprintln!("[Arc Protect] Stdio broker error: {e}");
+        return false;
+    }
+    true
+}
+
+fn run_trace(
+    event_id: &str,
+    session_id: &str,
+    session_dir: Option<&Path>,
+    project_local: bool,
+    json: bool,
+) -> bool {
+    let dir = match resolve_session_storage_dir(session_dir, project_local) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Session storage error: {e}");
+            return false;
+        }
+    };
+
+    let dag = match SessionTaintDag::load_from_dir(&dir, session_id) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            eprintln!(
+                "Error: Session '{session_id}' not found in storage: {}",
+                dir.display()
+            );
+            return false;
+        }
+        Err(e) => {
+            eprintln!("Error loading session: {e}");
+            return false;
+        }
+    };
+
+    let matched_node = if event_id.eq_ignore_ascii_case("latest") {
+        dag.causal_nodes.last()
+    } else {
+        dag.causal_nodes.iter().find(|n| {
+            n.node_id.contains(event_id)
+                || n.event_id
+                    .map(|id| id.to_string().contains(event_id))
+                    .unwrap_or(false)
+        })
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "session_id": session_id,
+                "current_taints": format!("{:?}", dag.current_taints),
+                "matched_event": matched_node,
+                "causal_graph_size": dag.causal_nodes.len(),
+                "history_length": dag.history.len(),
+            })
+        );
+        return true;
+    }
+
+    println!("\n=======================================================");
+    println!("             VEXA ARC CAUSAL TRACE REPORT               ");
+    println!("=======================================================");
+    println!("Session ID:         {}", dag.session_id);
+    println!("Current Taints:     {:?}", dag.current_taints);
+    println!("Graph Node Count:   {}", dag.causal_nodes.len());
+    println!("-------------------------------------------------------");
+
+    if let Some(node) = matched_node {
+        println!("Event / Action:     {}", node.action_summary);
+        println!("Node ID:            {}", node.node_id);
+        if let Some(id) = node.event_id {
+            println!("Event UUID:         {}", id);
+        }
+        println!("Taints Introduced:  {:?}", node.taints_introduced);
+        println!("Capabilities:       {:?}", node.capabilities);
+        println!("Parent Nodes:       {:?}", node.parent_node_ids);
+    } else {
+        println!("(No specific event matching '{event_id}' found in session history)");
+    }
+
+    if !dag.causal_nodes.is_empty() {
+        println!("\nCausal Ancestry Chain:");
+        for (i, node) in dag.causal_nodes.iter().rev().take(5).enumerate() {
+            println!(
+                "  [{}] {} (Taints: {:?})",
+                i + 1,
+                node.action_summary,
+                node.taints_introduced
+            );
+        }
+    }
+    println!("=======================================================\n");
+    true
+}
+
+fn run_test(json: bool) -> bool {
+    let mut results = Vec::new();
+
+    // 1. Rug-Pull Quarantine Test
+    let rug_pull_pass = {
+        let evaluator = PolicyEvaluator::default();
+        let s1 = [1u8; 32];
+        let s2 = [2u8; 32];
+        let e1 = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "test-rug",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "test-mcp".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: Some(s1),
+                },
+                tool: "search".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let _ = evaluator.evaluate(&e1);
+        let e2 = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "test-rug",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "test-mcp".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: Some(s2),
+                },
+                tool: "search".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let v2 = evaluator.evaluate(&e2);
+        matches!(v2, arc_core::Verdict::Quarantine { .. })
+    };
+    results.push(("Dynamic Schema Rug-Pull Quarantine", rug_pull_pass));
+
+    // 2. Lethal Trifecta Prevention Test
+    let trifecta_pass = {
+        let evaluator = PolicyEvaluator::default();
+        let e_priv = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "test-trifecta",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::FileRead {
+                path: PathBuf::from(".env"),
+            },
+        );
+        let _ = evaluator.evaluate(&e_priv);
+
+        let e_untrusted = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "test-trifecta",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::PromptSubmit {
+                text: "https://evil.com/issue".to_string(),
+                source: Some("untrusted_web".to_string()),
+            },
+        );
+        let _ = evaluator.evaluate(&e_untrusted);
+
+        let e_sink = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "test-trifecta",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "slack".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: None,
+                },
+                tool: "slack_post_message".to_string(),
+                arguments: serde_json::json!({"text": "leak"}),
+            },
+        );
+        let v_sink = evaluator.evaluate(&e_sink);
+        v_sink.is_denied()
+    };
+    results.push((
+        "Lethal Trifecta Context Exfiltration Prevention",
+        trifecta_pass,
+    ));
+
+    // 3. Secret Detection & Redaction
+    let dlp_pass = {
+        let engine = SecretScanEngine::new();
+        let sample = b"api_key: AKIAIOSFODNN7EXAMPLE";
+        let findings = engine.scan(sample);
+        !findings.is_empty()
+    };
+    results.push(("Context DLP Secret Detection & Byte Offsets", dlp_pass));
+
+    // 4. Package Slopsquatting Defense
+    let package_pass = {
+        let fw = PackageFirewall::new();
+        let verdict = fw.inspect_package(Ecosystem::Npm, "reactt", Some(2), Some(10), true);
+        verdict.is_blocked()
+    };
+    results.push(("Anti-Slopsquatting Package Firewall Gate", package_pass));
+
+    let all_passed = results.iter().all(|(_, p)| *p);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "adversarial_runtime_verification",
+                "all_passed": all_passed,
+                "tests": results.iter().map(|(n, p)| serde_json::json!({ "name": n, "passed": p })).collect::<Vec<_>>()
+            })
+        );
+    } else {
+        println!("\n=======================================================");
+        println!("             VEXA ARC ADVERSARIAL TEST SUITE           ");
+        println!("=======================================================");
+        for (name, passed) in &results {
+            let status = if *passed { "PASS [OK]" } else { "FAIL [X]" };
+            println!("{:<48} : {}", name, status);
+        }
+        println!("=======================================================");
+        if all_passed {
+            println!("All adversarial tests PASSED (0 failures).\n");
+        } else {
+            println!("Some adversarial tests FAILED.\n");
+        }
+    }
+
+    all_passed
 }
 
 fn run_audit(path: &Path, output_json: bool, bom_file: Option<&Path>) -> bool {

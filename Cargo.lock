@@ -155,7 +155,9 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -168,6 +170,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
