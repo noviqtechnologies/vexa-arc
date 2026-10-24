@@ -1528,7 +1528,7 @@ fn test_cli_trace_export_and_session_cleanup() {
 
     // 2. Export trace to a temporary file
     let temp_dir = std::env::temp_dir();
-    let export_path = temp_dir.join(format!("arc_trace_{}.json", session));
+    let export_path = temp_dir.join(format!("arc_trace_{session}.json"));
 
     let out_trace = Command::new(arc_bin)
         .args([
