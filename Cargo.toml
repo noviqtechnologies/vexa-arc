@@ -31,3 +31,4 @@ thiserror = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+vexa-sca = { git = "https://github.com/noviqtechnologies/vexa-sca", tag = "v1.0.0" }

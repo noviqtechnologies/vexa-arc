@@ -126,10 +126,23 @@ impl McpStdioBroker {
 
                 let caps = Capability::infer(&tool_name, false, false, false);
 
+                let artifact = if !self.command.is_empty() {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    for part in &self.command {
+                        hasher.update(part.as_bytes());
+                    }
+                    Artifact::Local {
+                        command_sha256: hasher.finalize().into(),
+                    }
+                } else {
+                    Artifact::Unknown
+                };
+
                 let action = Action::McpToolCall {
                     server: ServerIdentity {
                         config_name: self.server_name.clone(),
-                        artifact: Artifact::Unknown,
+                        artifact,
                         schema_root: self.current_schema_hash,
                     },
                     tool: tool_name.clone(),
@@ -246,13 +259,15 @@ impl McpStdioBroker {
         ServerMessageOutcome::Forward(line.to_string())
     }
 
-    /// Runs mediation between client stdio and child process streams (FR-MCP-001)
+    /// Runs mediation between client stdio and child process streams with OS-level containment (FR-MCP-001 / FR-HOOKS-003)
     pub fn run_stdio(&mut self) -> Result<(), BrokerError> {
         if self.command.is_empty() {
             return Err(BrokerError::ProtocolError(
                 "No target command specified for stdio broker".to_string(),
             ));
         }
+
+        let supervisor = crate::process_containment::OsProcessSupervisor::new()?;
 
         let mut cmd = Command::new(&self.command[0]);
         if self.command.len() > 1 {
@@ -263,7 +278,10 @@ impl McpStdioBroker {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::inherit()); // Stderr preserved separately (FR-MCP-001)
 
+        supervisor.configure_command(&mut cmd);
         let mut child = cmd.spawn()?;
+        supervisor.supervise_child(&child)?;
+
         let mut child_stdin = child.stdin.take().ok_or(BrokerError::ChildTerminated)?;
         let child_stdout = child.stdout.take().ok_or(BrokerError::ChildTerminated)?;
 
@@ -332,8 +350,7 @@ impl McpStdioBroker {
         }
 
         running.store(false, Ordering::Relaxed);
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = supervisor.terminate(&mut child);
         let _ = stdout_thread.join();
 
         Ok(())

@@ -64,6 +64,7 @@ pub enum Obligation {
     Redact { spans: Vec<(usize, usize, String)> },
     Spotlight { source: String },
     AddContext { text: String },
+    ExceptionGranted { id: String, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

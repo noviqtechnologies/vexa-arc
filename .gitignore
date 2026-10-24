@@ -4,6 +4,7 @@
 /prd
 /images
 /.sca-cache
+**/.sca-cache
 **/.arc
 /misc
 /design

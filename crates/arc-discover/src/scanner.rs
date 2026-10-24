@@ -51,6 +51,14 @@ pub struct AuditReport {
     pub exposed_secrets: Vec<ExposedSecretFinding>,
     pub overall_risk_band: RiskBand,
     pub total_assets: usize,
+    #[serde(default)]
+    pub scanned_locations: Vec<PathBuf>,
+    #[serde(default)]
+    pub unscanned_locations: Vec<PathBuf>,
+    #[serde(default)]
+    pub excluded_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub permission_errors: Vec<String>,
 }
 
 pub struct DiscoveryScanner {
@@ -61,6 +69,55 @@ impl Default for DiscoveryScanner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Returns known OS-specific roots for workstation AI configuration audit (FR-DISC-002)
+pub fn get_workstation_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            roots.push(appdata.join("Claude"));
+            roots.push(appdata.join("Cursor"));
+            roots.push(appdata.join("Code").join("User"));
+            roots.push(appdata.join("Windsurf"));
+        }
+        if let Some(userprofile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            roots.push(userprofile.join(".cursor"));
+            roots.push(userprofile.join(".claude"));
+            roots.push(userprofile.join(".vscode"));
+            roots.push(userprofile.join(".windsurf"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            #[cfg(target_os = "macos")]
+            {
+                let app_support = home.join("Library").join("Application Support");
+                roots.push(app_support.join("Claude"));
+                roots.push(app_support.join("Cursor"));
+                roots.push(app_support.join("Code").join("User"));
+                roots.push(app_support.join("Windsurf"));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let config = home.join(".config");
+                roots.push(config.join("Claude"));
+                roots.push(config.join("Cursor"));
+                roots.push(config.join("Code").join("User"));
+                roots.push(config.join("Windsurf"));
+            }
+            roots.push(home.join(".cursor"));
+            roots.push(home.join(".claude"));
+            roots.push(home.join(".vscode"));
+            roots.push(home.join(".windsurf"));
+        }
+    }
+
+    roots
 }
 
 impl DiscoveryScanner {
@@ -92,6 +149,12 @@ impl DiscoveryScanner {
         let mut agent_skills = Vec::new();
         let mut model_assets = Vec::new();
         let mut exposed_secrets = Vec::new();
+        let mut scanned_locations = Vec::new();
+        let mut unscanned_locations = Vec::new();
+        let mut excluded_paths = Vec::new();
+        let mut permission_errors = Vec::new();
+
+        scanned_locations.push(root.to_path_buf());
 
         self.scan_recursive(
             root,
@@ -100,6 +163,10 @@ impl DiscoveryScanner {
             &mut agent_skills,
             &mut model_assets,
             &mut exposed_secrets,
+            &mut scanned_locations,
+            &mut unscanned_locations,
+            &mut excluded_paths,
+            &mut permission_errors,
         );
 
         let elapsed = start.elapsed().as_millis() as u64;
@@ -126,9 +193,75 @@ impl DiscoveryScanner {
             exposed_secrets,
             overall_risk_band: highest_band,
             total_assets,
+            scanned_locations,
+            unscanned_locations,
+            excluded_paths,
+            permission_errors,
         })
     }
 
+    /// Opt-in workstation audit mode scanning known host roots across Windows, macOS, and Linux (FR-DISC-002)
+    pub fn audit_workstation(&self) -> io::Result<AuditReport> {
+        let start = std::time::Instant::now();
+        let mut mcp_servers = Vec::new();
+        let mut agent_skills = Vec::new();
+        let mut model_assets = Vec::new();
+        let mut exposed_secrets = Vec::new();
+        let mut scanned_locations = Vec::new();
+        let mut unscanned_locations = Vec::new();
+        let mut excluded_paths = Vec::new();
+        let mut permission_errors = Vec::new();
+
+        let roots = get_workstation_roots();
+        for root in roots {
+            if root.exists() && root.is_dir() {
+                scanned_locations.push(root.clone());
+                self.scan_recursive(
+                    &root,
+                    0,
+                    &mut mcp_servers,
+                    &mut agent_skills,
+                    &mut model_assets,
+                    &mut exposed_secrets,
+                    &mut scanned_locations,
+                    &mut unscanned_locations,
+                    &mut excluded_paths,
+                    &mut permission_errors,
+                );
+            } else {
+                unscanned_locations.push(root);
+            }
+        }
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        let mut highest_band = RiskBand::Low;
+        for s in &mcp_servers {
+            if s.profile.band > highest_band {
+                highest_band = s.profile.band;
+            }
+        }
+        if !exposed_secrets.is_empty() && highest_band < RiskBand::High {
+            highest_band = RiskBand::High;
+        }
+        let total_assets = mcp_servers.len() + agent_skills.len() + model_assets.len();
+
+        Ok(AuditReport {
+            scanned_path: PathBuf::from("workstation://"),
+            scan_duration_ms: elapsed,
+            mcp_servers,
+            agent_skills,
+            model_assets,
+            exposed_secrets,
+            overall_risk_band: highest_band,
+            total_assets,
+            scanned_locations,
+            unscanned_locations,
+            excluded_paths,
+            permission_errors,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn scan_recursive(
         &self,
         current: &Path,
@@ -137,14 +270,25 @@ impl DiscoveryScanner {
         agent_skills: &mut Vec<DiscoveredAgentSkill>,
         model_assets: &mut Vec<DiscoveredModelAsset>,
         exposed_secrets: &mut Vec<ExposedSecretFinding>,
+        scanned_locations: &mut Vec<PathBuf>,
+        unscanned_locations: &mut Vec<PathBuf>,
+        excluded_paths: &mut Vec<PathBuf>,
+        permission_errors: &mut Vec<String>,
     ) {
         if depth > 10 {
+            unscanned_locations.push(current.to_path_buf());
             return;
         }
 
         let entries = match fs::read_dir(current) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    permission_errors
+                        .push(format!("Permission denied accessing {}", current.display()));
+                }
+                return;
+            }
         };
 
         for entry in entries.flatten() {
@@ -158,10 +302,12 @@ impl DiscoveryScanner {
                 || file_name == ".venv"
                 || file_name == "venv"
             {
+                excluded_paths.push(path);
                 continue;
             }
 
             if path.is_dir() {
+                scanned_locations.push(path.clone());
                 self.scan_recursive(
                     &path,
                     depth + 1,
@@ -169,6 +315,10 @@ impl DiscoveryScanner {
                     agent_skills,
                     model_assets,
                     exposed_secrets,
+                    scanned_locations,
+                    unscanned_locations,
+                    excluded_paths,
+                    permission_errors,
                 );
             } else if path.is_file() {
                 self.inspect_file(
@@ -464,8 +614,35 @@ mod tests {
         assert_eq!(err2.kind(), io::ErrorKind::InvalidInput);
         let _ = fs::remove_file(&temp_file);
 
-        // 3. Valid directory
-        let res = scanner.audit_directory(Path::new("."));
+        // 3. Valid directory with an excluded folder
+        let temp_test_dir =
+            std::env::temp_dir().join(format!("vexa_arc_audit_val_{}", uuid::Uuid::now_v7()));
+        let _ = fs::create_dir_all(temp_test_dir.join("target"));
+        let _ = fs::create_dir_all(temp_test_dir.join("src"));
+        let res = scanner.audit_directory(&temp_test_dir);
         assert!(res.is_ok());
+        let rep = res.unwrap();
+        assert!(!rep.scanned_locations.is_empty());
+        assert!(
+            !rep.excluded_paths.is_empty(),
+            "Should exclude target/node_modules/.git"
+        );
+        let _ = fs::remove_dir_all(&temp_test_dir);
+    }
+
+    #[test]
+    fn test_workstation_audit_and_coverage_reporting() {
+        let scanner = DiscoveryScanner::new();
+        let report = scanner
+            .audit_workstation()
+            .expect("Workstation audit must succeed");
+        assert_eq!(report.scanned_path, Path::new("workstation://"));
+        // Workstation audit should report roots (either scanned or unscanned)
+        let total_reported_locations =
+            report.scanned_locations.len() + report.unscanned_locations.len();
+        assert!(
+            total_reported_locations > 0,
+            "Must report inspected workstation roots"
+        );
     }
 }

@@ -1464,3 +1464,132 @@ fn test_complete_path_latency_benchmark() {
         p99.as_secs_f64() * 1000.0
     );
 }
+
+#[test]
+fn test_cli_host_status_and_doctor_metrics() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+
+    // 1. arc host status --host claude-code --json
+    let out_cc = Command::new(arc_bin)
+        .args(["host", "status", "--host", "claude-code", "--json"])
+        .output()
+        .expect("failed to run arc host status");
+    assert_eq!(out_cc.status.code(), Some(0));
+    let stdout_cc = String::from_utf8_lossy(&out_cc.stdout);
+    let json_cc: serde_json::Value =
+        serde_json::from_str(&stdout_cc).expect("arc host status must emit valid JSON");
+    assert_eq!(json_cc["host"], "claude-code");
+    assert!(json_cc["installed"].is_boolean());
+
+    // 2. arc host status --host cursor --json
+    let out_cur = Command::new(arc_bin)
+        .args(["host", "status", "--host", "cursor", "--json"])
+        .output()
+        .expect("failed to run arc host status cursor");
+    assert_eq!(out_cur.status.code(), Some(0));
+    let stdout_cur = String::from_utf8_lossy(&out_cur.stdout);
+    let json_cur: serde_json::Value =
+        serde_json::from_str(&stdout_cur).expect("arc host status cursor must emit valid JSON");
+    assert_eq!(json_cur["host"], "cursor");
+
+    // 3. arc doctor --metrics --json
+    let out_doc = Command::new(arc_bin)
+        .args(["doctor", "--metrics", "--json"])
+        .output()
+        .expect("failed to run arc doctor --metrics");
+    assert_eq!(out_doc.status.code(), Some(0));
+    let stdout_doc = String::from_utf8_lossy(&out_doc.stdout);
+    let json_doc: serde_json::Value =
+        serde_json::from_str(&stdout_doc).expect("arc doctor --metrics must emit valid JSON");
+    assert_eq!(json_doc["status"], "healthy");
+    assert!(json_doc["host_integrations"]["claude_code"].is_object());
+    assert!(json_doc["host_integrations"]["cursor"].is_object());
+}
+
+#[test]
+fn test_cli_trace_export_and_session_cleanup() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let session = "qa-trace-export-session";
+
+    // 1. Record an event via intercept
+    let out_eval = Command::new(arc_bin)
+        .args([
+            "intercept",
+            "eval",
+            "file_read",
+            "secrets/api_key.txt",
+            "--session",
+            session,
+            "--json",
+        ])
+        .output()
+        .expect("failed to run intercept eval");
+    assert_eq!(out_eval.status.code(), Some(0));
+
+    // 2. Export trace to a temporary file
+    let temp_dir = std::env::temp_dir();
+    let export_path = temp_dir.join(format!("arc_trace_{}.json", session));
+
+    let out_trace = Command::new(arc_bin)
+        .args([
+            "trace",
+            "latest",
+            "--session",
+            session,
+            "--export",
+            export_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run arc trace --export");
+    assert_eq!(out_trace.status.code(), Some(0));
+    assert!(export_path.exists(), "Export file must be created on disk");
+
+    // Read and verify exported trace content
+    let exported_content = fs::read_to_string(&export_path).expect("must read exported trace");
+    let trace_json: serde_json::Value =
+        serde_json::from_str(&exported_content).expect("exported trace must be valid JSON");
+    assert_eq!(trace_json["session_id"], session);
+    assert!(!trace_json["nodes"].as_array().unwrap().is_empty());
+
+    // Clean up exported file
+    let _ = fs::remove_file(&export_path);
+
+    // 3. Test session cleanup command
+    let out_clean = Command::new(arc_bin)
+        .args(["intercept", "session", "--cleanup", "--max-age-hours", "0"])
+        .output()
+        .expect("failed to run session cleanup");
+    assert_eq!(out_clean.status.code(), Some(0));
+}
+
+#[test]
+fn test_cli_workstation_audit_json() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+
+    let out_audit = Command::new(arc_bin)
+        .args(["audit", "--workstation", "--json"])
+        .output()
+        .expect("failed to run arc audit --workstation");
+    assert_eq!(out_audit.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&out_audit.stdout);
+    let json_audit: serde_json::Value =
+        serde_json::from_str(&stdout).expect("workstation audit must be parseable JSON");
+    assert_eq!(json_audit["scanned_path"], "workstation://");
+    assert!(json_audit["scanned_locations"].is_array());
+    assert!(json_audit["mcp_servers"].is_array());
+}
+
+#[test]
+fn test_cli_shield_run_containment_execution() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+
+    // Legitimate package check
+    let out_run = Command::new(arc_bin)
+        .args(["shield", "run", "npm", "install", "express"])
+        .output()
+        .expect("failed to run arc shield run");
+    assert_eq!(out_run.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out_run.stdout);
+    assert!(stdout.contains("PERMITTED") || stdout.contains("CONTAINMENT EVALUATION"));
+}

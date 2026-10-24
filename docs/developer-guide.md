@@ -209,6 +209,23 @@ Provides the `LocalPseudonymizationVault`:
 
 ---
 
+### AST Pattern Injection Hook (`ARC-AST-001`) — FR-CORE-006
+
+`AstPatternEngine` in [`crates/arc-dlp/src/ast_pattern.rs`](file:///c:/vexa-arc/crates/arc-dlp/src/ast_pattern.rs) runs as a first-class step in `PolicyEvaluator::evaluate` for `Action::FileWrite`:
+
+```rust
+// Integration in arc-policy-engine/src/evaluator.rs
+if let Action::FileWrite { path, content } = &event.action {
+    if let Some(hit) = engine.check(content) {
+        return Verdict::Block { rule: "ARC-AST-001", explanation: hit };
+    }
+}
+```
+
+**Performance:** Uses Aho-Corasick multi-pattern prefilter across the whole buffer, then applies regex only at confirmed hit sites. Benchmarked at **< 0.1ms** for 256 KiB on debug builds; well within the 8ms NFR budget.
+
+---
+
 ## 5. Stateful Session Taint DAG & Policy Engine (`arc-policy-engine`)
 
 The policy engine tracks chronological agent interactions as a **Directed Acyclic Graph (DAG)** maintained in `SessionTaintDag` instances indexed by `session_id`.
@@ -238,7 +255,26 @@ $$\text{SessionTaints} \supseteq (\text{PRIVATE\_DATA} \cup \text{UNTRUSTED\_CON
 
 When this invariant is triggered, `evaluator.evaluate()` immediately emits `RuleId("ARC-LTT-001")`.
 
+### Field-Level & Path-Level Taint Isolation — FR-TAINT-005
+
+`SessionTaintDag` stores taint at two granularities beyond the session bitmask:
+
+```rust
+pub struct SessionTaintDag {
+    pub session_taints: Taint,
+    pub field_taints: HashMap<String, Taint>,  // e.g. "env.DATABASE_URL"
+    pub path_taints: HashMap<String, Taint>,   // e.g. ".env", ".ssh/id_rsa"
+    // ...
+}
+```
+
+- `check_field_level_lethal_trifecta(field, sink)` — tests the trifecta only for a specific field.
+- `check_event_trifecta_with_target(target, sink)` — tests using path-level granularity.
+- **Benign isolation:** Local commands (`git status`, `git diff`, `git log`, `cargo test`, `npm test`) bypass the session bitmask check entirely via `is_benign_local_command()`.
+- `compute_integrity_hash()` deterministically incorporates sorted field and path taints, preventing hash manipulation.
+
 ---
+
 
 ## 6. Asset Discovery & CycloneDX v1.6 AI-BOM (`arc-discover`)
 
@@ -264,15 +300,69 @@ Package command interceptors (`PackageFirewall::parse_command`) support:
 - `cargo add`
 - `go get`
 
+### OSV/EPSS Integration (`OsvPackageScanner`) — FR-PKG-005 & FR-PKG-006
+
+[`crates/arc-firewall/src/osv_scanner.rs`](file:///c:/vexa-arc/crates/arc-firewall/src/osv_scanner.rs) provides `OsvPackageScanner`:
+
+```rust
+let scanner = OsvPackageScanner::default(); // uses .sca-cache by default
+let result = scanner.scan_package("lodash", "4.17.15", "npm")?;
+
+if result.should_block() {
+    // FR-PKG-006: structured JSON-RPC error
+    let error_json = result.aggregate_jsonrpc_error();
+    // {"error": "Vulnerable package lodash@4.17.15; update constraint to >=4.17.21",
+    //  "rule_id": "ARC-SCA-001", "severity": "HIGH", ...}
+}
+```
+
+Key design decisions:
+- **100% payload locality:** Only `(name, version, ecosystem)` tuples are sent to `api.osv.dev`. No source code, prompts, or credentials leave the host.
+- **Air-gapped cache:** `VulnCache` stores advisories as JSON in `.sca-cache/` with 24-hour TTL. When `advisory_status.is_service_unavailable()`, the scanner returns `advisory_available: false` and does not block (fail-open for availability; slopsquat gate still runs fail-closed).
+- **Sync wrapper:** `scan_package()` spawns a `tokio::runtime::Builder::new_current_thread()` runtime internally, keeping `PackageFirewall`'s public API synchronous.
+- **Ecosystem bridge:** `ecosystem_to_osv_str(arc_core::event::Ecosystem)` converts between the arc-core `Ecosystem` enum and OSV string identifiers (`npm`, `PyPI`, `crates.io`, `Go`).
+
 ---
 
 ## 8. Host Adapters & MCP JSON-RPC Interceptors (`arc-hooks`)
 
-- `ClaudeCodeAdapter`: Decodes Claude Code CLI hook inputs and formats exit code + stderr remediation narratives.
-- `CursorAdapter`: Decodes Cursor PreToolUse shell and MCP events.
-- `McpJsonRpcInterceptor`: Converts intercepted MCP requests into `ActionEvent` and formats denials as standard JSON-RPC 2.0 `isError: true` responses.
+Vexa Arc defines a standard, extensible `HostAdapter` trait in [`crates/arc-hooks/src/adapter.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/adapter.rs) for IDE and agent lifecycle management:
+
+```rust
+pub trait HostAdapter {
+    fn host(&self) -> AgentHost;
+    fn install(&self, target_dir: &Path) -> Result<PathBuf, ArcError>;
+    fn uninstall(&self, target_dir: &Path) -> Result<(), ArcError>;
+    fn status(&self, target_dir: &Path) -> HostIntegrationStatus;
+    fn detect_bypass(&self, target_dir: &Path) -> Result<bool, ArcError>;
+}
+```
+
+- **`ClaudeCodeAdapter`**: Manages `.claude.json` / `~/.claude.json` `preToolUse` hook integrations. Automatically injects `arc intercept eval` hooks, detects hook tampering/bypasses, and safely restores configurations upon uninstall.
+- **`CursorAdapter`**: Manages `.cursor/settings.json` `cursor.agent.preHookCommand` integrations for shell and MCP action supervision.
+- **`McpJsonRpcInterceptor`**: Decodes standard MCP JSON-RPC requests, extracts RFC 8785 canonical schema fingerprints, and produces compliant `isError: true` JSON-RPC error responses with remediation options.
+- **`McpStdioBroker`**: A managed stdio supervisor proxying child process stdin/stdout, enforcing pre-execution allow-list rules, outbound DLP secret redaction, and runtime schema drift quarantine.
+
+### OS-Level Process Containment (`OsProcessSupervisor`) — FR-HOOKS-003
+
+[`crates/arc-hooks/src/process_containment.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/process_containment.rs) provides `OsProcessSupervisor` which is called from `McpStdioBroker::run_stdio` before spawning MCP child processes:
+
+```rust
+// Wrap child command with OS containment before spawning
+OsProcessSupervisor::apply_containment(&mut cmd);
+let child = cmd.spawn()?;
+```
+
+**Platform implementations (conditional compilation):**
+
+| Target | Implementation | Guarantee |
+| :--- | :--- | :--- |
+| `cfg(windows)` | `CreateJobObject` + `AssignProcessToJobObject` + `JOBOBJECT_BASIC_LIMIT_INFORMATION` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` | Child killed when Job handle drops |
+| `cfg(target_os = "linux")` | `cmd.process_group(0)` + `pre_exec(prctl(PR_SET_PDEATHSIG, SIGKILL))` | SIGKILL sent on broker parent death |
+| `cfg(unix)` (macOS, BSD) | `cmd.process_group(0)` — `killpg(pgid, SIGKILL)` on Drop | Entire process group reaped |
 
 ---
+
 
 ## 9. CLI Binary (`arc-cli`)
 
@@ -282,23 +372,17 @@ The root binary tying the subsystems together with `clap`.
 
 | Command | Windows (PowerShell) | Linux / macOS (Bash/Zsh) |
 | :--- | :--- | :--- |
-| **Audit Workstation** | `PS C:\vexa-arc\target\release> .\arc.exe audit` | `arc audit` (or `./target/release/arc audit`) |
+| **Audit Repository** | `PS C:\vexa-arc\target\release> .\arc.exe audit` | `arc audit` |
+| **Audit Workstation** | `PS C:\vexa-arc\target\release> .\arc.exe audit --workstation` | `arc audit --workstation` |
 | **Export CycloneDX BOM** | `PS C:\vexa-arc\target\release> .\arc.exe bom --path . --out bom.json` | `arc bom --path . --out bom.json` |
 | **Scan Directory Secrets** | `PS C:\vexa-arc\target\release> .\arc.exe scan-secrets --path .\src` | `arc scan-secrets --path ./src` |
 | **Scan Piped Stdin** | `Get-Content log.txt \| .\arc.exe scan-secrets --redact` | `cat log.txt \| arc scan-secrets --redact` |
-| **Shield Firewall** | `PS C:\vexa-arc\target\release> .\arc.exe shield reactt` | `arc shield reactt` |
-| **Intercept Eval** | `PS C:\vexa-arc\target\release> .\arc.exe intercept eval .env --session s1` | `arc intercept eval .env --session s1` |
-| **Inspect Session** | `PS C:\vexa-arc\target\release> .\arc.exe intercept session s1` | `arc intercept session s1` |
-
-### Core CLI Capabilities:
-* `arc audit`: Runs discovery of MCP servers, skills, and model checkpoints with optional CycloneDX v1.6 BOM export.
-* `arc bom`: Exports CycloneDX v1.6 AI-BOM capturing all AI dependencies.
-* `arc scan-secrets`: Runs deep DLP pattern and Shannon entropy analysis on target files, directory trees, or standard input streams:
-  - **Directory Recursion:** Automatically traverses directory hierarchies (up to depth 10) and scans all contained files, filtering out build directories (`.git`, `target`, `node_modules`, `.venv`, `venv`).
-  - **Single File & Stdin:** Reads from an explicit file path or pipes from standard input.
-  - **Pseudonymization Vaulting:** Optional `--redact` flag replaces detected secrets with `<ARC_VAULT_SECRET_XX>` tokens and registers entries in the `LocalPseudonymizationVault`.
-* `arc shield check`: Evaluates packages against compound 4-gate anti-slopsquatting rules with contextual remediation guidance, `--json` serialization for machine workflows, and standard exit status codes (`0` for pass, `1` for block).
-* `arc intercept eval`: Evaluates actions through the monotonic Stateful Session Taint DAG.
+| **Shield Firewall Check** | `PS C:\vexa-arc\target\release> .\arc.exe shield check reactt` | `arc shield check reactt` |
+| **Shield Containment Run** | `PS C:\vexa-arc\target\release> .\arc.exe shield run --enforce npm i express` | `arc shield run --enforce npm i express` |
+| **Host Integration** | `PS C:\vexa-arc\target\release> .\arc.exe host install --host claude-code` | `arc host install --host claude-code` |
+| **Diagnostics & Metrics** | `PS C:\vexa-arc\target\release> .\arc.exe doctor --metrics` | `arc doctor --metrics` |
+| **Trace & Export Evidence** | `PS C:\vexa-arc\target\release> .\arc.exe trace latest --export trace.json` | `arc trace latest --export trace.json` |
+| **Session Pruning** | `PS C:\vexa-arc\target\release> .\arc.exe intercept session --cleanup` | `arc intercept session --cleanup` |
 
 ---
 
@@ -308,17 +392,38 @@ The root binary tying the subsystems together with `clap`.
 
 1. Add target pattern keywords to `SecretScanEngine::new()` in [`crates/arc-dlp/src/detector.rs`](file:///c:/vexa-arc/crates/arc-dlp/src/detector.rs).
 2. Define the linear-time regular expression and minimum entropy threshold.
-3. Add a unit test covering happy path and edge cases.
+3. Add a unit test covering positive, negative, Unicode, and boundary cases.
 
 ### Adding a New Package Ecosystem
 
 1. Add the ecosystem variant to `Ecosystem` in [`crates/arc-core/src/event.rs`](file:///c:/vexa-arc/crates/arc-core/src/event.rs).
 2. Extend CLI command parsing in `PackageFirewall::parse_command()` in [`crates/arc-firewall/src/proxy.rs`](file:///c:/vexa-arc/crates/arc-firewall/src/proxy.rs).
+3. Implement containment shimming (`--ignore-scripts` injection) in `PackageFirewall::enforce_containment()`.
 
 ### Adding a New Host Adapter
 
 1. Implement the `HostAdapter` trait in [`crates/arc-hooks/src/adapter.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/adapter.rs).
-2. Define host-specific `decode()` and `encode()` methods.
+2. Expose the adapter in `arc-hooks::lib.rs` and connect it to `run_host_install`, `run_host_status`, and `run_host_uninstall` in [`crates/arc-cli/src/main.rs`](file:///c:/vexa-arc/crates/arc-cli/src/main.rs).
+3. Add diagnostic telemetry checks in `run_doctor`.
+
+### Running Tests & Verification Suite
+
+Vexa Arc maintains an automated test suite across all 7 workspace crates:
+
+```bash
+# Run all workspace unit and integration tests (82 tests):
+cargo test --workspace
+
+# Run integration tests specifically:
+cargo test --test integration_tests
+
+# Run latency benchmark suite:
+cargo test --test integration_tests test_complete_path_latency_benchmark -- --nocapture
+
+# Validate code formatting and zero-warning linting:
+cargo fmt --check
+cargo clippy --workspace -- -D warnings
+```
 
 ### Building & Running Tests Across Operating Systems
 

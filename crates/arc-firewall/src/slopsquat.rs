@@ -17,8 +17,18 @@ pub struct PackageRegistryMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SlopsquatVerdict {
-    Permitted { reason: &'static str },
-    Blocked { gate: &'static str, reason: String },
+    Permitted {
+        reason: &'static str,
+    },
+    Review {
+        gate: &'static str,
+        reason: String,
+        containment_recommendation: String,
+    },
+    Blocked {
+        gate: &'static str,
+        reason: String,
+    },
 }
 
 impl SlopsquatVerdict {
@@ -26,10 +36,21 @@ impl SlopsquatVerdict {
         matches!(self, SlopsquatVerdict::Blocked { .. })
     }
 
+    pub fn requires_review(&self) -> bool {
+        matches!(self, SlopsquatVerdict::Review { .. })
+    }
+
+    pub fn is_permitted(&self) -> bool {
+        matches!(self, SlopsquatVerdict::Permitted { .. })
+    }
+
     /// Provides actionable remediation guidance based on the evaluation verdict and package ecosystem.
     pub fn suggested_action(&self, ecosystem: &str) -> Option<String> {
         match self {
             SlopsquatVerdict::Permitted { .. } => None,
+            SlopsquatVerdict::Review { containment_recommendation, .. } => {
+                Some(containment_recommendation.clone())
+            }
             SlopsquatVerdict::Blocked { gate, reason } => match *gate {
                 "CompoundTyposquatGate" => {
                     if let Some(target) = reason.split("of '").nth(1).and_then(|s| s.split('\'').next()) {

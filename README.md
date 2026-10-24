@@ -3,8 +3,9 @@
 [![Rust Edition](https://img.shields.io/badge/Rust-2021%20Edition-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-brightgreen.svg)](#cross-platform-installation--setup)
-[![Tests](https://img.shields.io/badge/Tests-59%2F59%20Passing-success.svg)](#automated-tests--verification)
+[![Tests](https://img.shields.io/badge/Tests-98%2F98%20Passing-success.svg)](#automated-tests--verification)
 [![CycloneDX](https://img.shields.io/badge/CycloneDX-v1.6%20AI--BOM-blueviolet?logo=owasp&logoColor=white)](#2-live-cyclonedx-v16-ai-bom-export-arc-bom)
+[![OSV](https://img.shields.io/badge/OSV%2FEPSS-Integrated-orange?logo=opensourcesecurityfoundation&logoColor=white)](#osv-epss-vulnerability-scanning-arc-sca-001)
 [![Docs](https://img.shields.io/badge/Docs-Guides%20%26%20Reference-blueviolet?logo=read-the-docs&logoColor=white)](#-documentation--workflow-guides)
 
 **Vexa Arc** (`arc`) is an ultra-low-latency, zero-dependency native Rust runtime firewall and pre-execution endpoint security platform (EDR for AI Agents). Built for modern autonomous AI engineering workflows, Vexa Arc inspects and governs what coding agents (Claude Code, Cursor, Windsurf, Cline) and Model Context Protocol (MCP) servers see, use, and execute on developer endpoints and CI runners before code or shell execution touches disk.
@@ -27,15 +28,19 @@
 
 | Key Feature | Security & Developer Value | Quick Command |
 | :--- | :--- | :--- |
-| 🛡️ [**Stateful Session Taint DAG**](#1-stateful-session-taint-dag--lethal-trifecta-prevention) | Evaluates chronological agent action flows to eliminate the **Lethal Trifecta** (`ARC-LTT-001`: Private Data + Untrusted Context + Outbound Egress). | `arc intercept eval slack/post --session s1` |
-| ⚡ [**Sub-Millisecond Pure Rust Core**](#cross-platform-installation--setup) | High-throughput in-memory policy and taint evaluation with **$p_{99} < 3.5\text{ ms}$ latency** and **zero external C / OpenSSL dependencies**. | `arc audit` |
-| 🚫 [**Anti-Slopsquatting Package Firewall**](#2-anti-slopsquatting-dependency-firewall-arc-shield) | 4-gate compound defense blocking hallucinated packages and typosquats across `npm`, `pypi`, `cargo`, and `go` before install scripts execute. | `arc shield npm install reactt` |
+| 🛡️ [**Stateful Session Taint DAG**](#1-stateful-session-taint-dag--lethal-trifecta-prevention) | Evaluates chronological agent action flows to eliminate the **Lethal Trifecta** (`ARC-LTT-001`: Private Data + Untrusted Context + Outbound Egress). Field-level & path-level taint isolation keeps benign tools (git, cargo test) unblocked. | `arc intercept eval slack/post --session s1` |
+| 🔌 [**Host Enforcer & Bypass Detection**](#7-mcp-host-adapters--self-explaining-json-rpc-interceptors) | Direct native integration for **Claude Code** and **Cursor IDE** with automated installation, tamper verification, and bypass detection. | `arc host install --host claude-code` |
+| ⚡ [**Sub-Millisecond Pure Rust Core**](#cross-platform-installation--setup) | High-throughput in-memory policy and taint evaluation with **$p_{99} < 2.5\text{ ms}$ latency** and **zero external C / OpenSSL dependencies**. | `arc doctor --metrics` |
+| 🚫 [**Anti-Slopsquatting & OSV/EPSS Firewall**](#2-anti-slopsquatting-dependency-firewall-arc-shield) | 4-gate compound defense blocking hallucinated packages + **live OSV vulnerability scanning with EPSS scoring** (`ARC-SCA-001`) and structured JSON-RPC inline remediation. | `arc shield npm install lodash --json` |
 | 🔒 [**Linear-Time Context DLP & Vault**](#3-context-dlp-secret-detection--pseudonymization-vault) | Scans credentials and sensitive data in $< 0.9\text{ ms}$ with Shannon entropy and local pseudonymization tokenization (`<ARC_VAULT_SECRET_XX>`). | `arc scan-secrets --redact` |
+| 🔍 [**Workstation & Repo AI-SPM Discovery**](#4-zero-touch-ai-spm--asset-discovery-arc-audit) | Exhaustive multi-origin scanner discovering local models, agent rules (`.cursorrules`, `CLAUDE.md`), and workstation-level MCP configs. | `arc audit --workstation` |
 | 📋 [**CycloneDX v1.6 AI-BOM Generator**](#5-standardized-cyclonedx-v16-ai-bom-export-arc-bom) | Generates specification-compliant **CycloneDX v1.6 AI-BOM** manifests capturing models, datasets, MCP server capabilities, and agent instruction files. | `arc bom --out ai-bom.json` |
-| 🔍 [**Zero-Touch AI Asset Discovery**](#4-zero-touch-ai-spm--asset-discovery-arc-audit) | Exhaustive multi-origin scanner discovering local models, agent rules (`.cursorrules`, `CLAUDE.md`), and MCP configs with zero network egress. | `arc audit` |
 | 🛡️ [**Prompt Injection Sanitizer**](#6-inbound-prompt-injection-sanitization--nonce-spotlighting) | Strips invisible Unicode tags, Trojan Source bidi overrides, and wraps untrusted external context in cryptographic nonce boundaries. | `arc intercept prompt "https://issue/42"` |
 | 🔄 [**Dynamic Schema Rug-Pull Quarantine**](#7-mcp-host-adapters--self-explaining-json-rpc-interceptors) | Computes RFC 8785 JSON Canonicalization Scheme (JCS) SHA-256 hashes of MCP schemas to halt runtime privilege escalation attempts. | `arc intercept mcp slack read` |
-| 🚦 [**CI/CD Quality Gates & Exit Codes**](#8-cicd-quality-gates--policy-enforcement) | Deterministic exit codes (`0` = permitted / no violations, `1` = blocked, secret findings, invalid scan paths, or failed artifact exports) with structured JSON-RPC remediation options for automated agent self-healing. | `arc audit --json` |
+| ⚡ [**AST Pattern Injection Hook**](#ast-pattern-injection-hook-arc-ast-001) | Sub-8ms Aho-Corasick + regex diff hook blocking raw SQL interpolation, direct eval/exec, raw innerHTML, and plaintext private key writes before disk (`ARC-AST-001`). | `arc intercept eval --kind file_write --target out.js` |
+| 🖥️ [**OS-Level Process Containment**](#os-level-process-containment-fr-hooks-003) | Windows Job Objects + Unix process groups with SIGKILL on parent-death guarantee that spawned MCP child processes cannot outlive their broker. | `arc protect stdio --server github -- npx ...` |
+| 📜 [**Causal Trace & Evidence Export**](#cli-reference) | Traces decision causality and exports cryptographically bound, redacted JSON evidence bundles for security audits. | `arc trace latest --export trace.json` |
+| 🚦 [**CI/CD Quality Gates & Exit Codes**](#8-cicd-quality-gates--policy-enforcement) | Deterministic exit codes (`0` = permitted / clean, `1` = blocked / findings) with structured JSON-RPC remediation options for automated agent self-healing. | `arc audit --json` |
 
 > [!TIP]
 > **Try It in 30 Seconds**:
@@ -337,8 +342,82 @@ Finding:            Package 'reactt' is a suspected hallucination/typosquat of '
 SUGGESTED ACTION:
   💡 Did you mean: 'react'? Run: npm install react
   ℹ️  If legitimate: arc shield allow reactt --ecosystem npm
+----------------------------------------------------------
+OSV VULNERABILITY SCAN  [ARC-SCA-001]  ✅ No known vulnerabilities
 ──────────────────────────────────────────────────────────
 ```
+
+#### OSV/EPSS Vulnerability Scanning (`ARC-SCA-001`)
+
+`arc shield` now integrates **vexa-sca** as a native Rust crate to run OSV batch-queries and EPSS scoring on every package check:
+
+- **FR-PKG-005 (P0):** Live OSV advisory lookup with 24-hour `.sca-cache` air-gapped fallback. Only public package coordinates (name + version + ecosystem) leave the host — **100% payload locality**.
+- **FR-PKG-006 (P1):** Structured JSON-RPC inline remediation: `{"error": "Vulnerable package {name}@{version}; update constraint to >={safe}"}` with rule ID `ARC-SCA-001`.
+- **EPSS Threshold:** Findings with EPSS ≥ 70th percentile are flagged as actively exploited.
+- **Air-gapped fallback:** When OSV is unreachable, the `.sca-cache` directory provides 24-hour TTL cached advisory data.
+
+```bash
+# JSON output includes OSV findings and JSON-RPC remediation
+arc shield check lodash --ecosystem npm --json
+
+# Terminal output shows OSV scan section after slopsquat evaluation
+arc shield lodash
+```
+
+**Example JSON output with OSV finding:**
+```json
+{
+  "package": "lodash",
+  "status": "permitted",
+  "osv": {
+    "advisory_available": true,
+    "finding_count": 1,
+    "has_critical_or_high": true,
+    "remediation": "{\"error\": \"Vulnerable package lodash@4.17.15; update constraint to >=4.17.21\", \"rule_id\": \"ARC-SCA-001\", \"severity\": \"HIGH\"}",
+    "findings": [{
+      "advisory_id": "GHSA-jf85-cpcp-j695",
+      "severity": "HIGH",
+      "cvss_score": 7.5,
+      "remediation_message": "Vulnerable package lodash@4.17.15; update constraint to >=4.17.21"
+    }]
+  }
+}
+```
+
+#### AST Pattern Injection Hook (`ARC-AST-001`)
+
+Every agent `FileWrite` action is checked by the **`AstPatternEngine`** before the write reaches disk. It uses Aho-Corasick prefiltering + regex matching across 4 fatal injection categories:
+
+| Category | Pattern | Example |
+| :--- | :--- | :--- |
+| Raw SQL interpolation | `SELECT * FROM ... ${user_input}` | `f"SELECT * FROM users WHERE id = {req.id}"` |
+| Direct eval/exec | `eval(...)`, `exec(...)` | `eval(request.body)` |
+| Raw innerHTML | `element.innerHTML = ...` | `div.innerHTML = userComment` |
+| Plaintext private keys | `-----BEGIN PRIVATE KEY-----` | Embedded PEM blocks in source |
+
+```bash
+# Test via intercept eval with file_write kind
+arc intercept eval --kind file_write --target output.py --session s1
+```
+
+#### OS-Level Process Containment (`FR-HOOKS-003`)
+
+MCP server child processes are wrapped in OS-level containment:
+
+- **Windows:** `CreateJobObject` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — child processes are terminated when the broker Job Object handle is closed.
+- **Linux:** `prctl(PR_SET_PDEATHSIG, SIGKILL)` in pre-exec ensures child processes receive SIGKILL when the broker parent dies.
+- **macOS/Unix:** Process group (`setpgrp`) isolation allows `killpg` to reap the entire child process tree on shutdown.
+
+```bash
+arc protect stdio --server github -- npx @modelcontextprotocol/server-github
+```
+
+#### Field-Level & Path-Level Taint Isolation (`FR-TAINT-005`)
+
+The `SessionTaintDag` now tracks taint at **field granularity** (e.g., `env.SECRET`, `file.ssh_key`) and **path granularity** (e.g., `.env`, `.ssh/id_rsa`). This enables precise isolation:
+
+- **Benign local commands** (`git status`, `git diff`, `git log`, `cargo test`, `npm test`) are isolated from blanket session taint and permitted even in tainted sessions.
+- **Lethal Trifecta checks** can target specific field/path combinations rather than the entire session.
 
 ---
 
@@ -463,6 +542,7 @@ arc audit [OPTIONS]
 | Flag | Type | Description |
 | :--- | :--- | :--- |
 | `-p, --path <PATH>` | Option | Target root directory to audit (default: `.`) |
+| `-w, --workstation` | Flag | Perform opt-in workstation-level audit across user config roots (`%APPDATA%`, `~/.config`, `~/Library`) (FR-DISC-002) |
 | `--json` | Flag | Output full audit report as structured JSON |
 | `--output-bom <PATH>` | Option | Export live CycloneDX v1.6 AI-BOM to specified file |
 
@@ -497,7 +577,7 @@ arc scan-secrets [OPTIONS]
 ---
 
 ### 4. `arc shield`
-Anti-slopsquatting package firewall checking hallucinated packages before install.
+Anti-slopsquatting package firewall checking hallucinated packages and containing lifecycle scripts.
 
 ```bash
 # Direct natural command wrapper:
@@ -505,11 +585,15 @@ arc shield <PACKAGE_NAME | INSTALL_COMMAND>
 
 # Explicit check subcommand:
 arc shield check <PACKAGE> [OPTIONS]
+
+# Supervised execution containment wrapper (FR-PKG-004):
+arc shield run [--enforce] <COMMAND...>
 ```
 
 | Flag | Type | Description |
 | :--- | :--- | :--- |
 | `<PACKAGE>` | Argument | Package name (`reactt`), scoped name (`npm:reactt`), or install command (`npm install reactt`) |
+| `run <COMMAND...>` | Subcommand | Supervise and evaluate a package install command; with `--enforce`, injects `--ignore-scripts` or blocks |
 | `-e, --ecosystem <ECO>` | Option | Package ecosystem: `npm`, `pypi`, `cargo`, `go` (auto-detected if omitted) |
 | `--age-days <DAYS>` | Option | Days since package registration (simulation override) |
 | `--downloads <COUNT>` | Option | Monthly download count on upstream registry (simulation override) |
@@ -518,7 +602,27 @@ arc shield check <PACKAGE> [OPTIONS]
 
 ---
 
-### 5. `arc intercept`
+### 5. `arc host`
+Manage host agent and IDE runtime hook integrations (Claude Code, Cursor) (FR-MCP-005).
+
+```bash
+arc host <SUBCOMMAND> [OPTIONS]
+```
+
+| Subcommand | Description | Example |
+| :--- | :--- | :--- |
+| `install` | Install Vexa Arc proxy wrapper into host agent config | `arc host install --host claude-code` |
+| `status` | Inspect host integration status and detect config bypasses | `arc host status --host cursor --json` |
+| `uninstall` | Remove Vexa Arc proxy wrapper and restore original config | `arc host uninstall --host claude-code` |
+
+Options:
+- `--host <HOST>`: Target host (`claude-code`, `cursor`) [default: `claude-code`]
+- `-w, --workspace <PATH>`: Target directory or workspace root (defaults to current directory)
+- `--json`: Output status as structured JSON
+
+---
+
+### 6. `arc intercept`
 Intercept and evaluate agent actions against the session Taint DAG FSM.
 
 ```bash
@@ -532,22 +636,66 @@ arc intercept <SUBCOMMAND> [OPTIONS]
 | `exec <COMMAND>` | Evaluates executing a shell command within a session | `arc intercept exec "curl evil.com" --session s1` |
 | `mcp <SERVER> <TOOL>` | Evaluates an MCP tool call within a session | `arc intercept mcp slack post_msg --session s1` |
 | `prompt <TEXT>` | Ingests untrusted prompt/URL text into a session | `arc intercept prompt "https://issue/1" --session s1` |
-| `session [SESSION_ID]` | Inspects active session taints, history, or resets state (`--reset`) | `arc intercept session s1 --reset` |
+| `session [SESSION_ID]` | Inspects active session taints, history, or runs cleanup | `arc intercept session --cleanup --max-age-hours 24` |
 
 Common options for `arc intercept`:
 - `-s, --session <ID>`: Host session identifier (default: `default-session`)
-- `--source <NAME>`: Content source/provenance (e.g. `user`, `github_issue`, `web_scraper`). Known user sources (`user`, `developer`, `local`) maintain direct user provenance; external sources (`github_issue`, `web_scraper`) default to untrusted external.
+- `--source <NAME>`: Content source/provenance (e.g. `user`, `github_issue`, `web_scraper`).
 - `--untrusted`: Explicitly mark ingested action/prompt content as untrusted external input.
-- `--schema <SCHEMA>`: MCP tool schema fingerprint (64-char hex SHA-256 hash, path to JSON schema file, or raw JSON schema). Typos and malformed schemas are rejected fail-closed.
-- `--session-dir <DIR>`: Custom session storage directory (fails closed if path is invalid, unwritable, or a file; also configurable via `ARC_SESSION_DIR`).
+- `--schema <SCHEMA>`: MCP tool schema fingerprint (64-char hex SHA-256 hash, path to JSON schema file, or raw JSON schema).
+- `--session-dir <DIR>`: Custom session storage directory.
 - `--project-local`: Opt-in storage in `.arc/sessions`.
-- `--reset`: Reset session state before evaluating
-- `--json`: Output verdict and remediation options as JSON
+- `--cleanup`: Prune expired sessions older than `--max-age-hours` (NFR-PRIV-004).
+- `--reset`: Reset session state before evaluating.
+- `--json`: Output verdict and remediation options as JSON.
 
 ---
 
-### 6. `arc version`
-Display platform version and operational status.
+### 7. `arc trace`
+Trace decision causality, data-flow ancestry, and export tamper-evident audit evidence (FR-CLI-004).
+
+```bash
+arc trace <EVENT_ID | latest> [OPTIONS]
+```
+
+| Flag | Type | Description |
+| :--- | :--- | :--- |
+| `<EVENT_ID>` | Argument | Action event UUID to inspect (or `latest` for the most recent session event) |
+| `-s, --session <ID>` | Option | Session identifier (default: `default-session`) |
+| `--export <PATH>` | Option | Export complete redacted causal graph and event trace bundle to JSON |
+| `--json` | Flag | Output trace tree as structured JSON |
+
+---
+
+### 8. `arc doctor`
+Diagnose installation, adapter status, policy engine, and cumulative runtime metrics (NFR-OPS-001).
+
+```bash
+arc doctor [OPTIONS]
+```
+
+| Flag | Type | Description |
+| :--- | :--- | :--- |
+| `--metrics` | Flag | Display cumulative decision counters, block stats, and adapter integration health |
+| `--json` | Flag | Output diagnostic report as structured JSON |
+
+---
+
+### 9. `arc test`
+Execute local adversarial verification test fixtures (FR-CLI-001).
+
+```bash
+arc test [OPTIONS]
+```
+
+| Flag | Type | Description |
+| :--- | :--- | :--- |
+| `--json` | Flag | Output test fixture execution results as structured JSON |
+
+---
+
+### 10. `arc version`
+Display platform version, build target, and operational status.
 
 ```bash
 arc version
@@ -709,7 +857,7 @@ fi
 Vexa Arc includes a comprehensive automated test suite covering all 7 workspace crates and end-to-end integration scenarios:
 
 ```bash
-# Run all workspace unit and integration tests (59 tests)
+# Run all workspace unit and integration tests (82 tests)
 cargo test --workspace
 
 # Run integration tests specifically
@@ -718,13 +866,13 @@ cargo test --test integration_tests
 
 ### Test Suite Validations:
 - **`arc-cli` (5 tests)**: Positional parameter resolution, working-directory-independent secret directory collection, shield blocked & permitted packages, CLI audit execution, multi-step session persistence and Lethal Trifecta enforcement.
-- **`integration_tests` (19 tests)**: E2E compound anti-slopsquatting gates, inbound prompt injection sanitization and cryptographic spotlighting, Lethal Trifecta runtime governance, asset discovery & CycloneDX v1.6 AI-BOM export, DLP secret redaction and vault lifecycle, extended secret detection and vaulting (Stripe, GCP, DB URIs), cross-platform package manager shimming (`go get`, `python -m pip`, `pnpm`), dynamic schema rug-pull quarantine (`ARC-RUG-001`), unapproved MCP server blocking (`ARC-MCP-001`), CLI secret scan exit codes and stdout redaction, CLI audit path validation and non-zero exit codes, failed AI-BOM export and read-only destination exit codes, executable CLI schema rug-pull quarantine and cross-session baseline isolation, provenance-aware prompt taint classification and Lethal Trifecta enforcement, explicit cross-platform session storage directory overrides, fail-closed session storage resolution on regular files and multi-process egress prevention, fail-closed handling on corrupt session files and session inspection, full provenance trust separation matrix for direct user vs untrusted external content, and malformed schema fingerprint rejection.
-- **`arc-core` (5 tests)**: MCP 3D capability profiling and risk bands, monotonic taint bitflags, `ActionEvent` normalization and provenance metadata, self-explaining `Verdict` formats, RFC 8785 JSON Canonicalization Scheme (JCS) hash consistency.
-- **`arc-discover` (4 tests)**: CycloneDX v1.6 AI-BOM serialization conformity, multi-origin MCP configuration and asset discovery, modern agent rule (`.mdc`) and model (`.onnx`) asset discovery, audit directory validation and non-directory error handling.
+- **`integration_tests` (26 tests)**: Complete end-to-end testing of compound anti-slopsquatting gates, host adapter status and doctor metrics telemetry, trace causal graph export, session cleanup and pruning, workstation inventory discovery, package containment wrapping (`arc shield run`), inbound prompt injection sanitization and cryptographic spotlighting, Lethal Trifecta runtime governance, asset discovery & CycloneDX v1.6 AI-BOM export, DLP secret redaction and vault lifecycle, extended secret detection and vaulting (Stripe, GCP, DB URIs), cross-platform package manager shimming (`go get`, `python -m pip`, `pnpm`), dynamic schema rug-pull quarantine (`ARC-RUG-001`), unapproved MCP server blocking (`ARC-MCP-001`), CLI secret scan exit codes and stdout redaction, CLI audit path validation and non-zero exit codes, failed AI-BOM export and read-only destination exit codes, executable CLI schema rug-pull quarantine and cross-session baseline isolation, provenance-aware prompt taint classification and Lethal Trifecta enforcement, explicit cross-platform session storage directory overrides, fail-closed session storage resolution on regular files and multi-process egress prevention, fail-closed handling on corrupt session files and session inspection, full provenance trust separation matrix for direct user vs untrusted external content, and complete-path latency benchmark ($p_{99} \le 25\text{ ms}$).
+- **`arc-core` (7 tests)**: MCP 3D capability profiling and risk bands, monotonic taint bitflags, `ActionEvent` normalization and provenance metadata, self-explaining `Verdict` formats, RFC 8785 JSON Canonicalization Scheme (JCS) hash consistency, capability vocabulary risk classes, and action event serialization roundtrips.
+- **`arc-discover` (5 tests)**: CycloneDX v1.6 AI-BOM serialization conformity, multi-origin MCP configuration and asset discovery, modern agent rule (`.mdc`, `CLAUDE.md`) and model (`.onnx`, `.gguf`) asset discovery, audit directory validation, and workstation-level discovery and scanning coverage reporting.
 - **`arc-dlp` (8 tests)**: Invisible Unicode and Trojan Source bidi sanitization, nonce-delimited spotlighting, normalized and raw Shannon entropy calculation, local pseudonymization vault tokenization and rehydration, multi-pattern secret detection, and extended credential types (Stripe live keys, Google Cloud API keys, Database URIs, PyPI tokens, npm tokens).
-- **`arc-firewall` (10 tests)**: `npm`, `pnpm`, `yarn`, `pip`, `python -m pip`, `cargo`, and `go get` command parsing, target/command resolver, established package fast path, Phantom 404 gate rejection, lifecycle scripts gate rejection, typosquat similarity rejection and suggested remediation actions.
-- **`arc-hooks` (2 tests)**: MCP JSON-RPC 2.0 request parsing and error response structure, and MCP schema fingerprint extraction for dynamic rug-pull quarantine.
-- **`arc-policy-engine` (6 tests)**: Stateful Taint DAG Lethal Trifecta trigger, unapproved MCP server block, Lethal Trifecta policy evaluation, policy configuration serialization and disk roundtrip (`.arc/policy.json`), Windows backslash path and SSH key taint classification, and session-scoped schema rug-pull isolation.
+- **`arc-firewall` (13 tests)**: `npm`, `pnpm`, `yarn`, `pip`, `python -m pip`, `cargo`, and `go get` command parsing, target/command resolver, established package fast path, Phantom 404 gate rejection, lifecycle scripts gate rejection, typosquat similarity rejection, suggested remediation actions, authoritative protected mode spoof rejection, and execution containment wrapping.
+- **`arc-hooks` (7 tests)**: MCP JSON-RPC 2.0 request parsing and error response structure, MCP schema fingerprint extraction for dynamic rug-pull quarantine, Claude Code host adapter lifecycle (install, status, bypass detection, uninstall), Cursor host adapter lifecycle, broker unapproved server blocking, runtime schema capture, and outbound DLP secret redaction before forwarding.
+- **`arc-policy-engine` (11 tests)**: Stateful Taint DAG Lethal Trifecta trigger, unapproved MCP server block, Lethal Trifecta policy evaluation, policy configuration serialization and disk roundtrip (`.arc/policy.json`), Windows backslash path and SSH key taint classification, session-scoped schema rug-pull isolation, emergency deny precedence, MCP artifact identity command digest enforcement, policy exceptions and bounded declassification with TTL, session integrity SHA-256 hash validation and tamper detection, and session cleanup for expired sessions.
 
 ---
 

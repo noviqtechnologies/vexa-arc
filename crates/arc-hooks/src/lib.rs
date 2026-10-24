@@ -3,12 +3,14 @@ pub mod broker;
 pub mod claude_code;
 pub mod cursor;
 pub mod mcp_jsonrpc;
+pub mod process_containment;
 
-pub use adapter::{AdapterError, HostAdapter, HostResponse};
+pub use adapter::{AdapterError, HostAdapter, HostIntegrationStatus, HostResponse};
 pub use broker::{BrokerError, ClientMessageOutcome, McpStdioBroker, ServerMessageOutcome};
 pub use claude_code::ClaudeCodeAdapter;
 pub use cursor::CursorAdapter;
 pub use mcp_jsonrpc::McpJsonRpcInterceptor;
+pub use process_containment::OsProcessSupervisor;
 
 #[cfg(test)]
 mod tests {
@@ -120,5 +122,67 @@ mod tests {
             }
             _ => panic!("Expected Forward with redacted payload"),
         }
+    }
+
+    #[test]
+    fn test_claude_code_host_integration_lifecycle() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("vexa_arc_claude_test_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Initially not configured
+        let status_initial = ClaudeCodeAdapter::check_integration(&temp_dir);
+        assert!(!status_initial.is_configured);
+
+        // 2. Install
+        let installed_path = ClaudeCodeAdapter::install_integration(&temp_dir).unwrap();
+        assert!(installed_path.exists());
+
+        // 3. Status check should report configured
+        let status_installed = ClaudeCodeAdapter::check_integration(&temp_dir);
+        assert!(status_installed.is_configured);
+        assert!(!status_installed.bypass_risk);
+        assert!(status_installed.hook_command.unwrap().contains("arc"));
+
+        // 4. Uninstall
+        let uninstalled = ClaudeCodeAdapter::uninstall_integration(&temp_dir).unwrap();
+        assert!(uninstalled);
+
+        let status_after = ClaudeCodeAdapter::check_integration(&temp_dir);
+        assert!(!status_after.is_configured);
+        assert!(status_after.bypass_risk); // .claude.json exists but hook missing -> bypass risk!
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cursor_host_integration_lifecycle() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("vexa_arc_cursor_test_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Initially not configured
+        let status_initial = CursorAdapter::check_integration(&temp_dir);
+        assert!(!status_initial.is_configured);
+
+        // 2. Install
+        let installed_path = CursorAdapter::install_integration(&temp_dir).unwrap();
+        assert!(installed_path.exists());
+
+        // 3. Status check should report configured
+        let status_installed = CursorAdapter::check_integration(&temp_dir);
+        assert!(status_installed.is_configured);
+        assert!(!status_installed.bypass_risk);
+        assert!(status_installed.hook_command.unwrap().contains("arc"));
+
+        // 4. Uninstall
+        let uninstalled = CursorAdapter::uninstall_integration(&temp_dir).unwrap();
+        assert!(uninstalled);
+
+        let status_after = CursorAdapter::check_integration(&temp_dir);
+        assert!(!status_after.is_configured);
+        assert!(status_after.bypass_risk);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

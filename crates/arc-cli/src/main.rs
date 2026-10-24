@@ -11,8 +11,12 @@ use arc_discover::cyclonedx::generate_cyclonedx_1_6_bom;
 use arc_discover::scanner::DiscoveryScanner;
 use arc_dlp::detector::SecretScanEngine;
 use arc_dlp::vault::LocalPseudonymizationVault;
+use arc_firewall::osv_scanner::{ecosystem_to_osv_str, OsvPackageScanner};
 use arc_firewall::proxy::PackageFirewall;
+use arc_firewall::slopsquat::SlopsquatVerdict;
 use arc_hooks::broker::McpStdioBroker;
+use arc_hooks::claude_code::ClaudeCodeAdapter;
+use arc_hooks::cursor::CursorAdapter;
 use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
 use arc_policy_engine::taint_dag::SessionTaintDag;
 
@@ -35,6 +39,10 @@ enum Commands {
         /// Target root directory to audit (default: current directory)
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
+
+        /// Audit all user workstation AI/MCP roots (FR-DISC-002)
+        #[arg(long)]
+        workstation: bool,
 
         /// Output full audit report as JSON
         #[arg(long)]
@@ -85,11 +93,21 @@ enum Commands {
         action: ProtectAction,
     },
 
+    /// Manage IDE and Agent host integrations (Claude Code, Cursor) (FR-MCP-005)
+    Host {
+        #[command(subcommand)]
+        action: HostAction,
+    },
+
     /// Diagnose installation, runtime adapters, policy, storage, and protection status (FR-CLI-001)
     Doctor {
         /// Output health and diagnostic report as JSON
         #[arg(long)]
         json: bool,
+
+        /// Include cumulative session metrics and active taints (FR-CLI-001)
+        #[arg(long)]
+        metrics: bool,
     },
 
     /// Trace decision, causal data-flow ancestry, and evidence for an event (FR-CLI-004)
@@ -109,6 +127,10 @@ enum Commands {
         #[arg(long)]
         project_local: bool,
 
+        /// Export trace and causal evidence report to file (FR-CLI-004)
+        #[arg(long)]
+        export: Option<PathBuf>,
+
         /// Output trace evidence as JSON
         #[arg(long)]
         json: bool,
@@ -123,6 +145,46 @@ enum Commands {
 
     /// Display platform version and operational status
     Version,
+}
+
+#[derive(Subcommand)]
+enum HostAction {
+    /// Install Vexa Arc proxy wrapper into host agent config
+    Install {
+        /// Target host (claude-code, cursor)
+        #[arg(long, default_value = "claude-code")]
+        host: String,
+
+        /// Target directory or workspace root (defaults to current dir)
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
+    },
+
+    /// Check host integration status and detect config bypasses (FR-MCP-005)
+    Status {
+        /// Target host (claude-code, cursor)
+        #[arg(long, default_value = "claude-code")]
+        host: String,
+
+        /// Target directory or workspace root (defaults to current dir)
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
+
+        /// Output status as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Uninstall Vexa Arc proxy wrapper and restore original config
+    Uninstall {
+        /// Target host (claude-code, cursor)
+        #[arg(long, default_value = "claude-code")]
+        host: String,
+
+        /// Target directory or workspace root (defaults to current dir)
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -169,6 +231,17 @@ enum ShieldAction {
         /// Output findings as structured JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Execute or contain a package install command under protected mode firewall (FR-PKG-004)
+    Run {
+        /// Automatically enforce containment by wrapping command with --ignore-scripts or blocking
+        #[arg(long)]
+        enforce: bool,
+
+        /// Command to supervise and evaluate (e.g. npm install express)
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
     },
 
     /// Direct package name (e.g. 'reactt'), scoped target ('npm:reactt'), or install command ('npm install reactt')
@@ -346,6 +419,14 @@ enum InterceptAction {
         #[arg(long)]
         reset: bool,
 
+        /// Prune expired sessions older than max-age-hours (NFR-PRIV-004)
+        #[arg(long)]
+        cleanup: bool,
+
+        /// Session expiration threshold in hours for cleanup (default: 24)
+        #[arg(long, default_value = "24")]
+        max_age_hours: u64,
+
         /// Custom session storage directory
         #[arg(long)]
         session_dir: Option<PathBuf>,
@@ -366,10 +447,11 @@ fn main() {
     match cli.command {
         Commands::Audit {
             path,
+            workstation,
             json,
             output_bom,
         } => {
-            if !run_audit(&path, json, output_bom.as_deref()) {
+            if !run_audit(&path, workstation, json, output_bom.as_deref()) {
                 std::process::exit(1);
             }
         }
@@ -413,6 +495,11 @@ fn main() {
                     }
                 }
                 if !all_permitted {
+                    std::process::exit(1);
+                }
+            }
+            ShieldAction::Run { command, enforce } => {
+                if !run_shield_run(command, enforce) {
                     std::process::exit(1);
                 }
             }
@@ -579,6 +666,8 @@ fn main() {
             InterceptAction::Session {
                 session_id,
                 reset,
+                cleanup,
+                max_age_hours,
                 session_dir,
                 project_local,
                 json,
@@ -586,6 +675,8 @@ fn main() {
                 if !run_intercept_session_with_dir(
                     &session_id,
                     reset,
+                    cleanup,
+                    max_age_hours,
                     json,
                     session_dir.as_deref(),
                     project_local,
@@ -605,8 +696,29 @@ fn main() {
                 }
             }
         },
-        Commands::Doctor { json } => {
-            if !run_doctor(json) {
+        Commands::Host { action } => match action {
+            HostAction::Install { host, workspace } => {
+                if !run_host_install(&host, workspace.as_deref()) {
+                    std::process::exit(1);
+                }
+            }
+            HostAction::Status {
+                host,
+                workspace,
+                json,
+            } => {
+                if !run_host_status(&host, workspace.as_deref(), json) {
+                    std::process::exit(1);
+                }
+            }
+            HostAction::Uninstall { host, workspace } => {
+                if !run_host_uninstall(&host, workspace.as_deref()) {
+                    std::process::exit(1);
+                }
+            }
+        },
+        Commands::Doctor { json, metrics } => {
+            if !run_doctor(json, metrics) {
                 std::process::exit(1);
             }
         }
@@ -615,6 +727,7 @@ fn main() {
             session,
             session_dir,
             project_local,
+            export,
             json,
         } => {
             if !run_trace(
@@ -622,6 +735,7 @@ fn main() {
                 &session,
                 session_dir.as_deref(),
                 project_local,
+                export.as_deref(),
                 json,
             ) {
                 std::process::exit(1);
@@ -640,7 +754,7 @@ fn main() {
     }
 }
 
-fn run_doctor(json: bool) -> bool {
+fn run_doctor(json: bool, metrics: bool) -> bool {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     let policy = PolicyConfig::load_with_precedence(Some(Path::new(".")));
@@ -657,22 +771,38 @@ fn run_doctor(json: bool) -> bool {
         "GenericJsonRpc (arc-hooks::McpJsonRpcInterceptor)",
     ];
 
+    // Gather host integration status if metrics flag is set
+    let host_status_cc = if metrics {
+        Some(ClaudeCodeAdapter::check_integration(Path::new(".")))
+    } else {
+        None
+    };
+    let host_status_cursor = if metrics {
+        Some(CursorAdapter::check_integration(Path::new(".")))
+    } else {
+        None
+    };
+
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "status": "healthy",
-                "version": "1.0.0",
-                "os": os,
-                "arch": arch,
-                "policy_version": policy.version,
-                "policy_source": format!("{:?}", policy.source.unwrap_or(arc_policy_engine::evaluator::PolicySource::BuiltInDefault)),
-                "allowed_mcp_servers": policy.allowed_mcp_servers.len(),
-                "emergency_deny_servers": policy.emergency_deny_servers.len(),
-                "session_storage": session_status,
-                "supported_adapters": adapters,
-            })
-        );
+        let mut output = serde_json::json!({
+            "status": "healthy",
+            "version": "1.0.0",
+            "os": os,
+            "arch": arch,
+            "policy_version": policy.version,
+            "policy_source": format!("{:?}", policy.source.unwrap_or(arc_policy_engine::evaluator::PolicySource::BuiltInDefault)),
+            "allowed_mcp_servers": policy.allowed_mcp_servers.len(),
+            "emergency_deny_servers": policy.emergency_deny_servers.len(),
+            "session_storage": session_status,
+            "supported_adapters": adapters,
+        });
+        if let Some(ref cc) = host_status_cc {
+            output["host_integrations"] = serde_json::json!({
+                "claude_code": { "installed": cc.is_configured, "bypass_risk": cc.bypass_risk, "message": cc.message },
+                "cursor": host_status_cursor.as_ref().map(|c| serde_json::json!({ "installed": c.is_configured, "bypass_risk": c.bypass_risk, "message": c.message })),
+            });
+        }
+        println!("{}", output);
         return true;
     }
 
@@ -702,6 +832,26 @@ fn run_doctor(json: bool) -> bool {
     for a in &adapters {
         println!("  • {a}");
     }
+
+    if metrics {
+        println!("-------------------------------------------------------");
+        println!("Host Integration Status (--metrics):");
+        if let Some(ref cc) = host_status_cc {
+            println!(
+                "  Claude Code: installed={}, bypass_risk={}",
+                cc.is_configured, cc.bypass_risk
+            );
+            println!("    Status: {}", cc.message);
+        }
+        if let Some(ref cursor) = host_status_cursor {
+            println!(
+                "  Cursor:      installed={}, bypass_risk={}",
+                cursor.is_configured, cursor.bypass_risk
+            );
+            println!("    Status: {}", cursor.message);
+        }
+    }
+
     println!("=======================================================\n");
     true
 }
@@ -719,11 +869,201 @@ fn run_protect_stdio(server: &str, session: &str, command: Vec<String>) -> bool 
     true
 }
 
+/// Installs Vexa Arc proxy wrapper into a host agent config (FR-MCP-005)
+fn run_host_install(host: &str, workspace: Option<&Path>) -> bool {
+    let root = workspace.unwrap_or(Path::new("."));
+    match host.to_lowercase().as_str() {
+        "claude-code" | "claude" => match ClaudeCodeAdapter::install_integration(root) {
+            Ok(_path) => {
+                println!(
+                    "[Arc Host] Claude Code integration installed at {}",
+                    root.display()
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to install Claude Code integration: {e}");
+                false
+            }
+        },
+        "cursor" => match CursorAdapter::install_integration(root) {
+            Ok(_path) => {
+                println!(
+                    "[Arc Host] Cursor integration installed at {}",
+                    root.display()
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to install Cursor integration: {e}");
+                false
+            }
+        },
+        _ => {
+            eprintln!(
+                "Error: Unknown host '{}'. Supported: claude-code, cursor",
+                host
+            );
+            false
+        }
+    }
+}
+
+/// Checks host integration status and detects config bypasses (FR-MCP-005)
+fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
+    let root = workspace.unwrap_or(Path::new("."));
+    let status = match host.to_lowercase().as_str() {
+        "claude-code" | "claude" => ClaudeCodeAdapter::check_integration(root),
+        "cursor" => CursorAdapter::check_integration(root),
+        _ => {
+            eprintln!(
+                "Error: Unknown host '{}'. Supported: claude-code, cursor",
+                host
+            );
+            return false;
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "host": host,
+                "installed": status.is_configured,
+                "bypass_risk": status.bypass_risk,
+                "message": status.message,
+            })
+        );
+    } else {
+        println!("\n[Arc Host] Integration Status for '{host}'");
+        println!(
+            "  Installed:    {}",
+            if status.is_configured { "Yes" } else { "No" }
+        );
+        println!(
+            "  Bypass Risk:  {}",
+            if status.bypass_risk {
+                "YES (ALERT!)"
+            } else {
+                "No"
+            }
+        );
+        println!("  Status:       {}", status.message);
+        if let Some(ref path) = status.hook_path {
+            println!("  Config File:  {}", path.display());
+        }
+        if let Some(ref cmd) = status.hook_command {
+            println!("  Hook Cmd:     {cmd}");
+        }
+    }
+    true
+}
+
+/// Uninstalls Vexa Arc proxy wrapper from a host agent config
+fn run_host_uninstall(host: &str, workspace: Option<&Path>) -> bool {
+    let root = workspace.unwrap_or(Path::new("."));
+    match host.to_lowercase().as_str() {
+        "claude-code" | "claude" => {
+            match ClaudeCodeAdapter::uninstall_integration(root) {
+                Ok(modified) => {
+                    if modified {
+                        println!(
+                            "[Arc Host] Claude Code integration removed from {}",
+                            root.display()
+                        );
+                    } else {
+                        println!("[Arc Host] No Arc hook found in Claude Code config (was not installed)");
+                    }
+                    true
+                }
+                Err(e) => {
+                    eprintln!("[Arc Host] Failed to remove Claude Code integration: {e}");
+                    false
+                }
+            }
+        }
+        "cursor" => match CursorAdapter::uninstall_integration(root) {
+            Ok(modified) => {
+                if modified {
+                    println!(
+                        "[Arc Host] Cursor integration removed from {}",
+                        root.display()
+                    );
+                } else {
+                    println!("[Arc Host] No Arc hook found in Cursor config (was not installed)");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to remove Cursor integration: {e}");
+                false
+            }
+        },
+        _ => {
+            eprintln!(
+                "Error: Unknown host '{}'. Supported: claude-code, cursor",
+                host
+            );
+            false
+        }
+    }
+}
+
+/// Evaluates and optionally enforces containment on a package install command (FR-PKG-004)
+fn run_shield_run(command: Vec<String>, enforce: bool) -> bool {
+    let cmd_str = command.join(" ");
+    let pkgs = PackageFirewall::parse_command(&cmd_str);
+
+    if pkgs.is_empty() {
+        eprintln!("[Arc Shield] No packages detected in command: '{cmd_str}'");
+        eprintln!("  Tip: 'arc shield run npm install express'");
+        return false;
+    }
+
+    let firewall = PackageFirewall::new();
+    let mut all_safe = true;
+
+    println!("\n[Arc Shield Run] Evaluating install command: {cmd_str}");
+    for (eco, pkg_name) in &pkgs {
+        let verdict = firewall.inspect_package_protected(*eco, pkg_name, false);
+        match &verdict {
+            SlopsquatVerdict::Blocked { gate, reason } => {
+                println!("  🛑 BLOCKED  {pkg_name} ({eco:?}) — {gate}: {reason}");
+                all_safe = false;
+            }
+            SlopsquatVerdict::Review {
+                gate,
+                containment_recommendation,
+                ..
+            } => {
+                println!("  ⚠️  REVIEW  {pkg_name} ({eco:?}) — {gate}");
+                if enforce {
+                    match PackageFirewall::enforce_containment(&cmd_str, &verdict) {
+                        Ok(safe_cmd) => println!("  → Containment applied: {safe_cmd}"),
+                        Err(e) => {
+                            println!("  → Blocked: {e}");
+                            all_safe = false;
+                        }
+                    }
+                } else {
+                    println!("  → Recommendation: {containment_recommendation}");
+                    println!("  → Use --enforce to automatically apply containment");
+                }
+            }
+            SlopsquatVerdict::Permitted { reason } => {
+                println!("  ✅ PERMITTED {pkg_name} ({eco:?}) — {reason}");
+            }
+        }
+    }
+    all_safe
+}
+
 fn run_trace(
     event_id: &str,
     session_id: &str,
     session_dir: Option<&Path>,
     project_local: bool,
+    export: Option<&Path>,
     json: bool,
 ) -> bool {
     let dir = match resolve_session_storage_dir(session_dir, project_local) {
@@ -807,6 +1147,25 @@ fn run_trace(
         }
     }
     println!("=======================================================\n");
+
+    if let Some(export_path) = export {
+        let report = serde_json::json!({
+            "session_id": session_id,
+            "current_taints": format!("{:?}", dag.current_taints),
+            "causal_graph_size": dag.causal_nodes.len(),
+            "history_length": dag.history.len(),
+            "nodes": dag.causal_nodes,
+        });
+        let content = serde_json::to_string_pretty(&report).unwrap_or_default();
+        if let Err(e) = fs::write(export_path, content) {
+            eprintln!("Error exporting trace to {}: {e}", export_path.display());
+            return false;
+        }
+        println!(
+            "[Arc Trace] Causal evidence report exported to {}",
+            export_path.display()
+        );
+    }
     true
 }
 
@@ -950,7 +1309,33 @@ fn run_test(json: bool) -> bool {
     all_passed
 }
 
-fn run_audit(path: &Path, output_json: bool, bom_file: Option<&Path>) -> bool {
+fn run_audit(path: &Path, workstation: bool, output_json: bool, bom_file: Option<&Path>) -> bool {
+    if workstation {
+        if !output_json {
+            println!("[Arc Audit] Performing full workstation AI/MCP discovery...");
+        }
+        let scanner = DiscoveryScanner::new();
+        match scanner.audit_workstation() {
+            Ok(report) => {
+                if output_json {
+                    let json_str = serde_json::to_string_pretty(&report).unwrap_or_default();
+                    println!("{json_str}");
+                } else {
+                    println!("  Scanned Roots:  {}", report.scanned_locations.len());
+                    println!("  Unscanned:      {}", report.unscanned_locations.len());
+                    println!("  Total Assets:   {}", report.total_assets);
+                    println!("  Overall Risk:   {:?}", report.overall_risk_band);
+                    println!("[Arc Audit] Workstation audit complete.");
+                }
+                return true;
+            }
+            Err(e) => {
+                eprintln!("Error: Workstation audit failed: {e}");
+                return false;
+            }
+        }
+    }
+
     let scanner = DiscoveryScanner::new();
     let report = match scanner.audit_directory(path) {
         Ok(r) => r,
@@ -1295,7 +1680,37 @@ fn run_shield_check(
     let verdict = firewall.inspect_package(eco, package, age_days, downloads, dangerous_scripts);
     let suggestion = verdict.suggested_action(ecosystem);
 
+    // FR-PKG-005: Run OSV/EPSS vulnerability scan via vexa-sca native integration.
+    // Only public package coordinates (name + version=unknown) are queried; no
+    // source code leaves the host (100% payload locality).
+    let osv_scanner = OsvPackageScanner::default();
+    let osv_eco = ecosystem_to_osv_str(eco);
+    // Use "0.0.0" as a sentinel version when no version is known; OSV will return
+    // no findings for an unknown version, preserving fail-open for availability.
+    let osv_result = osv_scanner.scan_package(package, "0.0.0", osv_eco).ok();
+
     if json {
+        let osv_json = osv_result.as_ref().map(|r| {
+            serde_json::json!({
+                "advisory_available": r.advisory_available,
+                "finding_count": r.findings.len(),
+                "has_critical_or_high": r.has_critical_or_high,
+                "has_high_epss": r.has_high_epss,
+                "has_reachable": r.has_reachable,
+                // FR-PKG-006: inline JSON-RPC remediation for the top finding
+                "remediation": r.aggregate_jsonrpc_error(),
+                "findings": r.findings.iter().map(|f| serde_json::json!({
+                    "advisory_id": f.advisory_id,
+                    "severity": f.severity,
+                    "cvss_score": f.cvss_score,
+                    "epss_score": f.epss_score,
+                    "is_reachable": f.is_reachable,
+                    "fixed_in": f.fixed_in,
+                    "remediation_message": f.remediation_message,
+                })).collect::<Vec<_>>(),
+            })
+        });
+
         let json_output = match &verdict {
             arc_firewall::slopsquat::SlopsquatVerdict::Permitted { reason } => {
                 serde_json::json!({
@@ -1308,7 +1723,8 @@ fn run_shield_check(
                         "age_days": age_days,
                         "monthly_downloads": downloads,
                         "dangerous_scripts": dangerous_scripts
-                    }
+                    },
+                    "osv": osv_json,
                 })
             }
             arc_firewall::slopsquat::SlopsquatVerdict::Blocked { gate, reason } => {
@@ -1323,7 +1739,29 @@ fn run_shield_check(
                         "age_days": age_days,
                         "monthly_downloads": downloads,
                         "dangerous_scripts": dangerous_scripts
-                    }
+                    },
+                    "osv": osv_json,
+                })
+            }
+            arc_firewall::slopsquat::SlopsquatVerdict::Review {
+                gate,
+                reason,
+                containment_recommendation,
+            } => {
+                serde_json::json!({
+                    "package": package,
+                    "ecosystem": format!("{eco:?}").to_lowercase(),
+                    "status": "review",
+                    "gate": gate,
+                    "reason": reason,
+                    "containment_recommendation": containment_recommendation,
+                    "suggested_action": suggestion,
+                    "metrics": {
+                        "age_days": age_days,
+                        "monthly_downloads": downloads,
+                        "dangerous_scripts": dangerous_scripts
+                    },
+                    "osv": osv_json,
                 })
             }
         };
@@ -1331,7 +1769,11 @@ fn run_shield_check(
             "{}",
             serde_json::to_string_pretty(&json_output).unwrap_or_default()
         );
-        return !verdict.is_blocked();
+        let osv_blocked = osv_result
+            .as_ref()
+            .map(|r| r.should_block())
+            .unwrap_or(false);
+        return !verdict.is_blocked() && !osv_blocked;
     }
 
     println!("\n┌────────────────────────────────────────────────────────┐");
@@ -1354,32 +1796,79 @@ fn run_shield_check(
 
     match &verdict {
         arc_firewall::slopsquat::SlopsquatVerdict::Permitted { reason } => {
-            println!("STATUS:             ✅ PERMITTED (PASS)");
+            println!("STATUS:             \u{2705} PERMITTED (PASS)");
             println!("Reason:             {reason}");
         }
         arc_firewall::slopsquat::SlopsquatVerdict::Blocked { gate, reason } => {
-            println!("STATUS:             🛑 BLOCKED (HARD GATE REJECTION)");
+            println!("STATUS:             \u{1F6D1} BLOCKED (HARD GATE REJECTION)");
             println!("Triggered Gate:     {gate}");
             println!("Finding:            {reason}");
 
             if let Some(act) = &suggestion {
                 println!("\nSUGGESTED ACTION:");
                 if gate == &"CompoundTyposquatGate" {
-                    println!("  💡 {act}");
+                    println!("  \u{1F4A1} {act}");
                     println!(
-                        "  ℹ️  If legitimate: arc shield allow {package} --ecosystem {ecosystem}"
+                        "  \u{2139}\u{FE0F}  If legitimate: arc shield allow {package} --ecosystem {ecosystem}"
                     );
                 } else if gate == &"CompoundLifecycleGate" {
-                    println!("  ⚠️  {act}");
+                    println!("  \u{26a0}\u{FE0F}  {act}");
                 } else {
-                    println!("  ➜  {act}");
+                    println!("  \u{27a1}  {act}");
                 }
             }
         }
+        arc_firewall::slopsquat::SlopsquatVerdict::Review {
+            gate,
+            reason,
+            containment_recommendation,
+        } => {
+            println!("STATUS:             \u{26a0}\u{FE0F}  REVIEW REQUIRED");
+            println!("Triggered Gate:     {gate}");
+            println!("Finding:            {reason}");
+            println!("Containment:        {containment_recommendation}");
+            println!("Action:             Use 'arc shield run --enforce {package}' to auto-apply containment");
+        }
     }
-    println!("──────────────────────────────────────────────────────────\n");
 
-    !verdict.is_blocked()
+    // FR-PKG-005 / FR-PKG-006: Print OSV/EPSS vulnerability findings.
+    if let Some(ref osv) = osv_result {
+        if !osv.findings.is_empty() {
+            println!("----------------------------------------------------------");
+            println!("OSV VULNERABILITY SCAN  [ARC-SCA-001]");
+            if !osv.advisory_available {
+                println!("  ⚠️  Advisory database unavailable (served from cache or offline)");
+            }
+            for f in &osv.findings {
+                let epss_str = f
+                    .epss_score
+                    .map(|s| format!(", EPSS: {:.1}%", s * 100.0))
+                    .unwrap_or_default();
+                let reach_str = if f.is_reachable { " [REACHABLE]" } else { "" };
+                println!(
+                    "  🔴 {} – {} (CVSS: {:.1}{epss_str}){reach_str}",
+                    f.advisory_id, f.severity, f.cvss_score
+                );
+                println!("     {}", f.remediation_message);
+            }
+            if osv.should_block() {
+                // FR-PKG-006: emit structured JSON-RPC error
+                if let Some(err) = osv.aggregate_jsonrpc_error() {
+                    println!("  JSON-RPC remediation: {err}");
+                }
+            }
+        } else if osv.advisory_available {
+            println!("----------------------------------------------------------");
+            println!("OSV VULNERABILITY SCAN  [ARC-SCA-001]  ✅ No known vulnerabilities");
+        }
+    }
+    println!("----------------------------------------------------------\n");
+
+    let osv_blocked = osv_result
+        .as_ref()
+        .map(|r| r.should_block())
+        .unwrap_or(false);
+    !verdict.is_blocked() && !osv_blocked
 }
 
 #[derive(Default, Debug)]
@@ -1779,12 +2268,14 @@ fn format_added_taints(taints: Taint) -> String {
 
 #[allow(dead_code)]
 fn run_intercept_session(session_id: &str, reset: bool, json: bool) -> bool {
-    run_intercept_session_with_dir(session_id, reset, json, None, false)
+    run_intercept_session_with_dir(session_id, reset, false, 24, json, None, false)
 }
 
 fn run_intercept_session_with_dir(
     session_id: &str,
     reset: bool,
+    cleanup: bool,
+    max_age_hours: u64,
     json: bool,
     session_dir: Option<&Path>,
     project_local: bool,
@@ -1804,6 +2295,27 @@ fn run_intercept_session_with_dir(
         }
     };
     let evaluator = PolicyEvaluator::default();
+
+    if cleanup {
+        use arc_policy_engine::taint_dag::SessionTaintDag;
+        match SessionTaintDag::cleanup_expired_sessions(&storage_dir, max_age_hours) {
+            Ok(count) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "cleaned_up": count, "max_age_hours": max_age_hours, "success": true })
+                    );
+                } else {
+                    println!("[Arc Session] Cleaned up {count} expired sessions (older than {max_age_hours}h)");
+                }
+                return true;
+            }
+            Err(e) => {
+                eprintln!("Error: Session cleanup failed: {e}");
+                return false;
+            }
+        }
+    }
 
     if reset {
         match evaluator.clear_session_state(Some(&storage_dir), session_id) {

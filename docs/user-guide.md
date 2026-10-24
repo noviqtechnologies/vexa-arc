@@ -398,7 +398,97 @@ SUGGESTED ACTION:
 * `0`: Package evaluation permitted (passed all security gates).
 * `1`: Package evaluation blocked (hard gate rejection, stopping CI/CD build or installation).
 
+#### OSV/EPSS Vulnerability Scanning (`ARC-SCA-001`) — FR-PKG-005 & FR-PKG-006
+
+`arc shield` integrates **vexa-sca** as a native Rust crate. Every package check now runs a live OSV batch-query + EPSS scoring after the slopsquat evaluation:
+
+- **Air-gapped safe:** Only public package coordinates (name + ecosystem) leave the host. Source code never leaves localhost.
+- **`.sca-cache` fallback:** 24-hour TTL local cache enables offline / air-gapped operation after the first successful query.
+- **EPSS threshold:** Findings at ≥ 70th EPSS percentile are flagged as actively exploited.
+- **JSON-RPC inline remediation:** Structured error payload `{"error": "Vulnerable package {name}@{version}; update constraint to >={safe}", "rule_id": "ARC-SCA-001"}` for agent self-healing (FR-PKG-006).
+
+```bash
+# Get JSON output with OSV findings and inline remediation
+arc shield check lodash --ecosystem npm --json
+
+# Terminal output shows OSV section after slopsquat evaluation
+arc shield lodash
+```
+
+**Example terminal output with OSV findings:**
+```text
+┌────────────────────────────────────────────────────────┐
+│        ARC SHIELD ANTI-SLOPSQUATTING EVALUATION        │
+└────────────────────────────────────────────────────────┘
+Package:            lodash (npm)
+Registry Metrics:   Pre-install Gate (Automated package baseline & slopsquat check)
+Dangerous Scripts:  false
+----------------------------------------------------------
+STATUS:             ✅ PERMITTED (PASS)
+Reason:             Package 'lodash' is an established popular package.
+----------------------------------------------------------
+OSV VULNERABILITY SCAN  [ARC-SCA-001]
+  🔴 GHSA-jf85-cpcp-j695 – HIGH (CVSS: 7.5)
+     Vulnerable package lodash@4.17.15; update constraint to >=4.17.21
+  JSON-RPC remediation: {"error":"Vulnerable package lodash@4.17.15; update constraint to >=4.17.21","rule_id":"ARC-SCA-001","severity":"HIGH"}
+----------------------------------------------------------
+```
+
+> [!IMPORTANT]
+> `arc shield` returns **exit code 1** (blocking) when either the slopsquat gate fires **or** an OSV finding with CRITICAL/HIGH severity or EPSS ≥ 70% is detected.
+
 ---
+
+### AST Pattern Injection Hook (`ARC-AST-001`) — FR-CORE-006
+
+Every `FileWrite` action evaluated by `arc intercept eval` triggers the **`AstPatternEngine`** before bytes reach disk. The check runs in **< 8ms** on files up to 256 KiB using Aho-Corasick prefiltering + regex matching:
+
+| Injection Category | Detection Pattern |
+| :--- | :--- |
+| Raw SQL interpolation | `SELECT/INSERT/UPDATE … ${user}` / Python f-string with table name |
+| Direct eval/exec | `eval(…)` / `exec(…)` / `child_process.exec(req.param)` |
+| Raw innerHTML | `element.innerHTML = untrustedVar` |
+| Plaintext private keys | `-----BEGIN PRIVATE KEY-----` / `-----BEGIN RSA PRIVATE KEY-----` |
+
+A blocked write returns rule ID `ARC-AST-001` with a structured JSON-RPC error.
+
+---
+
+### OS-Level Process Containment (`FR-HOOKS-003`)
+
+When `arc protect stdio` launches an MCP server, the child process is wrapped in OS-level containment:
+
+| Platform | Mechanism |
+| :--- | :--- |
+| **Windows** | `CreateJobObject` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — child terminates when Job handle closes |
+| **Linux** | `prctl(PR_SET_PDEATHSIG, SIGKILL)` in pre-exec — SIGKILL on broker parent death |
+| **macOS/Unix** | `setpgrp()` process group isolation — `killpg()` reaps entire subtree on shutdown |
+
+```bash
+# All platforms — containment is transparent to the user
+arc protect stdio --server github -- npx @modelcontextprotocol/server-github
+```
+
+---
+
+### Field-Level & Path-Level Taint Isolation (`FR-TAINT-005`)
+
+The Session Taint DAG now tracks taint at **field granularity** and **path granularity**:
+
+- Reading `.env.SECRET` taints that specific field, not the entire session.
+- **Benign commands** (`git status`, `git diff`, `git log`, `cargo test`, `npm test`) are whitelisted from blanket session taint and always permitted even in tainted sessions.
+- The Lethal Trifecta check can target specific field/path combinations for surgical blocking.
+
+```bash
+# Benign command in a tainted session — permitted
+arc intercept eval "git status" --session tainted-sess  # EXIT 0
+
+# Outbound egress after .env read — blocked (Lethal Trifecta)
+arc intercept eval slack/slack_post_message --session tainted-sess  # EXIT 1
+```
+
+---
+
 
 ### `arc intercept eval`: Runtime Action & Taint Tracking (DAG)
 
@@ -453,48 +543,130 @@ arc intercept session dev-sess --reset  # Reset session state
 
 ---
 
-## 4. Host Agent & IDE Integration
+### `arc shield run`: Supervised Package Containment Wrapper (FR-PKG-004)
 
-### Claude Code Integration
+Wraps package manager commands (`npm`, `pnpm`, `yarn`, `pip`, `cargo`, `go`) to inspect target dependencies before child processes spawn. When dangerous lifecycle scripts are detected, Arc can automatically inject `--ignore-scripts` to contain pre/post-install code execution:
 
-Vexa Arc integrates transparently with Anthropic Claude Code via standard pre-tool use hooks.
+```bash
+# Evaluate and wrap install command:
+arc shield run npm install express
 
-1. Ensure `arc` (or `arc.exe` on Windows) is accessible in your system `PATH` (or specify absolute binary path).
-2. Configure your Claude Code hook in `~/.claude.json` or `.claude.json`:
+# Automatically enforce containment:
+arc shield run --enforce npm install questionable-package
+```
 
-**Windows (`.claude.json`):**
+---
+
+### `arc audit --workstation`: Workstation AI-SPM Inventory (FR-DISC-002)
+
+Discovers agent configurations, MCP configs, models, and rule files across workstation-level OS user roots:
+- **Windows:** `%APPDATA%\Claude`, `%APPDATA%\Code\User`, `%USERPROFILE%\.cursor`, `%USERPROFILE%\.cline`
+- **macOS:** `~/Library/Application Support/Claude`, `~/Library/Application Support/Cursor`, `~/.config`
+- **Linux:** `~/.config/Claude`, `~/.config/Cursor`, `~/.cursor`, `~/.cline`
+
+```bash
+# Scan full workstation AI and MCP footprint:
+arc audit --workstation
+
+# Output structured JSON inventory:
+arc audit --workstation --json
+```
+
+---
+
+### `arc trace`: Causal Trace & Evidence Export (FR-CLI-004)
+
+Inspects the causal data-flow ancestry of any event in the session Taint DAG and exports a tamper-evident redacted JSON evidence bundle:
+
+```bash
+# Inspect the most recent session event:
+arc trace latest --session dev-sess
+
+# Export redacted causal evidence to file:
+arc trace latest --session dev-sess --export audit_evidence.json
+```
+
+---
+
+### `arc doctor --metrics`: Diagnostics & Runtime Health (NFR-OPS-001)
+
+Verifies toolchain installation, adapter availability, session storage permissions, host integrations, and reports cumulative policy decision metrics:
+
+```bash
+arc doctor --metrics
+arc doctor --metrics --json
+```
+
+---
+
+### `arc intercept session --cleanup`: Session Pruning (NFR-PRIV-004)
+
+Prunes expired session state files older than the retention threshold (default: 24 hours):
+
+```bash
+arc intercept session --cleanup --max-age-hours 24
+```
+
+---
+
+## 4. Host Agent & IDE Integration (FR-MCP-005)
+
+Vexa Arc provides native host adapter integrations for **Claude Code** and **Cursor IDE** with automated installation, health verification, and bypass detection.
+
+### Automated Host Installation
+
+Instead of editing JSON configuration files manually, Arc automates installation and configuration via `arc host`:
+
+```bash
+# 1. Install Arc protection into Claude Code:
+arc host install --host claude-code
+
+# 2. Install Arc protection into Cursor IDE:
+arc host install --host cursor
+
+# 3. Target a specific workspace root:
+arc host install --host claude-code --workspace /path/to/project
+```
+
+### Bypass Detection & Status Verification
+
+Arc verifies whether host configurations invoke the runtime proxy wrapper or if users/scripts have bypassed protection:
+
+```bash
+# Inspect integration health and bypass risk:
+arc host status --host claude-code
+arc host status --host cursor --json
+
+# Run holistic platform diagnostics across all host adapters:
+arc doctor --metrics
+```
+
+### Clean Host Uninstallation
+
+To restore original host configurations cleanly:
+
+```bash
+arc host uninstall --host claude-code
+arc host uninstall --host cursor
+```
+
+### Manual Configuration Reference
+
+If manual configuration is preferred:
+
+**Claude Code (`.claude.json` / `~/.claude.json`):**
 ```json
 {
   "hooks": {
-    "preToolUse": "arc.exe intercept eval --session %CLAUDE_SESSION_ID% --kind mcp_call --target %TOOL_NAME%"
+    "preToolUse": "arc intercept eval --session %CLAUDE_SESSION_ID% --kind mcp_call --target %TOOL_NAME%"
   }
 }
 ```
 
-**Linux / macOS (`~/.claude.json`):**
+**Cursor IDE (`.cursor/settings.json`):**
 ```json
 {
-  "hooks": {
-    "preToolUse": "arc intercept eval --session $CLAUDE_SESSION_ID --kind mcp_call --target $TOOL_NAME"
-  }
-}
-```
-
-### Cursor IDE Integration
-
-In `.cursor/settings.json`:
-
-**Windows:**
-```json
-{
-  "cursor.agent.preHookCommand": "arc.exe intercept eval --session %CURSOR_SESSION_ID% --kind shell --target \"%COMMAND%\""
-}
-```
-
-**Linux / macOS:**
-```json
-{
-  "cursor.agent.preHookCommand": "arc intercept eval --session $CURSOR_SESSION_ID --kind shell --target \"$COMMAND\""
+  "cursor.agent.preHookCommand": "arc intercept eval --session %CURSOR_SESSION_ID% --kind shell --target \"%COMMAND%\""
 }
 ```
 
@@ -508,7 +680,7 @@ For custom MCP client setups, configure Arc as a loopback stdio proxy:
   "mcpServers": {
     "protected-github": {
       "command": "arc.exe",
-      "args": ["intercept", "stdio", "--server", "github", "--", "npx.cmd", "-y", "@modelcontextprotocol/server-github"]
+      "args": ["protect", "stdio", "--server", "github", "--", "npx.cmd", "-y", "@modelcontextprotocol/server-github"]
     }
   }
 }

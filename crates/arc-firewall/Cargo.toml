@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 arc-core = { path = "../arc-core" }
+vexa-sca = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 strsim = { workspace = true }
 thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
