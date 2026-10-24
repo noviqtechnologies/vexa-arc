@@ -161,6 +161,7 @@ dependencies = [
  "arc-core",
  "arc-policy-engine",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
