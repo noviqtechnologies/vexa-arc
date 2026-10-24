@@ -519,9 +519,7 @@ mod tests {
         let threshold_ms = if cfg!(debug_assertions) { 50 } else { 8 };
         assert!(
             duration.as_millis() <= threshold_ms,
-            "Diff inspection latency must be strictly under {} ms, got {:?}",
-            threshold_ms,
-            duration
+            "Diff inspection latency must be strictly under {threshold_ms} ms, got {duration:?}"
         );
         assert!(findings_count > 0);
     }

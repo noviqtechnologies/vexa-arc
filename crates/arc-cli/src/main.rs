@@ -802,7 +802,7 @@ fn run_doctor(json: bool, metrics: bool) -> bool {
                 "cursor": host_status_cursor.as_ref().map(|c| serde_json::json!({ "installed": c.is_configured, "bypass_risk": c.bypass_risk, "message": c.message })),
             });
         }
-        println!("{}", output);
+        println!("{output}");
         return true;
     }
 
@@ -900,10 +900,7 @@ fn run_host_install(host: &str, workspace: Option<&Path>) -> bool {
             }
         },
         _ => {
-            eprintln!(
-                "Error: Unknown host '{}'. Supported: claude-code, cursor",
-                host
-            );
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor");
             false
         }
     }
@@ -916,10 +913,7 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
         "claude-code" | "claude" => ClaudeCodeAdapter::check_integration(root),
         "cursor" => CursorAdapter::check_integration(root),
         _ => {
-            eprintln!(
-                "Error: Unknown host '{}'. Supported: claude-code, cursor",
-                host
-            );
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor");
             return false;
         }
     };
@@ -1000,10 +994,7 @@ fn run_host_uninstall(host: &str, workspace: Option<&Path>) -> bool {
             }
         },
         _ => {
-            eprintln!(
-                "Error: Unknown host '{}'. Supported: claude-code, cursor",
-                host
-            );
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor");
             false
         }
     }

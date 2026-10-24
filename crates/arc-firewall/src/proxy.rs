@@ -377,10 +377,7 @@ mod tests {
             SlopsquatVerdict::Blocked { gate, .. } => {
                 assert_eq!(gate, "CompoundProvenanceGate");
             }
-            _ => panic!(
-                "Expected blocked verdict in protected mode, got {:?}",
-                verdict
-            ),
+            _ => panic!("Expected blocked verdict in protected mode, got {verdict:?}"),
         }
 
         // Verified package from cache (e.g., "express") passes Gate 1
