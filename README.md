@@ -103,7 +103,7 @@ arc host install --host cursor
 
 ## Core Security Pillars
 
-### 1. Stateful Session Taint DAG & Lethal Trifecta Prevention (`ARC-LTT-001`)
+### 1. Stateful Session Taint DAG & Lethal Trifecta Prevention
 
 The **Lethal Trifecta** occurs when an autonomous agent simultaneously acquires:
 1. **Private Data Access** (e.g. reading `.env`, database configuration, SSH keys, internal source code)
