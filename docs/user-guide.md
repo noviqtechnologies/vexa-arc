@@ -33,12 +33,15 @@ Welcome to the **Vexa Arc (Agentic Runtime Control)** User Guide. This document 
 
 ## 1. Overview & Key Concepts
 
-**Vexa Arc** is a zero-dependency, ultra-low-latency native Rust runtime firewall (Endpoint Detection and Response — EDR — for AI Agents). It inspects what coding agents see, use, and execute on developer endpoints:
+**Vexa Arc** is an open-source, zero-dependency, ultra-low-latency native Rust pre-execution policy firewall and developer workstation security control. Built specifically for AI coding agents and MCP interactions, it evaluates and governs actions before code, dependencies, or shell commands touch disk:
 
 * **Arc Intercept:** Evaluates agent tool calls in real time against a monotonic **Stateful Session Taint DAG** (Directed Acyclic Graph).
 * **Arc Veil:** Performs linear-time secret detection and Data Loss Prevention (DLP) ($< 0.9\text{ ms}$), prompt injection sanitization, and deterministic local vaulting (`<ARC_VAULT_SECRET_XX>`).
-* **Arc Shield:** Blocks hallucinated ("slopsquatted") and typosquatted dependencies before install lifecycle scripts (`postinstall.js`, `setup.py`) execute.
+* **Arc Shield:** Evaluates package names and install commands against anti-slopsquatting compound heuristics and queries OSV for exact version coordinates.
 * **Arc Atlas:** Discovers shadow MCP (Model Context Protocol) servers, agent instruction files, and model checkpoints, producing standardized CycloneDX v1.6 AI-BOM (AI Bill of Materials) artifacts.
+
+> [!IMPORTANT]
+> **Architectural Boundary:** Vexa Arc is an application-level pre-execution firewall at the agent host hook and MCP stdio boundary. It does not hook operating system system calls (it is not a kernel EDR), does not inspect network packets at the NIC layer (it is not a network egress firewall), and is not a centralized SaaS fleet management platform.
 
 ### Key Concepts & Acronym Glossary
 
@@ -55,7 +58,7 @@ To ensure clarity across security, DevOps, and AI development teams, the table b
 | **Slopsquatting** | AI Hallucination Squatting | A supply-chain vulnerability where attackers register package names that generative AI models frequently hallucinate (or typosquat from real libraries) on registries like npm and PyPI, embedding malicious post-install lifecycle scripts. |
 | **Dynamic Schema Rug-Pull** | — | A vulnerability where an MCP server or tool dynamically modifies its declared schemas, parameters, or descriptions after initial authorization to escalate privileges or bypass safety boundaries. |
 | **JCS** | **J**SON **C**anonicalization **S**cheme (RFC 8785) | A deterministic serialization standard for JSON payloads. Arc calculates SHA-256 hashes of canonicalized tool schemas to verify tools have not mutated between sessions. |
-| **EDR** | **E**ndpoint **D**etection and **R**esponse | An endpoint security discipline focused on monitoring endpoint activities and responding to threats in real time. Arc acts as an agent-aware runtime firewall/EDR for coding agents. |
+| **Pre-Execution Firewall** | — | A host-level policy control that evaluates agent requests before process spawn or disk write, blocking policy violations and feeding structured error feedback back to the agent model for self-correction. |
 
 ---
 
@@ -721,6 +724,13 @@ arc host uninstall --host cursor
 > **Native Stdin Intercept Hook (`arc intercept hook`):**
 > Claude Code and Cursor communicate directly with `arc intercept hook --host <claude-code|cursor>` over standard I/O using their native hook schemas. Any execution error or malformed payload exits with code `2`, safely failing closed to prevent unauthorized actions.
 
+### Editors Without Native Hook APIs (Windsurf, Cline)
+
+Some AI coding environments (e.g. Windsurf, Cline) do not currently provide documented pre-execution hook APIs for intercepting internal editor commands, file reads, or shell tasks before they execute.
+
+In these environments:
+- **MCP Brokering (`arc protect stdio`):** Any MCP server configured in the editor can be wrapped via `arc protect stdio --server <NAME> -- <COMMAND>`. Arc will enforce runtime schema pinning (`--pin-schema`), quarantine dynamic rug-pulls, redact sensitive secrets, ingest result taints, and enforce OS process lifetime and memory limits.
+- **Direct Editor Terminal / File Writes:** Actions performed directly inside the host editor without using MCP tools bypass Arc because the host provides no hook interception points.
 
 ### Generic Model Context Protocol (MCP) JSON-RPC
 

@@ -78,7 +78,18 @@ Vexa Arc (`arc`) acts as a local, deterministic security control and pre-executi
 
 ---
 
-## 3. Explicit Limitations & Boundaries
+## 3. Explicit Limitations, Non-Goals & Architectural Boundaries
 
-1. **Same-User Local Privilege Limit:** An attacker with equal or higher OS-level privileges (e.g. administrator/root) can modify local disk binaries or kill processes. Arc defends against untrusted code and agent-mediated workflows running under normal user privileges.
-2. **Kernel EDR:** Arc does not hook OS system calls at the kernel level; it operates at the agent runtime and MCP JSON-RPC protocol boundary.
+To avoid ambiguity regarding deployment guarantees, Vexa Arc defines explicit operational boundaries:
+
+1. **Not a Kernel-Level EDR or OS Syscall Sandbox:** Arc does not hook operating system system calls or inspect kernel event streams (e.g., eBPF, Windows ETW/minifilters). Malicious processes spawned independently of Arc or commands executing raw kernel bypasses fall outside Arc's control boundary. Arc functions strictly as an application-level, pre-execution policy firewall at the agent host hook and MCP JSON-RPC boundary.
+2. **Not a Commercial Network Egress Firewall:** Arc inspects shell command tokens, interpreter flags, and tool arguments at the boundary of agent sessions. It does not inspect packet-level TCP/IP traffic or DNS queries at the network interface layer.
+3. **Host Adapter Coverage Scope:** Full pre-execution interception (shell, filesystem read/write, MCP calls) requires the host editor to expose documented hook APIs. Arc currently provides native adapters for:
+   - **Claude Code**: Structured hooks in `.claude/settings.json` (`PreToolUse`, `PostToolUse`).
+   - **Cursor**: Structured hooks in `.cursor/hooks.json` (`beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`, `afterMCPExecution`).
+   Hosts without documented pre-execution hook interfaces (e.g., Windsurf, Cline) can only be mediated at the MCP transport layer via the stdio broker (`arc protect stdio`); unmediated internal host actions in those editors are not intercepted.
+4. **Dataflow Tracking Nature:** The Session Taint DAG accumulates taints monotonically across causal events. While it isolates benign commands (e.g., `git status`, local test runners) and tracks structured field/path access, it is a conservative session-level and path-level automaton, not a full byte-level taint tracking compiler engine.
+5. **Package Firewall Scope:** `arc shield` evaluates slopsquatting risks using deterministic algorithmic distance metrics (Levenshtein, Jaro-Winkler) against seeded popular package baselines, script presence, and caller simulation flags. It is not an active online package registry crawler. OSV vulnerability scanning evaluates exact coordinates (`name@version`); requests without concrete versions are categorized as `not_scanned_no_version`, and unavailable advisory feeds fail closed (`incomplete`).
+6. **Code Pattern Scanner Nature:** The pre-write injection engine uses linear-time Aho-Corasick prefiltering and targeted regular expressions evaluated per line. It does not construct an Abstract Syntax Tree (AST) or perform inter-procedural dataflow analysis across files.
+7. **Process Containment Scope:** The process supervisor enforces process tree lifetime containment and memory limits via OS Job Objects (`CREATE_SUSPENDED` on Windows) and `PR_SET_PDEATHSIG` / `RLIMIT_AS` (on Linux). It is process resource and descendant lifecycle containment, not a virtualized syscall, filesystem chroot, or network namespace sandbox.
+8. **Same-User Local Privilege Limit:** An attacker with equal or higher OS-level privileges (e.g., administrator/root) can modify local binaries, tamper with unencrypted files, or kill processes. Arc defends against untrusted external content and agent-mediated workflows executing under standard user privileges.

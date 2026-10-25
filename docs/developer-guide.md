@@ -39,7 +39,7 @@ Vexa Arc operates under three core engineering invariants:
 
 ```mermaid
 flowchart TB
-    HOST["Agent / IDE (Claude Code, Cursor, Windsurf)"] -->|"Hook / JSON-RPC"| HOOKS["arc-hooks"]
+    HOST["Agent / IDE (Claude Code, Cursor, MCP Stdio)"] -->|"Hook / JSON-RPC"| HOOKS["arc-hooks"]
     HOOKS -->|"Normalized ActionEvent"| ENGINE["arc-policy-engine"]
     
     subgraph ENGINE_SUBSYSTEMS["Core Security Subsystems"]
@@ -209,20 +209,23 @@ Provides the `LocalPseudonymizationVault`:
 
 ---
 
-### AST Pattern Injection Hook (`ARC-AST-001`) — FR-CORE-006
+### Code Injection Pattern Hook (`ARC-AST-001`) — FR-CORE-006
 
 `AstPatternEngine` in [`crates/arc-dlp/src/ast_pattern.rs`](file:///c:/vexa-arc/crates/arc-dlp/src/ast_pattern.rs) runs as a first-class step in `PolicyEvaluator::evaluate` for `Action::FileWrite`:
 
 ```rust
 // Integration in arc-policy-engine/src/evaluator.rs
-if let Action::FileWrite { path, content } = &event.action {
+if let Action::FileWrite { path, new_content: Some(content) } = &event.action {
     if let Some(hit) = engine.check(content) {
-        return Verdict::Block { rule: "ARC-AST-001", explanation: hit };
+        return Verdict::Deny { rule: RuleId("ARC-AST-001".to_string()), explanation: ... };
     }
 }
 ```
 
-**Performance:** Uses Aho-Corasick multi-pattern prefilter across the whole buffer, then applies regex only at confirmed hit sites. Benchmarked at **< 0.1ms** for 256 KiB on debug builds; well within the 8ms NFR budget.
+> [!NOTE]
+> **Implementation Scope & Architectural Tradeoff:** Despite the module naming `AstPatternEngine`, this component does **not** construct a compiler Abstract Syntax Tree (which would incur prohibitive multi-language grammar parser overhead and tens of milliseconds of latency). Instead, it employs linear-time Aho-Corasick multi-keyword prefiltering followed by targeted regular expressions evaluated per line. This provides microsecond-level detection for obvious SQL format-string interpolation, direct `eval`/`exec`, raw `innerHTML`, and plaintext private key tokens without language-specific AST compilation overhead.
+
+**Performance:** Uses Aho-Corasick multi-pattern prefilter across the buffer, then applies regex only at candidate keyword matches. Benchmarked at **< 0.1ms** for 256 KiB buffers.
 
 ---
 

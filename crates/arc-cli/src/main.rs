@@ -1767,7 +1767,8 @@ fn run_shield_check(
     let firewall = PackageFirewall::new();
     let eco = parse_ecosystem(ecosystem);
 
-    let verdict = firewall.inspect_package(eco, package, age_days, downloads, dangerous_scripts);
+    let (osv_name, osv_version) = split_package_version(package);
+    let verdict = firewall.inspect_package(eco, osv_name, age_days, downloads, dangerous_scripts);
     let suggestion = verdict.suggested_action(ecosystem);
 
     // FR-PKG-005: Run OSV/EPSS vulnerability scan via vexa-sca native integration.
@@ -1777,7 +1778,6 @@ fn run_shield_check(
     // NoVersion, and scan errors / unreachable advisory data fail closed.
     let osv_scanner = OsvPackageScanner::default();
     let osv_eco = ecosystem_to_osv_str(eco);
-    let (osv_name, osv_version) = split_package_version(package);
     let osv_outcome = match osv_version {
         None => OsvOutcome::NoVersion,
         Some(v) => match osv_scanner.scan_package(osv_name, v, osv_eco) {

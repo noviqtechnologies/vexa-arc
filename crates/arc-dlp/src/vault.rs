@@ -19,6 +19,19 @@ struct SessionVaultData {
     counter: usize,
 }
 
+impl Drop for SessionVaultData {
+    fn drop(&mut self) {
+        // Volatile zeroization of raw secret memory buffers to prevent secret lingering in heap
+        for bytes in self.tokens.values_mut() {
+            for b in bytes.iter_mut() {
+                unsafe {
+                    std::ptr::write_volatile(b, 0);
+                }
+            }
+        }
+    }
+}
+
 pub struct LocalPseudonymizationVault {
     session_vault: RwLock<HashMap<String, SessionVaultData>>,
 }
