@@ -1,21 +1,23 @@
 # Rust & Build Artifacts
-/target
+target/
+**/target/
 **/*.rs.bk
 *.pdb
 *.profraw
 
 # ARC & Security Scanners
-**/.arc
-/.sca-cache
-**/.sca-cache
+.arc/
+**/.arc/
+.sca-cache/
+**/.sca-cache/
 
 # Local Workspace, Design & Documentation Staging
-/prd
-/images
-/misc
-/design
-/outputs
-/completed
+prd/
+images/
+misc/
+design/
+outputs/
+completed/
 
 # IDEs & Editors
 .vscode/
