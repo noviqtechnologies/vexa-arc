@@ -273,12 +273,16 @@ impl OsvPackageScanner {
     /// Convenience method: scan a package and return the aggregated JSON-RPC
     /// error string if any blocking vulnerability is found.
     ///
-    /// Returns `None` when the package is clean or the advisory database is
-    /// unavailable.
+    /// Returns `None` only when the package was scanned with advisory data and is clean.
+    /// Scan errors or an unavailable advisory database yield an error string (fail closed).
     pub fn blocking_error(&self, name: &str, version: &str, ecosystem: &str) -> Option<String> {
         match self.scan_package(name, version, ecosystem) {
+            Ok(result) if !result.advisory_available => Some(format!(
+                "OSV scan incomplete for {name}@{version}: advisory database unavailable"
+            )),
             Ok(result) if result.should_block() => result.aggregate_jsonrpc_error(),
-            _ => None,
+            Ok(_) => None,
+            Err(e) => Some(format!("OSV scan failed for {name}@{version}: {e}")),
         }
     }
 }

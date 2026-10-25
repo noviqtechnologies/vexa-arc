@@ -127,6 +127,34 @@ impl Default for PolicyConfig {
 }
 
 impl PolicyConfig {
+    /// Reads one policy file. Absent file => `None` silently; unreadable or malformed
+    /// file => `None` with a loud stderr warning (never silently ignored).
+    fn read_policy_file(path: &std::path::Path, source: PolicySource) -> Option<PolicyConfig> {
+        if !path.exists() {
+            return None;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("arc: WARNING: cannot read policy {}: {e}", path.display());
+                return None;
+            }
+        };
+        match serde_json::from_str::<PolicyConfig>(&content) {
+            Ok(mut parsed) => {
+                parsed.source = Some(source);
+                Some(parsed)
+            }
+            Err(e) => {
+                eprintln!(
+                    "arc: WARNING: malformed policy {} ignored (defaults apply): {e}",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
     /// Loads policy with documented precedence (FR-CORE-005):
     /// BuiltInDefault < UserGlobal (~/.arc/policy.json) < ProjectLocal (.arc/policy.json) < SignedOrganization
     pub fn load_with_precedence(project_dir: Option<&std::path::Path>) -> Self {
@@ -138,13 +166,8 @@ impl PolicyConfig {
             .map(std::path::PathBuf::from)
         {
             let user_cfg = user_home.join(".arc").join("policy.json");
-            if user_cfg.exists() {
-                if let Ok(content) = std::fs::read_to_string(&user_cfg) {
-                    if let Ok(mut parsed) = serde_json::from_str::<PolicyConfig>(&content) {
-                        parsed.source = Some(PolicySource::UserGlobal);
-                        effective.merge_lower_precedence(parsed);
-                    }
-                }
+            if let Some(parsed) = Self::read_policy_file(&user_cfg, PolicySource::UserGlobal) {
+                effective.merge_lower_precedence(parsed);
             }
         }
 
@@ -152,26 +175,24 @@ impl PolicyConfig {
         if let Some(dir) = project_dir {
             let candidate_paths = [dir.join(".arc").join("policy.json"), dir.join(".arc.json")];
             for path in &candidate_paths {
-                if path.exists() {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        if let Ok(mut parsed) = serde_json::from_str::<PolicyConfig>(&content) {
-                            parsed.source = Some(PolicySource::ProjectLocal);
-                            effective.merge_lower_precedence(parsed);
-                            break;
-                        }
-                    }
+                if let Some(parsed) = Self::read_policy_file(path, PolicySource::ProjectLocal) {
+                    effective.merge_lower_precedence(parsed);
+                    break;
                 }
             }
 
-            // 3. Check signed organization policy (.arc/signed_policy.json)
+            // 3. Check organization policy (.arc/signed_policy.json)
+            // NOTE: no signature verification is implemented; this file lives in the
+            // project directory and is trusted only as much as the directory itself.
             let org_path = dir.join(".arc").join("signed_policy.json");
-            if org_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&org_path) {
-                    if let Ok(mut parsed) = serde_json::from_str::<PolicyConfig>(&content) {
-                        parsed.source = Some(PolicySource::SignedOrganization);
-                        effective.merge_lower_precedence(parsed);
-                    }
-                }
+            if let Some(parsed) =
+                Self::read_policy_file(&org_path, PolicySource::SignedOrganization)
+            {
+                eprintln!(
+                    "arc: WARNING: {} is NOT cryptographically verified; treat as unsigned",
+                    org_path.display()
+                );
+                effective.merge_lower_precedence(parsed);
             }
         }
 

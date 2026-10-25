@@ -1,13 +1,46 @@
+# Rust & Build Artifacts
 /target
 **/*.rs.bk
 *.pdb
-/prd
-/images
+*.profraw
+
+# ARC & Security Scanners
+**/.arc
 /.sca-cache
 **/.sca-cache
-**/.arc
+
+# Local Workspace, Design & Documentation Staging
+/prd
+/images
 /misc
 /design
 /outputs
 /completed
 
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# OS Artifacts
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment, Secrets & Local Logs
+*.log
+.env
+.env.local
+.env.*.local
+
+# AI Agents & Local Output
+.gemini/
+graphify-out/

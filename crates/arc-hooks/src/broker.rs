@@ -2,14 +2,20 @@ use arc_core::capability::Capability;
 use arc_core::event::{
     Action, ActionEvent, AgentHost, Artifact, OsPrincipal, Phase, ServerIdentity,
 };
-use arc_core::verdict::{Obligation, Verdict};
+use arc_core::verdict::{Explanation, Obligation, RuleId, Verdict};
 use arc_policy_engine::evaluator::PolicyEvaluator;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
+
+use crate::process_containment::{ContainmentLimits, OsProcessSupervisor};
+
+/// Upper bound on in-flight `tools/call` requests tracked for result taint attribution.
+const MAX_PENDING_CALLS: usize = 4096;
 
 #[derive(Debug, Error)]
 pub enum BrokerError {
@@ -57,6 +63,13 @@ pub struct McpStdioBroker {
     pub requests_processed: usize,
     pub requests_blocked: usize,
     pub secrets_redacted: usize,
+    /// When set, the first (and every later) `tools/list` schema must hash to this value.
+    pub pinned_schema_hash: Option<[u8; 32]>,
+    /// Set once a `tools/list` response failed the pin check; all tool calls are then denied.
+    pub schema_pin_violated: bool,
+    pub limits: ContainmentLimits,
+    /// In-flight `tools/call` request id (JSON text) -> tool name, for result taint attribution.
+    pending_calls: HashMap<String, String>,
 }
 
 impl McpStdioBroker {
@@ -75,6 +88,10 @@ impl McpStdioBroker {
             requests_processed: 0,
             requests_blocked: 0,
             secrets_redacted: 0,
+            pinned_schema_hash: None,
+            schema_pin_violated: false,
+            limits: ContainmentLimits::default(),
+            pending_calls: HashMap::new(),
         }
     }
 
@@ -86,6 +103,29 @@ impl McpStdioBroker {
     pub fn with_max_payload(mut self, max_bytes: usize) -> Self {
         self.max_payload_bytes = max_bytes;
         self
+    }
+
+    /// Requires the server's `tools/list` JCS schema hash to equal `hash` (trust anchor for the
+    /// initial schema; without it the first observed schema is simply trusted-on-first-use).
+    pub fn with_pinned_schema(mut self, hash: [u8; 32]) -> Self {
+        self.pinned_schema_hash = Some(hash);
+        self
+    }
+
+    pub fn with_limits(mut self, limits: ContainmentLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    fn deny_verdict(rule: &str, summary: String, options: Vec<String>) -> Verdict {
+        Verdict::Deny {
+            rule: RuleId(rule.to_string()),
+            explanation: Explanation::new(
+                summary,
+                options,
+                Some(format!("https://docs.vexa.ai/arc/policies/{rule}")),
+            ),
+        }
     }
 
     /// Processes an incoming message from the host agent to the MCP server.
@@ -116,6 +156,26 @@ impl McpStdioBroker {
 
         match method {
             Some("tools/call") => {
+                if self.schema_pin_violated {
+                    self.requests_blocked += 1;
+                    let verdict = Self::deny_verdict(
+                        "ARC-MCP-003",
+                        format!(
+                            "MCP server '{}' presented a tool schema that does not match the pinned hash; tool calls are disabled.",
+                            self.server_name
+                        ),
+                        vec![
+                            "Verify the server binary/version and update the pinned schema hash."
+                                .to_string(),
+                        ],
+                    );
+                    return ClientMessageOutcome::RespondLocally(
+                        crate::mcp_jsonrpc::McpJsonRpcInterceptor::format_response(
+                            &req_id, &verdict,
+                        ),
+                    );
+                }
+
                 let params = parsed.get("params").cloned().unwrap_or(Value::Null);
                 let tool_name = params
                     .get("name")
@@ -169,6 +229,15 @@ impl McpStdioBroker {
                     return ClientMessageOutcome::RespondLocally(local_resp);
                 }
 
+                // Remember the call so its result can be attributed (and taint-classified).
+                if !req_id.is_null() {
+                    if self.pending_calls.len() >= MAX_PENDING_CALLS {
+                        self.pending_calls.clear();
+                    }
+                    self.pending_calls
+                        .insert(req_id.to_string(), tool_name.clone());
+                }
+
                 // If allowed with DLP obligations, redact arguments before forwarding!
                 if let Verdict::Allow { ref obligations } = verdict {
                     let mut modified_args = args;
@@ -210,48 +279,118 @@ impl McpStdioBroker {
         }
     }
 
+    /// Flattens an MCP `tools/call` result (`content[].text`, `structuredContent`, or raw JSON).
+    fn result_text(result: &Value) -> String {
+        if let Some(items) = result.get("content").and_then(|c| c.as_array()) {
+            let texts: Vec<&str> = items
+                .iter()
+                .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+                .collect();
+            if !texts.is_empty() {
+                return texts.join("\n");
+            }
+        }
+        result.to_string()
+    }
+
     /// Processes a message emitted by the MCP server child process.
-    /// Intercepts runtime tool schemas from `tools/list` responses to compute RFC 8785 JCS fingerprint.
+    /// * Intercepts runtime tool schemas from `tools/list` responses to compute the RFC 8785 JCS
+    ///   fingerprint (and enforce the optional schema pin).
+    /// * Routes `tools/call` results through the taint classifier so externally-authored content
+    ///   (issues, web pages, messages) taints the session.
     pub fn handle_server_message(&mut self, line: &str) -> ServerMessageOutcome {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return ServerMessageOutcome::Forward(line.to_string());
         }
 
-        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-            // Check for tools/list response
-            if let Some(result) = parsed.get("result") {
-                if let Some(tools) = result.get("tools") {
-                    if let Ok(tools_bytes) = serde_json::to_vec(tools) {
-                        if let Ok(hash) = arc_core::compute_jcs_schema_hash(&tools_bytes) {
-                            self.current_schema_hash = Some(hash);
-                            // Register in session
-                            let event = ActionEvent::new(
-                                AgentHost::ClaudeCode,
-                                &self.session_id,
-                                OsPrincipal::Uid(1000),
-                                Phase::Post,
-                                Action::McpToolsList {
-                                    server: ServerIdentity {
-                                        config_name: self.server_name.clone(),
-                                        artifact: Artifact::Unknown,
-                                        schema_root: Some(hash),
-                                    },
-                                    tools_json: serde_json::to_string(tools).unwrap_or_default(),
-                                },
-                            )
-                            .with_schema_fingerprint(hash);
+        let Ok(parsed) = serde_json::from_str::<Value>(trimmed) else {
+            return ServerMessageOutcome::Forward(line.to_string());
+        };
 
-                            self.evaluator
-                                .taint_tracker
-                                .record_event_and_update_taints(&event);
-
-                            return ServerMessageOutcome::CapturedSchema {
-                                fingerprint: hash,
-                                forward_line: line.to_string(),
-                            };
+        // Check for tools/list response
+        if let Some(tools) = parsed.get("result").and_then(|r| r.get("tools")) {
+            if let Ok(tools_bytes) = serde_json::to_vec(tools) {
+                if let Ok(hash) = arc_core::compute_jcs_schema_hash(&tools_bytes) {
+                    if let Some(pin) = self.pinned_schema_hash {
+                        if pin != hash {
+                            self.schema_pin_violated = true;
+                            self.requests_blocked += 1;
+                            let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+                            let err = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32001,
+                                    "message": format!(
+                                        "[ARC-MCP-003] tools/list schema hash {} does not match pinned hash {}",
+                                        hex::encode(hash),
+                                        hex::encode(pin)
+                                    )
+                                }
+                            });
+                            return ServerMessageOutcome::Forward(err.to_string());
                         }
                     }
+
+                    self.current_schema_hash = Some(hash);
+                    // Register in session
+                    let event = ActionEvent::new(
+                        AgentHost::ClaudeCode,
+                        &self.session_id,
+                        OsPrincipal::Uid(1000),
+                        Phase::Post,
+                        Action::McpToolsList {
+                            server: ServerIdentity {
+                                config_name: self.server_name.clone(),
+                                artifact: Artifact::Unknown,
+                                schema_root: Some(hash),
+                            },
+                            tools_json: serde_json::to_string(tools).unwrap_or_default(),
+                        },
+                    )
+                    .with_schema_fingerprint(hash);
+
+                    self.evaluator
+                        .taint_tracker
+                        .record_event_and_update_taints(&event);
+
+                    return ServerMessageOutcome::CapturedSchema {
+                        fingerprint: hash,
+                        forward_line: line.to_string(),
+                    };
+                }
+            }
+        }
+
+        // Correlate tools/call responses with their requests and classify the result for taint.
+        if let Some(id) = parsed.get("id").filter(|i| !i.is_null()) {
+            if let Some(tool) = self.pending_calls.remove(&id.to_string()) {
+                if let Some(result) = parsed.get("result") {
+                    let is_error = result
+                        .get("isError")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
+                    let event = ActionEvent::new(
+                        AgentHost::ClaudeCode,
+                        &self.session_id,
+                        OsPrincipal::Uid(1000),
+                        Phase::Post,
+                        Action::McpToolResult {
+                            server: ServerIdentity {
+                                config_name: self.server_name.clone(),
+                                artifact: Artifact::Unknown,
+                                schema_root: self.current_schema_hash,
+                            },
+                            tool,
+                            content: Self::result_text(result),
+                            is_error,
+                        },
+                    )
+                    .with_transport("stdio");
+                    self.evaluator
+                        .taint_tracker
+                        .record_event_and_update_taints(&event);
                 }
             }
         }
@@ -267,7 +406,7 @@ impl McpStdioBroker {
             ));
         }
 
-        let supervisor = crate::process_containment::OsProcessSupervisor::new()?;
+        let supervisor = OsProcessSupervisor::with_limits(self.limits)?;
 
         let mut cmd = Command::new(&self.command[0]);
         if self.command.len() > 1 {
@@ -278,80 +417,100 @@ impl McpStdioBroker {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::inherit()); // Stderr preserved separately (FR-MCP-001)
 
-        supervisor.configure_command(&mut cmd);
-        let mut child = cmd.spawn()?;
-        supervisor.supervise_child(&child)?;
+        // Spawn with containment armed before the child can execute any code (suspended-create +
+        // job assignment on Windows; process group + PDEATHSIG on Unix).
+        let mut child = supervisor.spawn(&mut cmd)?;
 
         let mut child_stdin = child.stdin.take().ok_or(BrokerError::ChildTerminated)?;
         let child_stdout = child.stdout.take().ok_or(BrokerError::ChildTerminated)?;
 
-        let running = Arc::new(AtomicBool::new(true));
-        let running_clone = running.clone();
+        let running = AtomicBool::new(true);
+        let running_ref = &running;
+        // Serialises writes from the relay thread and the policy (local response) path so that
+        // neither holds the process-wide stdout lock for its whole lifetime.
+        let out = Mutex::new(std::io::stdout());
+        let out_ref = &out;
+        let shared = Mutex::new(&mut *self);
+        let shared_ref = &shared;
 
-        // Background thread reading from child server stdout -> host stdout
-        let stdout_thread = std::thread::spawn(move || {
-            let mut reader = BufReader::new(child_stdout);
-            let mut stdout = std::io::stdout().lock();
+        fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+            m.lock().unwrap_or_else(|e| e.into_inner())
+        }
+        fn write_line(out: &Mutex<std::io::Stdout>, text: &str) {
+            let mut o = lock(out);
+            let _ = o.write_all(text.as_bytes());
+            if !text.ends_with('\n') {
+                let _ = o.write_all(b"\n");
+            }
+            let _ = o.flush();
+        }
+
+        std::thread::scope(|scope| {
+            // Child server stdout -> (schema capture / result taint) -> host stdout
+            let relay = scope.spawn(move || {
+                let mut reader = BufReader::new(child_stdout);
+                let mut line_buf = String::new();
+                while running_ref.load(Ordering::Relaxed) {
+                    line_buf.clear();
+                    match reader.read_line(&mut line_buf) {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let outcome = lock(shared_ref).handle_server_message(&line_buf);
+                            let forward = match outcome {
+                                ServerMessageOutcome::Forward(l) => l,
+                                ServerMessageOutcome::CapturedSchema { forward_line, .. } => {
+                                    forward_line
+                                }
+                            };
+                            write_line(out_ref, &forward);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Host stdin -> policy evaluation -> child server stdin
+            let stdin = std::io::stdin().lock();
+            let mut reader = BufReader::new(stdin);
             let mut line_buf = String::new();
 
-            while running_clone.load(Ordering::Relaxed) {
+            while running.load(Ordering::Relaxed) {
                 line_buf.clear();
                 match reader.read_line(&mut line_buf) {
-                    Ok(0) => break, // EOF
+                    Ok(0) => break, // Host closed stdin
                     Ok(_) => {
-                        let _ = stdout.write_all(line_buf.as_bytes());
-                        let _ = stdout.flush();
+                        let outcome = lock(shared_ref).handle_client_message(&line_buf);
+                        match outcome {
+                            ClientMessageOutcome::Forward(forward_str) => {
+                                let _ = child_stdin.write_all(forward_str.as_bytes());
+                                if !forward_str.ends_with('\n') {
+                                    let _ = child_stdin.write_all(b"\n");
+                                }
+                                let _ = child_stdin.flush();
+                            }
+                            ClientMessageOutcome::RespondLocally(resp) => {
+                                write_line(out_ref, &resp.to_string());
+                            }
+                            ClientMessageOutcome::ProtocolError(err) => {
+                                let err_resp = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "error": {
+                                        "code": -32600,
+                                        "message": err
+                                    }
+                                });
+                                write_line(out_ref, &err_resp.to_string());
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
             }
+
+            running.store(false, Ordering::Relaxed);
+            let _ = supervisor.terminate(&mut child);
+            let _ = relay.join();
         });
-
-        // Main thread reading from host stdin -> policy evaluation -> child server stdin
-        let stdin = std::io::stdin().lock();
-        let mut reader = BufReader::new(stdin);
-        let mut client_stdout = std::io::stdout().lock();
-        let mut line_buf = String::new();
-
-        while running.load(Ordering::Relaxed) {
-            line_buf.clear();
-            match reader.read_line(&mut line_buf) {
-                Ok(0) => break, // Host closed stdin
-                Ok(_) => match self.handle_client_message(&line_buf) {
-                    ClientMessageOutcome::Forward(forward_str) => {
-                        let _ = child_stdin.write_all(forward_str.as_bytes());
-                        if !forward_str.ends_with('\n') {
-                            let _ = child_stdin.write_all(b"\n");
-                        }
-                        let _ = child_stdin.flush();
-                    }
-                    ClientMessageOutcome::RespondLocally(resp) => {
-                        let mut resp_str = resp.to_string();
-                        resp_str.push('\n');
-                        let _ = client_stdout.write_all(resp_str.as_bytes());
-                        let _ = client_stdout.flush();
-                    }
-                    ClientMessageOutcome::ProtocolError(err) => {
-                        let err_resp = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "error": {
-                                "code": -32600,
-                                "message": err
-                            }
-                        });
-                        let mut resp_str = err_resp.to_string();
-                        resp_str.push('\n');
-                        let _ = client_stdout.write_all(resp_str.as_bytes());
-                        let _ = client_stdout.flush();
-                    }
-                },
-                Err(_) => break,
-            }
-        }
-
-        running.store(false, Ordering::Relaxed);
-        let _ = supervisor.terminate(&mut child);
-        let _ = stdout_thread.join();
 
         Ok(())
     }

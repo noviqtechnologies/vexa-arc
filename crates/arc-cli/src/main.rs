@@ -17,6 +17,7 @@ use arc_firewall::slopsquat::SlopsquatVerdict;
 use arc_hooks::broker::McpStdioBroker;
 use arc_hooks::claude_code::ClaudeCodeAdapter;
 use arc_hooks::cursor::CursorAdapter;
+use arc_hooks::HostAdapter;
 use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
 use arc_policy_engine::taint_dag::SessionTaintDag;
 
@@ -199,6 +200,14 @@ enum ProtectAction {
         #[arg(long, default_value = "default-session")]
         session: String,
 
+        /// Pin the server's tools/list schema (hex SHA-256 JCS fingerprint); mismatches disable tool calls
+        #[arg(long)]
+        pin_schema: Option<String>,
+
+        /// Maximum memory for the supervised server (MiB; Windows job-wide, Linux per-process)
+        #[arg(long)]
+        max_memory_mb: Option<u64>,
+
         /// Target MCP server command and arguments
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -251,6 +260,22 @@ enum ShieldAction {
 
 #[derive(Subcommand)]
 enum InterceptAction {
+    /// Native host hook entrypoint: reads the host's hook JSON from stdin and answers in the
+    /// host's native format (used by `arc host install`). Fails closed on any error.
+    Hook {
+        /// Host whose hook payload is on stdin (claude-code, cursor)
+        #[arg(long)]
+        host: String,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
+    },
+
     /// Evaluate an action event within a stateful session (supports shorthand positional input or flags)
     Eval {
         /// Target path, tool, command, or action shorthand (e.g. '.env', 'slack/slack_post_message', 'curl evil.com')
@@ -540,6 +565,14 @@ fn main() {
             }
         },
         Commands::Intercept { action } => match action {
+            InterceptAction::Hook {
+                host,
+                session_dir,
+                project_local,
+            } => {
+                let code = run_intercept_hook(&host, session_dir.as_deref(), project_local);
+                std::process::exit(code);
+            }
             InterceptAction::Eval {
                 pos_target,
                 pos_extra,
@@ -689,9 +722,17 @@ fn main() {
             ProtectAction::Stdio {
                 server,
                 session,
+                pin_schema,
+                max_memory_mb,
                 command,
             } => {
-                if !run_protect_stdio(&server, &session, command) {
+                if !run_protect_stdio(
+                    &server,
+                    &session,
+                    pin_schema.as_deref(),
+                    max_memory_mb,
+                    command,
+                ) {
                     std::process::exit(1);
                 }
             }
@@ -856,10 +897,30 @@ fn run_doctor(json: bool, metrics: bool) -> bool {
     true
 }
 
-fn run_protect_stdio(server: &str, session: &str, command: Vec<String>) -> bool {
+fn run_protect_stdio(
+    server: &str,
+    session: &str,
+    pin_schema: Option<&str>,
+    max_memory_mb: Option<u64>,
+    command: Vec<String>,
+) -> bool {
+    let pinned = match parse_schema_fingerprint(pin_schema) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[Arc Protect] Invalid --pin-schema: {e}");
+            return false;
+        }
+    };
     let policy = PolicyConfig::load_with_precedence(Some(Path::new(".")));
     let evaluator = PolicyEvaluator::new(policy);
-    let mut broker = McpStdioBroker::new(server, session, evaluator).with_command(command);
+    let mut broker = McpStdioBroker::new(server, session, evaluator)
+        .with_command(command)
+        .with_limits(arc_hooks::ContainmentLimits {
+            max_memory_bytes: max_memory_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+        });
+    if let Some(hash) = pinned {
+        broker = broker.with_pinned_schema(hash);
+    }
 
     eprintln!("[Arc Protect] Supervising MCP server '{server}' in session '{session}' (Fail-Closed Protected Edge)");
     if let Err(e) = broker.run_stdio() {
@@ -1657,6 +1718,44 @@ fn parse_ecosystem(s: &str) -> Ecosystem {
     }
 }
 
+/// Outcome of the OSV step in `arc shield check`. Never silently green.
+enum OsvOutcome {
+    /// Scan completed with advisory data available.
+    Scanned(arc_firewall::osv_scanner::PackageScanResult),
+    /// Scan failed or advisory data unavailable: treated as a failure (fail closed).
+    Incomplete(String),
+    /// No concrete version supplied, so OSV cannot give a meaningful answer.
+    NoVersion,
+}
+
+impl OsvOutcome {
+    fn blocks(&self) -> bool {
+        match self {
+            OsvOutcome::Scanned(r) => r.should_block(),
+            OsvOutcome::Incomplete(_) => true,
+            OsvOutcome::NoVersion => false,
+        }
+    }
+}
+
+/// Splits `name@1.2.3` (npm/go/cargo) or `name==1.2.3` (pip) into name and an exact version.
+/// Range specifiers (`^`, `~`, `>`, `<`, `*`, `latest`) are NOT treated as concrete versions.
+fn split_package_version(spec: &str) -> (&str, Option<&str>) {
+    let (name, ver) = if let Some((n, v)) = spec.split_once("==") {
+        (n, v)
+    } else if let Some(idx) = spec.rfind('@').filter(|i| *i > 0) {
+        (&spec[..idx], &spec[idx + 1..])
+    } else {
+        return (spec, None);
+    };
+    let ver = ver.trim_start_matches('v');
+    let concrete = ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && ver
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-+_".contains(c));
+    (name, concrete.then_some(ver))
+}
+
 fn run_shield_check(
     package: &str,
     ecosystem: &str,
@@ -1672,35 +1771,62 @@ fn run_shield_check(
     let suggestion = verdict.suggested_action(ecosystem);
 
     // FR-PKG-005: Run OSV/EPSS vulnerability scan via vexa-sca native integration.
-    // Only public package coordinates (name + version=unknown) are queried; no
+    // Only public package coordinates (name + exact version) are queried; no
     // source code leaves the host (100% payload locality).
+    // No fake sentinel version: without an exact version the scan is reported as
+    // NoVersion, and scan errors / unreachable advisory data fail closed.
     let osv_scanner = OsvPackageScanner::default();
     let osv_eco = ecosystem_to_osv_str(eco);
-    // Use "0.0.0" as a sentinel version when no version is known; OSV will return
-    // no findings for an unknown version, preserving fail-open for availability.
-    let osv_result = osv_scanner.scan_package(package, "0.0.0", osv_eco).ok();
+    let (osv_name, osv_version) = split_package_version(package);
+    let osv_outcome = match osv_version {
+        None => OsvOutcome::NoVersion,
+        Some(v) => match osv_scanner.scan_package(osv_name, v, osv_eco) {
+            Ok(r) if r.advisory_available => OsvOutcome::Scanned(r),
+            Ok(_) => OsvOutcome::Incomplete(
+                "advisory database unavailable and no cached result".to_string(),
+            ),
+            Err(e) => OsvOutcome::Incomplete(e),
+        },
+    };
+    let osv_result = match &osv_outcome {
+        OsvOutcome::Scanned(r) => Some(r),
+        _ => None,
+    };
 
     if json {
-        let osv_json = osv_result.as_ref().map(|r| {
-            serde_json::json!({
-                "advisory_available": r.advisory_available,
-                "finding_count": r.findings.len(),
-                "has_critical_or_high": r.has_critical_or_high,
-                "has_high_epss": r.has_high_epss,
-                "has_reachable": r.has_reachable,
-                // FR-PKG-006: inline JSON-RPC remediation for the top finding
-                "remediation": r.aggregate_jsonrpc_error(),
-                "findings": r.findings.iter().map(|f| serde_json::json!({
-                    "advisory_id": f.advisory_id,
-                    "severity": f.severity,
-                    "cvss_score": f.cvss_score,
-                    "epss_score": f.epss_score,
-                    "is_reachable": f.is_reachable,
-                    "fixed_in": f.fixed_in,
-                    "remediation_message": f.remediation_message,
-                })).collect::<Vec<_>>(),
-            })
-        });
+        let osv_status = match &osv_outcome {
+            OsvOutcome::Scanned(_) => "scanned",
+            OsvOutcome::Incomplete(_) => "incomplete",
+            OsvOutcome::NoVersion => "not_scanned_no_version",
+        };
+        let osv_error = match &osv_outcome {
+            OsvOutcome::Incomplete(e) => Some(e.clone()),
+            _ => None,
+        };
+        let osv_json = Some(osv_result.map_or_else(
+            || serde_json::json!({ "status": osv_status, "error": osv_error }),
+            |r| {
+                serde_json::json!({
+                    "status": osv_status,
+                    "advisory_available": r.advisory_available,
+                    "finding_count": r.findings.len(),
+                    "has_critical_or_high": r.has_critical_or_high,
+                    "has_high_epss": r.has_high_epss,
+                    "has_reachable": r.has_reachable,
+                    // FR-PKG-006: inline JSON-RPC remediation for the top finding
+                    "remediation": r.aggregate_jsonrpc_error(),
+                    "findings": r.findings.iter().map(|f| serde_json::json!({
+                        "advisory_id": f.advisory_id,
+                        "severity": f.severity,
+                        "cvss_score": f.cvss_score,
+                        "epss_score": f.epss_score,
+                        "is_reachable": f.is_reachable,
+                        "fixed_in": f.fixed_in,
+                        "remediation_message": f.remediation_message,
+                    })).collect::<Vec<_>>(),
+                })
+            },
+        ));
 
         let json_output = match &verdict {
             arc_firewall::slopsquat::SlopsquatVerdict::Permitted { reason } => {
@@ -1760,11 +1886,7 @@ fn run_shield_check(
             "{}",
             serde_json::to_string_pretty(&json_output).unwrap_or_default()
         );
-        let osv_blocked = osv_result
-            .as_ref()
-            .map(|r| r.should_block())
-            .unwrap_or(false);
-        return !verdict.is_blocked() && !osv_blocked;
+        return !verdict.is_blocked() && !osv_outcome.blocks();
     }
 
     println!("\n┌────────────────────────────────────────────────────────┐");
@@ -1823,7 +1945,21 @@ fn run_shield_check(
     }
 
     // FR-PKG-005 / FR-PKG-006: Print OSV/EPSS vulnerability findings.
-    if let Some(ref osv) = osv_result {
+    match &osv_outcome {
+        OsvOutcome::Incomplete(e) => {
+            println!("----------------------------------------------------------");
+            println!("OSV VULNERABILITY SCAN  [ARC-SCA-001]  \u{1F6D1} INCOMPLETE (FAIL CLOSED)");
+            println!("  Reason: {e}");
+        }
+        OsvOutcome::NoVersion => {
+            println!("----------------------------------------------------------");
+            println!(
+                "OSV VULNERABILITY SCAN  [ARC-SCA-001]  \u{26a0}\u{FE0F}  NOT SCANNED (no exact version; use name@1.2.3)"
+            );
+        }
+        OsvOutcome::Scanned(_) => {}
+    }
+    if let Some(osv) = osv_result {
         if !osv.findings.is_empty() {
             println!("----------------------------------------------------------");
             println!("OSV VULNERABILITY SCAN  [ARC-SCA-001]");
@@ -1855,11 +1991,82 @@ fn run_shield_check(
     }
     println!("----------------------------------------------------------\n");
 
-    let osv_blocked = osv_result
-        .as_ref()
-        .map(|r| r.should_block())
-        .unwrap_or(false);
-    !verdict.is_blocked() && !osv_blocked
+    !verdict.is_blocked() && !osv_outcome.blocks()
+}
+
+/// Native host hook runner. Returns the process exit code. Any failure (bad payload, unreadable or
+/// corrupt session state, persistence failure) is reported on stderr and returns 2, which both
+/// Claude Code and Cursor treat as a block (fail closed).
+fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: bool) -> i32 {
+    let adapter: Box<dyn HostAdapter> = match host.to_lowercase().as_str() {
+        "claude-code" | "claude" => Box::new(ClaudeCodeAdapter),
+        "cursor" => Box::new(CursorAdapter),
+        other => {
+            eprintln!("[Arc Hook] Unknown host '{other}'. Supported: claude-code, cursor");
+            return 2;
+        }
+    };
+
+    const MAX_HOOK_PAYLOAD: u64 = 16 * 1024 * 1024;
+    let mut raw = Vec::new();
+    if let Err(e) = io::stdin().take(MAX_HOOK_PAYLOAD).read_to_end(&mut raw) {
+        eprintln!("[Arc Hook] Failed to read hook payload from stdin: {e} (failing closed)");
+        return 2;
+    }
+
+    let events = match adapter.decode(&raw, OsPrincipal::Uid(1000)) {
+        Ok(ev) => ev,
+        Err(e) => {
+            eprintln!("[Arc Hook] Malformed {host} hook payload: {e} (failing closed)");
+            return 2;
+        }
+    };
+
+    let emit = |resp: arc_hooks::HostResponse| -> i32 {
+        use std::io::Write;
+        let _ = io::stdout().write_all(&resp.stdout);
+        let _ = io::stdout().flush();
+        let _ = io::stderr().write_all(&resp.stderr);
+        resp.exit_code
+    };
+    let allow = arc_core::verdict::Verdict::Allow {
+        obligations: Vec::new(),
+    };
+
+    let Some(first) = events.first() else {
+        return emit(adapter.encode(&allow));
+    };
+    let session = first.host_session_id.clone();
+
+    let storage_dir = match resolve_session_storage_dir(session_dir, project_local) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[Arc Hook] Session storage failure: {e} (failing closed)");
+            return 2;
+        }
+    };
+
+    let evaluator = PolicyEvaluator::new(PolicyConfig::load_with_precedence(Some(Path::new("."))));
+    if let Err(e) = evaluator.load_session_state(&storage_dir, &session) {
+        eprintln!("[Arc Hook] Session state for '{session}' is corrupt or unreadable: {e} (failing closed)");
+        return 2;
+    }
+
+    let mut response = adapter.encode(&allow);
+    for event in &events {
+        let verdict = evaluator.evaluate(event);
+        // Post-phase hooks only report results for taint tracking; they never block.
+        if event.phase == Phase::Pre && !verdict.is_allowed() {
+            response = adapter.encode(&verdict);
+            break;
+        }
+    }
+
+    if let Err(e) = evaluator.save_session_state(&storage_dir, &session) {
+        eprintln!("[Arc Hook] Failed to persist session state: {e} (failing closed)");
+        return 2;
+    }
+    emit(response)
 }
 
 #[derive(Default, Debug)]
@@ -2925,5 +3132,34 @@ mod tests {
 
         // Cleanup: Reset session
         run_intercept_session(session, true, true);
+    }
+}
+
+#[cfg(test)]
+mod shield_version_tests {
+    use super::split_package_version;
+
+    #[test]
+    fn exact_versions_are_extracted() {
+        assert_eq!(
+            split_package_version("lodash@4.17.21"),
+            ("lodash", Some("4.17.21"))
+        );
+        assert_eq!(
+            split_package_version("@scope/pkg@1.2.3"),
+            ("@scope/pkg", Some("1.2.3"))
+        );
+        assert_eq!(
+            split_package_version("requests==2.31.0"),
+            ("requests", Some("2.31.0"))
+        );
+    }
+
+    #[test]
+    fn ranges_and_missing_versions_are_not_concrete() {
+        assert_eq!(split_package_version("lodash"), ("lodash", None));
+        assert_eq!(split_package_version("lodash@^4.17.21"), ("lodash", None));
+        assert_eq!(split_package_version("lodash@latest"), ("lodash", None));
+        assert_eq!(split_package_version("@scope/pkg"), ("@scope/pkg", None));
     }
 }

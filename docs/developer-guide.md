@@ -318,7 +318,7 @@ if result.should_block() {
 
 Key design decisions:
 - **100% payload locality:** Only `(name, version, ecosystem)` tuples are sent to `api.osv.dev`. No source code, prompts, or credentials leave the host.
-- **Air-gapped cache:** `VulnCache` stores advisories as JSON in `.sca-cache/` with 24-hour TTL. When `advisory_status.is_service_unavailable()`, the scanner returns `advisory_available: false` and does not block (fail-open for availability; slopsquat gate still runs fail-closed).
+- **Fail-Closed Advisory Policy:** `VulnCache` caches advisories as JSON in `.sca-cache/` with 24-hour TTL. When the network or advisory database is unavailable on a cache miss, or when an unpinned version cannot be resolved, the check fails closed (`OsvOutcome::Incomplete`) to prevent unverified dependencies from bypassing enterprise gates.
 - **Sync wrapper:** `scan_package()` spawns a `tokio::runtime::Builder::new_current_thread()` runtime internally, keeping `PackageFirewall`'s public API synchronous.
 - **Ecosystem bridge:** `ecosystem_to_osv_str(arc_core::event::Ecosystem)` converts between the arc-core `Ecosystem` enum and OSV string identifiers (`npm`, `PyPI`, `crates.io`, `Go`).
 
@@ -329,37 +329,39 @@ Key design decisions:
 Vexa Arc defines a standard, extensible `HostAdapter` trait in [`crates/arc-hooks/src/adapter.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/adapter.rs) for IDE and agent lifecycle management:
 
 ```rust
-pub trait HostAdapter {
+pub trait HostAdapter: Send + Sync {
     fn host(&self) -> AgentHost;
-    fn install(&self, target_dir: &Path) -> Result<PathBuf, ArcError>;
-    fn uninstall(&self, target_dir: &Path) -> Result<(), ArcError>;
-    fn status(&self, target_dir: &Path) -> HostIntegrationStatus;
-    fn detect_bypass(&self, target_dir: &Path) -> Result<bool, ArcError>;
+
+    /// Decodes raw host hook input into ActionEvents. Must not panic.
+    fn decode(&self, raw: &[u8], principal: OsPrincipal) -> Result<Vec<ActionEvent>, AdapterError>;
+
+    /// Encodes the decision verdict into the host's expected response format and exit code.
+    fn encode(&self, verdict: &Verdict) -> HostResponse;
 }
 ```
 
-- **`ClaudeCodeAdapter`**: Manages `.claude.json` / `~/.claude.json` `preToolUse` hook integrations. Automatically injects `arc intercept eval` hooks, detects hook tampering/bypasses, and safely restores configurations upon uninstall.
-- **`CursorAdapter`**: Manages `.cursor/settings.json` `cursor.agent.preHookCommand` integrations for shell and MCP action supervision.
+- **`ClaudeCodeAdapter`**: Manages `.claude/settings.json` hook configurations (`PreToolUse` for pre-execution enforcement and `PostToolUse` for untrusted tool result taint tracking). Decodes structured `tool_input` (`Bash`, `Read`, `Write`, `Edit`, `WebFetch`, `mcp__*`) and translates denial verdicts into exit code `2` with explanatory remediation text passed to stderr for model context feedback.
+- **`CursorAdapter`**: Manages `.cursor/hooks.json` hook configurations with explicit `failClosed: true` enforcement (`beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`, and `afterMCPExecution`). Decodes payload arguments, commands, paths, and tool outputs, mapping verdicts to Cursor-native permissions (`allow`, `deny`, `ask`).
+- **`host_config` helpers**: Provides atomic, non-destructive JSON upsert and deletion routines (`read_json_object`, `write_json_atomic`, `upsert_event_entry`) guaranteeing user-configured third-party hooks are preserved.
 - **`McpJsonRpcInterceptor`**: Decodes standard MCP JSON-RPC requests, extracts RFC 8785 canonical schema fingerprints, and produces compliant `isError: true` JSON-RPC error responses with remediation options.
-- **`McpStdioBroker`**: A managed stdio supervisor proxying child process stdin/stdout, enforcing pre-execution allow-list rules, outbound DLP secret redaction, and runtime schema drift quarantine.
+- **`McpStdioBroker`**: A managed stdio supervisor proxying child process stdin/stdout, enforcing pre-execution allow-list rules, outbound DLP secret redaction, initial and runtime schema pin verification (`--pin-schema`), and bidirectional taint tracking.
 
 ### OS-Level Process Containment (`OsProcessSupervisor`) — FR-HOOKS-003
 
-[`crates/arc-hooks/src/process_containment.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/process_containment.rs) provides `OsProcessSupervisor` which is called from `McpStdioBroker::run_stdio` before spawning MCP child processes:
+[`crates/arc-hooks/src/process_containment.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/process_containment.rs) provides `OsProcessSupervisor` which is used by `McpStdioBroker::run_stdio` and `arc protect stdio` before child processes execute any user code:
 
 ```rust
-// Wrap child command with OS containment before spawning
-OsProcessSupervisor::apply_containment(&mut cmd);
-let child = cmd.spawn()?;
+let supervisor = OsProcessSupervisor::with_limits(limits)?;
+let mut child = supervisor.spawn(&mut cmd)?;
 ```
 
 **Platform implementations (conditional compilation):**
 
 | Target | Implementation | Guarantee |
 | :--- | :--- | :--- |
-| `cfg(windows)` | `CreateJobObject` + `AssignProcessToJobObject` + `JOBOBJECT_BASIC_LIMIT_INFORMATION` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` | Child killed when Job handle drops |
-| `cfg(target_os = "linux")` | `cmd.process_group(0)` + `pre_exec(prctl(PR_SET_PDEATHSIG, SIGKILL))` | SIGKILL sent on broker parent death |
-| `cfg(unix)` (macOS, BSD) | `cmd.process_group(0)` — `killpg(pgid, SIGKILL)` on Drop | Entire process group reaped |
+| `cfg(windows)` | `CreateProcess(CREATE_SUSPENDED)` + `AssignProcessToJobObject` + `NtResumeProcess` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` & optional job memory limits | Eliminates post-launch race windows; child and descendants terminate immediately when Job handle closes |
+| `cfg(target_os = "linux")` | `cmd.process_group(0)` + `pre_exec(prctl(PR_SET_PDEATHSIG, SIGKILL))` with parent PID race verification + `setrlimit(RLIMIT_AS)` | Kernel terminates child if parent dies; memory address space is strictly bounded |
+| `cfg(unix)` (macOS, BSD) | `cmd.process_group(0)` — dedicated process group reaped via `kill(-pgid, SIGKILL)` on Drop | Entire process subtree is reaped on exit or supervisor drop |
 
 ---
 

@@ -456,27 +456,28 @@ A blocked write returns rule ID `ARC-AST-001` with a structured JSON-RPC error.
 
 ### OS-Level Process Containment (`FR-HOOKS-003`)
 
-When `arc protect stdio` launches an MCP server, the child process is wrapped in OS-level containment:
+When `arc protect stdio` launches an MCP server, the child process is wrapped in OS-level containment before executing user code:
 
-| Platform | Mechanism |
-| :--- | :--- |
-| **Windows** | `CreateJobObject` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — child terminates when Job handle closes |
-| **Linux** | `prctl(PR_SET_PDEATHSIG, SIGKILL)` in pre-exec — SIGKILL on broker parent death |
-| **macOS/Unix** | `setpgrp()` process group isolation — `killpg()` reaps entire subtree on shutdown |
+| Platform | Mechanism | Guarantee |
+| :--- | :--- | :--- |
+| **Windows** | `CreateProcess(CREATE_SUSPENDED)` + `AssignProcessToJobObject` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` | Eliminates launch race window; child and descendants terminate when Job handle closes. Supports `--max-memory-mb`. |
+| **Linux** | `prctl(PR_SET_PDEATHSIG, SIGKILL)` in pre-exec + parent PID race verification + `setrlimit(RLIMIT_AS)` | SIGKILL on broker parent death; enforces virtual address space bounds. |
+| **macOS/Unix** | `setpgrp()` process group isolation — `kill(-pgid, SIGKILL)` on Drop | Reaps entire process subtree on supervisor shutdown or crash. |
 
 ```bash
-# All platforms — containment is transparent to the user
-arc protect stdio --server github -- npx @modelcontextprotocol/server-github
+# Supervise an MCP server with schema pinning and 512 MB memory boundary:
+arc protect stdio --server github --pin-schema 6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b --max-memory-mb 512 -- npx @modelcontextprotocol/server-github
 ```
 
 ---
 
 ### Field-Level & Path-Level Taint Isolation (`FR-TAINT-005`)
 
-The Session Taint DAG now tracks taint at **field granularity** and **path granularity**:
+The Session Taint DAG tracks taint at **field granularity** and **path granularity**:
 
 - Reading `.env.SECRET` taints that specific field, not the entire session.
-- **Benign commands** (`git status`, `git diff`, `git log`, `cargo test`, `npm test`) are whitelisted from blanket session taint and always permitted even in tainted sessions.
+- **Benign local commands** (`git status`, `git diff`, `git log`, `cargo test`, `npm test`, `pytest`) are whitelisted from blanket session taint and permitted in tainted sessions.
+- **Compound command guard:** The benign exemption strictly requires atomic commands; command chaining, pipes, or shell redirection (`git status; curl ...`, `pytest | nc ...`) immediately void the exemption and are evaluated against full egress policy.
 - The Lethal Trifecta check can target specific field/path combinations for surgical blocking.
 
 ```bash
@@ -651,24 +652,75 @@ arc host uninstall --host cursor
 ```
 
 ### Manual Configuration Reference
-
-If manual configuration is preferred:
-
-**Claude Code (`.claude.json` / `~/.claude.json`):**
+ 
+ If manual configuration is preferred:
+ 
+- **Claude Code (`.claude/settings.json`):**
 ```json
 {
   "hooks": {
-    "preToolUse": "arc intercept eval --session %CLAUDE_SESSION_ID% --kind mcp_call --target %TOOL_NAME%"
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "arc intercept hook --host claude-code"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "WebFetch|WebSearch|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "arc intercept hook --host claude-code"
+          }
+        ]
+      }
+    ]
   }
 }
 ```
 
-**Cursor IDE (`.cursor/settings.json`):**
+- **Cursor IDE (`.cursor/hooks.json`):**
 ```json
 {
-  "cursor.agent.preHookCommand": "arc intercept eval --session %CURSOR_SESSION_ID% --kind shell --target \"%COMMAND%\""
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "arc intercept hook --host cursor",
+        "failClosed": true
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "arc intercept hook --host cursor",
+        "failClosed": true
+      }
+    ],
+    "beforeReadFile": [
+      {
+        "command": "arc intercept hook --host cursor",
+        "failClosed": true
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "arc intercept hook --host cursor"
+      }
+    ]
+  }
 }
 ```
+
+> [!TIP]
+> **Native Stdin Intercept Hook (`arc intercept hook`):**
+> Claude Code and Cursor communicate directly with `arc intercept hook --host <claude-code|cursor>` over standard I/O using their native hook schemas. Any execution error or malformed payload exits with code `2`, safely failing closed to prevent unauthorized actions.
+
 
 ### Generic Model Context Protocol (MCP) JSON-RPC
 

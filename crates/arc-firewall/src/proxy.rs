@@ -16,21 +16,29 @@ impl Default for AuthoritativeRegistryCache {
 impl AuthoritativeRegistryCache {
     pub fn new() -> Self {
         let mut verified = std::collections::HashMap::new();
-        // Seed authoritative entries for prominent verified packages
-        for pkg in &[
-            "react", "express", "lodash", "axios", "tokio", "requests", "numpy",
+        // HEURISTIC SEED, NOT LIVE REGISTRY DATA: age/downloads/stars are static
+        // placeholders for well-known packages. SLSA provenance is NOT claimed because
+        // it is not verified anywhere.
+        for (pkg, eco) in &[
+            ("react", "npm"),
+            ("express", "npm"),
+            ("lodash", "npm"),
+            ("axios", "npm"),
+            ("tokio", "crates.io"),
+            ("requests", "PyPI"),
+            ("numpy", "PyPI"),
         ] {
             verified.insert(
                 pkg.to_string(),
                 PackageRegistryMetadata {
                     name: pkg.to_string(),
-                    ecosystem: "npm".to_string(),
+                    ecosystem: eco.to_string(),
                     age_days: 1000,
                     monthly_downloads: 50_000_000,
                     has_verified_repository_link: true,
                     repository_stars: 5000,
                     repository_commits: 2000,
-                    has_slsa_provenance: true,
+                    has_slsa_provenance: false,
                     has_dangerous_lifecycle_scripts: false,
                     recent_registry_404: false,
                 },
