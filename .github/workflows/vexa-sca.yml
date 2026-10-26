@@ -29,13 +29,13 @@ jobs:
           sudo cp /tmp/vexa-sca/target/release/vexa-sca /usr/local/bin/vexa-sca
           rm -rf /tmp/vexa-sca
 
-      - name: Run Vexa SCA CI Scan
+      - name: Run Vexa SCA Scan
         run: |
-          vexa-sca ci . \
+          vexa-sca scan . \
             --fail-on high \
             --html-file vexa-report.html \
-            --sarif vexa-report.sarif \
-            --sbom-format cyclonedx \
+            --sarif-file vexa-report.sarif \
+            --sbom cyclonedx \
             --sbom-file vexa-sbom.cdx.json
 
       - name: Archive Scan Reports
@@ -44,6 +44,6 @@ jobs:
         with:
           name: vexa-sca-reports
           path: |
-            vexa-report.html
-            vexa-report.sarif
-            vexa-sbom.cdx.json
+            vexa-sca-report.html
+            vexa-sca-report.sarif
+            vexa-sca-sbom.cdx.json
