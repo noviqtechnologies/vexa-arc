@@ -1,73 +1,73 @@
-name: Vexa SCA Security Gate
+name: Vexa SCA Security Scan
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      create_fix_pr:
-        description: "Generate and open automated Security Fix PR"
-        type: boolean
-        default: false
-        required: false
 
 permissions:
-  contents: write         # Needed to push fix branch
-  pull-requests: write    # Needed to open GitHub PR
-  security-events: write
+  contents: read
+  security-events: write # Required if uploading SARIF to GitHub Code Scanning
 
 jobs:
-  security-scan:
-    name: Vexa SCA Quality Gate
+  vexa-sca-scan:
+    name: Vexa SCA Dependency & Vulnerability Audit
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Checkout target repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          fetch-depth: 0
+          workspaces: |
+            vexa-sca-engine -> target
 
-      - name: Install Vexa SCA CLI
-        run: |
-          curl -sSL "https://github.com/noviqtechnologies/vexa-sca/releases/latest/download/vexa-sca-linux-x86_64.tar.gz" | tar -xz
-          sudo mv vexa-sca /usr/local/bin/
-          vexa-sca --version
-
-      # Standard Quality Gate Scan on Push / Pull Request
-      - name: Execute Vexa SCA Quality Gate
-        run: |
-          vexa-sca scan . \
-            --fail-on critical \
-            --sarif-file results.sarif \
-            --html-file scan-dashboard.html \
-            --sbom cyclonedx \
-            --sbom-file sbom.json
-
-      # Automated Remediation PR Step (Executes when toggled on)
-      - name: Create Automated Fix PR
-        if: ${{ github.event.inputs.create_fix_pr == 'true' }}
-        run: |
-          git config --global user.name "vexa-sca-bot[bot]"
-          git config --global user.email "vexa-sca-bot@users.noreply.github.com"
-          vexa-sca fix . \
-            --create-pr \
-            --repo "${{ github.repository }}" \
-            --token "${{ secrets.GITHUB_TOKEN }}" \
-            --base "main"
-
-      - name: Upload SARIF to GitHub Security Alerts
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      - name: Checkout latest Vexa SCA engine
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          sarif_file: results.sarif
+          repository: noviqtechnologies/vexa-sca
+          ref: main
+          path: vexa-sca-engine
 
-      - name: Archive HTML Dashboard & SBOM
-        uses: actions/upload-artifact@v4
+      - name: Build Vexa SCA CLI binary
+        run: |
+          cargo build --locked --release --manifest-path vexa-sca-engine/Cargo.toml
+          sudo cp vexa-sca-engine/target/release/vexa-sca /usr/local/bin/vexa-sca
+
+      - name: Run Vexa SCA CI Scan
+        # Use 'ci' profile for pipeline execution
+        # Add --no-fail for non-blocking report-only evaluation, OR --fail-on high to enforce quality gates
+        run: |
+          vexa-sca ci . \
+            --fail-on high \
+            --html-file vexa-report.html \
+            --sarif vexa-report.sarif \
+            --sbom-format cyclonedx \
+            --sbom-file vexa-sbom.cdx.json
+
+      - name: Archive Scan Reports & Artifacts
+        # Runs even if the scan step exits non-zero (Quality Gate or Incomplete data)
         if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2b6cb773ac77 # v4.4.3
         with:
           name: vexa-sca-reports
           path: |
-            scan-dashboard.html
-            sbom.json
+            vexa-report.html
+            vexa-report.sarif
+            vexa-sbom.cdx.json
+            .sca-cache/
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: vexa-report.sarif
+          category: vexa-sca
+        continue-on-error: true
