@@ -55,7 +55,7 @@ jobs:
       - name: Archive Scan Reports & Artifacts
         # Runs even if the scan step exits non-zero (Quality Gate or Incomplete data)
         if: always()
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2b6cb773ac77 # v4.4.3
+        uses: actions/upload-artifact@v4
         with:
           name: vexa-sca-reports
           path: |
