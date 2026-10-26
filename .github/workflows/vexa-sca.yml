@@ -9,41 +9,27 @@ on:
 
 permissions:
   contents: read
-  security-events: write # Required if uploading SARIF to GitHub Code Scanning
 
 jobs:
   vexa-sca-scan:
-    name: Vexa SCA Dependency & Vulnerability Audit
+    name: Vexa SCA Scan
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout target repository
+      - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            vexa-sca-engine -> target
-
-      - name: Checkout latest Vexa SCA engine
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: noviqtechnologies/vexa-sca
-          ref: main
-          path: vexa-sca-engine
-
-      - name: Build Vexa SCA CLI binary
+      - name: Build and install Vexa SCA CLI
         run: |
-          cargo build --locked --release --manifest-path vexa-sca-engine/Cargo.toml
-          sudo cp vexa-sca-engine/target/release/vexa-sca /usr/local/bin/vexa-sca
+          git clone --depth 1 https://github.com/noviqtechnologies/vexa-sca.git /tmp/vexa-sca
+          cargo build --locked --release --manifest-path /tmp/vexa-sca/Cargo.toml
+          sudo cp /tmp/vexa-sca/target/release/vexa-sca /usr/local/bin/vexa-sca
+          rm -rf /tmp/vexa-sca
 
       - name: Run Vexa SCA CI Scan
-        # Use 'ci' profile for pipeline execution
-        # Add --no-fail for non-blocking report-only evaluation, OR --fail-on high to enforce quality gates
         run: |
           vexa-sca ci . \
             --fail-on high \
@@ -52,8 +38,7 @@ jobs:
             --sbom-format cyclonedx \
             --sbom-file vexa-sbom.cdx.json
 
-      - name: Archive Scan Reports & Artifacts
-        # Runs even if the scan step exits non-zero (Quality Gate or Incomplete data)
+      - name: Archive Scan Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -62,12 +47,3 @@ jobs:
             vexa-report.html
             vexa-report.sarif
             vexa-sbom.cdx.json
-            .sca-cache/
-
-      - name: Upload SARIF to GitHub Code Scanning
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: vexa-report.sarif
-          category: vexa-sca
-        continue-on-error: true
