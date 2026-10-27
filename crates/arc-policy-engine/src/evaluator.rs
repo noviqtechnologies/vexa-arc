@@ -146,7 +146,11 @@ struct SignedPolicyEnvelope {
 
 fn parse_trusted_policy_keys(raw: &str) -> Result<HashMap<String, Vec<u8>>, String> {
     let mut keys = HashMap::new();
-    for entry in raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
         let (key_id, encoded_key) = entry
             .split_once(':')
             .ok_or_else(|| "trusted-key entries must use key-id:hex-public-key".to_string())?;
@@ -229,7 +233,9 @@ fn parse_signed_policy(
         .map_err(|e| format!("signed policy payload has an invalid policy schema: {e}"))?;
     for (server, fingerprint) in &policy.mcp_schema_pins {
         if server.trim().is_empty() || server.trim() != server.as_str() {
-            return Err("signed MCP schema pin server names must be non-empty and trimmed".to_string());
+            return Err(
+                "signed MCP schema pin server names must be non-empty and trimmed".to_string(),
+            );
         }
         let bytes = hex::decode(fingerprint).map_err(|e| {
             format!("signed MCP schema pin for '{server}' is not valid hexadecimal: {e}")
@@ -267,8 +273,7 @@ impl PolicyConfig {
             return Ok(None);
         }
         let trusted_keys = std::env::var("ARC_POLICY_TRUSTED_PUBLIC_KEYS").map_err(|_| {
-            "ARC_POLICY_TRUSTED_PUBLIC_KEYS is required to load .arc/signed_policy.json"
-                .to_string()
+            "ARC_POLICY_TRUSTED_PUBLIC_KEYS is required to load .arc/signed_policy.json".to_string()
         })?;
         let trusted_keys = parse_trusted_policy_keys(&trusted_keys)?;
         let minimum_sequence = std::env::var("ARC_POLICY_MIN_SEQUENCE")
@@ -286,9 +291,7 @@ impl PolicyConfig {
     /// Loads policy with documented precedence. Errors are returned rather than silently ignored.
     /// A signed organization policy requires an Ed25519 trust store in
     /// `ARC_POLICY_TRUSTED_PUBLIC_KEYS` (`key-id:hex-public-key` entries, comma separated).
-    pub fn try_load_with_precedence(
-        project_dir: Option<&std::path::Path>,
-    ) -> Result<Self, String> {
+    pub fn try_load_with_precedence(project_dir: Option<&std::path::Path>) -> Result<Self, String> {
         let mut effective = Self::default();
 
         if let Some(user_home) = std::env::var_os("USERPROFILE")
@@ -712,7 +715,8 @@ mod tests {
 
     #[test]
     fn unsigned_policy_file_cannot_supply_schema_pins() {
-        let dir = std::env::temp_dir().join(format!("arc_policy_pin_test_{}", uuid::Uuid::now_v7()));
+        let dir =
+            std::env::temp_dir().join(format!("arc_policy_pin_test_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("policy.json");
         let mut policy = PolicyConfig::default();
@@ -732,28 +736,32 @@ mod tests {
     #[test]
     fn only_signed_organization_policy_pins_survive_precedence_merge() {
         let mut effective = PolicyConfig::default();
-        let mut local = PolicyConfig::default();
-        local.source = Some(PolicySource::ProjectLocal);
+        let mut local = PolicyConfig {
+            source: Some(PolicySource::ProjectLocal),
+            ..Default::default()
+        };
         local
             .mcp_schema_pins
             .insert("github".to_string(), hex::encode([1u8; 32]));
         effective.merge_lower_precedence(local);
         assert!(effective.mcp_schema_pins.is_empty());
 
-        let mut signed = PolicyConfig::default();
-        signed.source = Some(PolicySource::SignedOrganization);
         let expected_pin = hex::encode([2u8; 32]);
+        let mut signed = PolicyConfig {
+            source: Some(PolicySource::SignedOrganization),
+            ..Default::default()
+        };
         signed
             .mcp_schema_pins
             .insert("github".to_string(), expected_pin.clone());
         effective.merge_lower_precedence(signed);
         assert_eq!(effective.mcp_schema_pins.get("github"), Some(&expected_pin));
 
-        let mut emergency = PolicyConfig::default();
-        emergency.source = Some(PolicySource::EmergencyDeny);
-        emergency
-            .emergency_deny_servers
-            .insert("rogue".to_string());
+        let mut emergency = PolicyConfig {
+            source: Some(PolicySource::EmergencyDeny),
+            ..Default::default()
+        };
+        emergency.emergency_deny_servers.insert("rogue".to_string());
         effective.merge_lower_precedence(emergency);
         assert_eq!(effective.mcp_schema_pins.get("github"), Some(&expected_pin));
     }
@@ -1314,16 +1322,20 @@ mod tests {
         let signature = hex::encode(key_pair.sign(&signed_bytes).as_ref());
         envelope["signature"] = serde_json::json!(signature);
         let mut trusted_keys = HashMap::new();
-        trusted_keys.insert("test-key".to_string(), key_pair.public_key().as_ref().to_vec());
+        trusted_keys.insert(
+            "test-key".to_string(),
+            key_pair.public_key().as_ref().to_vec(),
+        );
 
         let policy =
             parse_signed_policy(&envelope.to_string(), &trusted_keys, 7, now_unix_ms).unwrap();
         assert_eq!(policy.source, Some(PolicySource::SignedOrganization));
         assert!(policy.block_unapproved_mcp);
-        assert_eq!(policy.mcp_schema_pins.get("github"), Some(&hex::encode([9u8; 32])));
-        assert!(
-            parse_signed_policy(&envelope.to_string(), &trusted_keys, 8, now_unix_ms).is_err()
+        assert_eq!(
+            policy.mcp_schema_pins.get("github"),
+            Some(&hex::encode([9u8; 32]))
         );
+        assert!(parse_signed_policy(&envelope.to_string(), &trusted_keys, 8, now_unix_ms).is_err());
         assert!(parse_signed_policy(
             &envelope.to_string(),
             &trusted_keys,
@@ -1344,8 +1356,6 @@ mod tests {
 
         let mut tampered = envelope;
         tampered["payload"]["allowed_mcp_servers"] = serde_json::json!(["attacker-mcp"]);
-        assert!(
-            parse_signed_policy(&tampered.to_string(), &trusted_keys, 7, now_unix_ms).is_err()
-        );
+        assert!(parse_signed_policy(&tampered.to_string(), &trusted_keys, 7, now_unix_ms).is_err());
     }
 }

@@ -22,7 +22,11 @@ fn ecosystem_label(ecosystem: Ecosystem) -> &'static str {
 }
 
 fn package_cache_key(ecosystem: &str, name: &str) -> String {
-    format!("{}:{}", normalize_ecosystem(ecosystem), name.to_ascii_lowercase())
+    format!(
+        "{}:{}",
+        normalize_ecosystem(ecosystem),
+        name.to_ascii_lowercase()
+    )
 }
 
 /// Legacy name: this contains seeded heuristic placeholders, not authoritative registry records.
@@ -487,11 +491,9 @@ mod tests {
             reason: "Missing provenance".to_string(),
             containment_recommendation: "Require a signed provenance attestation or explicit security review before installation.".to_string(),
         };
-        let no_false_rewrite = PackageFirewall::suggest_safer_command(
-            "npm install new-lib",
-            &provenance_review,
-        )
-        .unwrap_err();
+        let no_false_rewrite =
+            PackageFirewall::suggest_safer_command("npm install new-lib", &provenance_review)
+                .unwrap_err();
         assert!(no_false_rewrite.contains("review manually"));
 
         let permitted = SlopsquatVerdict::Permitted {

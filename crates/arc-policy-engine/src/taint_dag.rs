@@ -462,10 +462,9 @@ impl SessionTaintDag {
 
         let has_untrusted = self.current_taints.contains(Taint::UNTRUSTED_CONTENT);
 
-        let is_sensitive_sink =
-            sink.contains(SinkClass::EXTERNAL_EGRESS)
-                || sink.contains(SinkClass::DESTRUCTIVE)
-                || sink.contains(SinkClass::PUBLISH);
+        let is_sensitive_sink = sink.contains(SinkClass::EXTERNAL_EGRESS)
+            || sink.contains(SinkClass::DESTRUCTIVE)
+            || sink.contains(SinkClass::PUBLISH);
 
         if has_private && has_untrusted && is_sensitive_sink {
             let private_origins: Vec<_> = self
@@ -546,10 +545,9 @@ impl SessionTaintDag {
             || self.current_taints.contains(Taint::PRIVILEGED_DATA);
 
         let has_untrusted = self.current_taints.contains(Taint::UNTRUSTED_CONTENT);
-        let is_sensitive_sink =
-            sink.contains(SinkClass::EXTERNAL_EGRESS)
-                || sink.contains(SinkClass::DESTRUCTIVE)
-                || sink.contains(SinkClass::PUBLISH);
+        let is_sensitive_sink = sink.contains(SinkClass::EXTERNAL_EGRESS)
+            || sink.contains(SinkClass::DESTRUCTIVE)
+            || sink.contains(SinkClass::PUBLISH);
 
         if !has_private || !has_untrusted || !is_sensitive_sink {
             return None;
@@ -1557,6 +1555,8 @@ mod tests {
         let mcp_push = mcp("git_push", serde_json::json!({"remote": "origin"}));
         let mcp_sink = TaintTracker::classify_sink(&mcp_push);
         assert!(mcp_sink.contains(SinkClass::PUBLISH));
-        assert!(dag.check_field_level_lethal_trifecta(Some("git_push"), mcp_sink).is_some());
+        assert!(dag
+            .check_field_level_lethal_trifecta(Some("git_push"), mcp_sink)
+            .is_some());
     }
 }

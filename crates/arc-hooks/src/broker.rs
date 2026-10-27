@@ -576,6 +576,9 @@ mod fingerprint_tests {
         let joined = vec!["a".to_string(), "bc".to_string()];
         assert_ne!(command_fingerprint(&split), command_fingerprint(&joined));
         assert_eq!(command_fingerprint(&split), command_fingerprint(&split));
-        assert_ne!(command_fingerprint(&[]), command_fingerprint(&[String::new()]));
+        assert_ne!(
+            command_fingerprint(&[]),
+            command_fingerprint(&[String::new()])
+        );
     }
 }

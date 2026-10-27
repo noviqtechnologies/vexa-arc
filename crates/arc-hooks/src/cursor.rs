@@ -346,9 +346,7 @@ impl CursorAdapter {
             let post_mcp = hooks
                 .and_then(|h| h.get("afterMCPExecution"))
                 .and_then(find_arc_command);
-            if let (Some(cmd), Some(_), Some(_), Some(_)) =
-                (shell.clone(), mcp, read, post_mcp)
-            {
+            if let (Some(cmd), Some(_), Some(_), Some(_)) = (shell.clone(), mcp, read, post_mcp) {
                 return crate::adapter::HostIntegrationStatus {
                     host: AgentHost::Cursor,
                     is_configured: true,

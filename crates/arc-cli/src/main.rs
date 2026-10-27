@@ -1939,9 +1939,7 @@ fn run_shield_check(
     } else if let Some(dl) = downloads {
         println!("Simulation Input:   Monthly Downloads: {dl}");
     } else {
-        println!(
-            "Package Baseline:   Seeded heuristic; live registry metadata not fetched"
-        );
+        println!("Package Baseline:   Seeded heuristic; live registry metadata not fetched");
     }
     println!("Dangerous Scripts:  {dangerous_scripts}");
     println!("----------------------------------------------------------");
@@ -2302,7 +2300,8 @@ fn resolve_schema_pin(
     if policy.source == Some(arc_policy_engine::evaluator::PolicySource::SignedOrganization) {
         if allow_tofu {
             return Err(
-                "--allow-tofu is prohibited when a signed organization policy is active".to_string(),
+                "--allow-tofu is prohibited when a signed organization policy is active"
+                    .to_string(),
             );
         }
         let fingerprint = policy.mcp_schema_pins.get(server).ok_or_else(|| {
@@ -3068,8 +3067,10 @@ mod tests {
         let expected = [0x5au8; 32];
         let encoded = hex::encode(expected);
         let mismatched = hex::encode([0x11u8; 32]);
-        let mut policy = PolicyConfig::default();
-        policy.source = Some(arc_policy_engine::evaluator::PolicySource::SignedOrganization);
+        let mut policy = PolicyConfig {
+            source: Some(arc_policy_engine::evaluator::PolicySource::SignedOrganization),
+            ..Default::default()
+        };
         policy
             .mcp_schema_pins
             .insert("github".to_string(), encoded.clone());
@@ -3090,8 +3091,10 @@ mod tests {
     #[test]
     fn unsigned_policy_schema_pin_is_not_a_trust_anchor() {
         let explicit_pin = hex::encode([0x5au8; 32]);
-        let mut policy = PolicyConfig::default();
-        policy.source = Some(arc_policy_engine::evaluator::PolicySource::ProjectLocal);
+        let mut policy = PolicyConfig {
+            source: Some(arc_policy_engine::evaluator::PolicySource::ProjectLocal),
+            ..Default::default()
+        };
         policy
             .mcp_schema_pins
             .insert("github".to_string(), explicit_pin.clone());
