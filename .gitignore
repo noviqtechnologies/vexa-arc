@@ -10,6 +10,9 @@ target/
 **/.arc/
 .sca-cache/
 **/.sca-cache/
+vexa-*.html
+vexa-*.sarif
+vexa-*.cdx.json
 
 # Local Workspace, Design & Documentation Staging
 prd/

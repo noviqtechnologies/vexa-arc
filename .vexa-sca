@@ -1,0 +1,11 @@
+# Vexa SCA Policy Configuration (.vexa-sca)
+version: "v1.0.0"
+max_waiver_days: 90
+
+# Vulnerability ignore / suppression rules
+ignore:
+  GHSA-qwgh-2vcv-g2f7:
+    reason: "block-buffer panic corruption only manifests in caught panics; no catch_unwind paths exist in Vexa Arc, and transitive dependency will be eliminated upon upstream vexa-sca sha2 0.11 update"
+    expires: "2026-12-25"
+    owner: "contact@vexasec.io"
+    ticket: "ARC-SEC-001"
