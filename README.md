@@ -1,19 +1,16 @@
-# Vexa Arc: Agentic Runtime Firewall & Pre-Execution AI Security
+# Vexa Arc: Local Agent Security Engine & MCP Policy Broker
 
 [![Rust Edition](https://img.shields.io/badge/Rust-2021%20Edition-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-brightgreen.svg)](#cross-platform-installation--setup)
-[![Tests](https://img.shields.io/badge/Tests-118%2F118%20Passing-success.svg)](#automated-tests--verification)
-[![Latency](https://img.shields.io/badge/Engine%20Latency-p99%20%3C%203.5ms-informational)](#core-architectural-invariants)
-[![Zero C Dependencies](https://img.shields.io/badge/Dependencies-Pure%20Rust%20(Zero%20C)-orange)](#prerequisites-by-os)
 [![CycloneDX](https://img.shields.io/badge/CycloneDX-v1.6%20AI--BOM-blueviolet?logo=owasp&logoColor=white)](#6-standardized-cyclonedx-v16-ai-bom-export-arc-bom)
-[![OSV](https://img.shields.io/badge/OSV%2FEPSS-Integrated-orange?logo=opensourcesecurityfoundation&logoColor=white)](#4-anti-slopsquatting-dependency-firewall-arc-shield)
+[![OSV](https://img.shields.io/badge/OSV%2FEPSS-Integrated-orange?logo=opensourcesecurityfoundation&logoColor=white)](#4-advisory-package-risk-checks-arc-shield)
 [![Docs](https://img.shields.io/badge/Docs-Guides%20%26%20Reference-blueviolet?logo=read-the-docs&logoColor=white)](#-documentation--workflow-guides)
 
-**Vexa Agentic Runtime Firewall** (`arc`) is an open-source, ultra-low-latency native Rust pre-execution policy firewall for AI coding agents and Model Context Protocol (MCP) interactions. Built for developer workstations and CI runners, Vexa Arc inspects and governs what coding agents (Claude Code, Cursor) and MCP servers see, use, and execute before code, package installations, or shell commands touch disk.
+**Vexa Arc Community** (`arc`) is an open-source, local-first developer security utility: a Rust policy engine with selected Claude Code/Cursor hook events, an explicitly invoked MCP stdio broker, and advisory package checks. It is designed for individual developers, not as a universal endpoint firewall. Actions outside configured hooks and the broker are not mediated. `arc shield` does not intercept or execute package installs.
 
 > [!IMPORTANT]
-> **Scope & Architectural Reality:** Vexa Arc is a local, host-level pre-execution policy firewall and MCP stdio broker. It is **NOT** a kernel-level EDR (it does not hook OS system calls), **NOT** an enterprise fleet control plane (organizations manage policy files locally or via dotfile/git distribution), **NOT** a network-level egress firewall (it performs token and flag inspection on commands, not packet-level filtering), and **NOT** a replacement for commercial enterprise endpoint protection. It serves as a fast, deterministic defense-in-depth pre-execution control.
+> **Community scope:** The supported target is one developer on one workstation. Enterprise fleet enforcement is deferred. Arc is **NOT** a kernel-level EDR, **NOT** a network egress firewall, and **NOT** a replacement for commercial endpoint protection. It provides defense-in-depth only on explicitly mediated paths. Session/sink classification is heuristic, ordinary Cursor file writes bypass the scanner, and end-to-end latency has not been independently validated. See the [Community release scope and GO gates](docs/community-release-scope.md).
 
 <p align="center">
   <a href="#quick-start-30-seconds"><b>Quick Start</b></a> •
@@ -21,8 +18,10 @@
   <a href="#ide--agent-hook-integrations"><b>Agent Hooks</b></a> •
   <a href="docs/user-guide.md"><b>User Guide</b></a> •
   <a href="docs/developer-guide.md"><b>Developer Guide</b></a> •
+  <a href="docs/product-tiers.md"><b>Product Tiers</b></a> •
   <a href="#architecture--invariants"><b>Architecture</b></a> •
   <a href="#cli-command-reference"><b>CLI Reference</b></a>
+  • <a href="docs/community-release-scope.md"><b>Community Scope / GO Gates</b></a>
 </p>
 
 ---
@@ -31,7 +30,7 @@
 
 Autonomous coding agents possess shell execution permissions, file system read/write access, and external network or MCP connectivity. Traditional endpoint protection (EDR) operates *post-execution* after processes have spawned, missing agent-specific vectors (e.g. indirect prompt injection, Lethal Trifecta, package slopsquatting).
 
-Vexa Arc enforces **Pre-Execution Inversion**: in-daemon policy decisions are rendered in $< 3.5\text{ ms}$ *before* actions occur.
+Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; it does not intercept every process, editor write, or network request. End-to-end latency has not been validated.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -44,10 +43,10 @@ Vexa Arc enforces **Pre-Execution Inversion**: in-daemon policy decisions are re
 │   Evaluates:                                                                           │
 │   1. Lethal Trifecta DAG (Private Data + Untrusted Context + Egress)                   │
 │   2. Multi-Language Token Egress (curl, python urllib, node http, powershell)          │
-│   3. Slopsquatting & OSV Vulnerability Firewall (4-Gate Compound Defense)             │
+│   3. Advisory Package-Name Heuristics + Exact-Version OSV Check                        │
 │   4. Dynamic MCP Schema Rug-Pull Quarantine (RFC 8785 JCS Hash Pinning)                │
 │   5. Linear-Time Code Pattern Scanning (SQL string interpolation, eval/exec, innerHTML)│
-│   6. OS-Level Process Containment (Job Objects / PR_SET_PDEATHSIG / Memory Limits)    │
+│   6. Process Lifecycle Controls (Job Objects / PR_SET_PDEATHSIG / Memory Limits)      │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,14 +56,14 @@ Vexa Arc enforces **Pre-Execution Inversion**: in-daemon policy decisions are re
 
 | Security Dimension | Threat Vector Addressed | Vexa Arc Mechanism | CLI Command |
 | :--- | :--- | :--- | :--- |
-| **Lethal Trifecta Guard** | Indirect prompt injection triggering data exfiltration | Stateful session Taint DAG with field/path isolation and token-based multi-language egress classification | `arc intercept eval --session s1` |
-| **Agent Hook Defense** | Unmonitored agent shell commands and tool calls | Native hooks for Claude Code (`.claude/settings.json`) and Cursor (`.cursor/hooks.json`) with `failClosed: true` | `arc host install --host claude-code` |
-| **Package Firewall** | Slopsquatting (hallucinated packages) & supply chain malware | 4-gate compound defense + exact-version OSV/EPSS scan with fail-closed network handling and JSON-RPC remediation | `arc shield npm install lodash@4.17.21` |
-| **Schema Rug-Pulls** | Runtime MCP privilege escalation | RFC 8785 JCS SHA-256 schema hashing with `--pin-schema` enforcement | `arc protect stdio --pin-schema <hash>` |
-| **Orphan Processes** | MCP child processes outliving parent sessions | Windows Job Objects (`CREATE_SUSPENDED`), Linux `PR_SET_PDEATHSIG` + `RLIMIT_AS`, Unix process groups | `arc protect stdio --max-memory-mb 512` |
-| **Secret Redaction** | Credentials leaked into agent context windows | Linear-time Shannon entropy secret detector + synthetic tokenization vault (`<ARC_VAULT_SECRET_XX>`) | `arc scan-secrets --path . --redact` |
-| **Code Pattern Hook** | Injected backdoors in code generation | Linear-time Aho-Corasick + regex pre-write hook detecting raw SQL interpolation, eval/exec, and innerHTML | `arc intercept eval --kind file_write` |
-| **AI Asset Discovery** | Shadow AI models and unvetted MCP servers | Zero-touch workstation & repo scanner exporting compliant **CycloneDX v1.6 AI-BOM** manifests | `arc audit --output-bom ai-bom.json` |
+| **Observed Taint Checks** | Some mediated private-data + untrusted-context flows | Session Taint DAG and heuristic classification of selected sinks; not general egress interception | `arc intercept eval --session s1` |
+| **Selected Agent Hooks** | Configured Claude Code/Cursor lifecycle events | Host hooks mediate supported events only; ordinary Cursor editor writes and unwrapped actions bypass Arc | `arc host install --host claude-code` |
+| **Package Risk Check** | Package-name lookalikes and known vulnerabilities for exact versions | Advisory name heuristic; exact-version OSV check where requested; not an install control | `arc shield check lodash@4.17.21` |
+| **Wrapped MCP Schema Pinning** | Schema changes on an MCP server launched through the Arc stdio broker | RFC 8785 JCS hashing; local reviewed pin or explicit development-only TOFU | `arc protect stdio --pin-schema <hash>` |
+| **Process Lifecycle Controls** | Some child-process lifetime/resource risks in the wrapped broker | OS-specific lifecycle/resource controls; not sandboxing or network isolation | `arc protect stdio --max-memory-mb 512` |
+| **Secret Scanning** | Supported secret patterns in explicitly scanned inputs | Pattern/entropy detector; redaction applies only where the path can apply it | `arc scan-secrets --path . --redact` |
+| **Targeted Code-Pattern Scan** | Selected risky code patterns on a mediated file-write event | Aho-Corasick prefilter + targeted regex; not AST analysis or universal file-write DLP | `arc intercept eval --kind file_write` |
+| **AI Asset Discovery** | Inventory of discovered AI assets/configuration | Repository/workstation scanner with CycloneDX v1.6 export; validate inventory completeness | `arc audit --output-bom ai-bom.json` |
 
 ---
 
@@ -72,7 +71,7 @@ Vexa Arc enforces **Pre-Execution Inversion**: in-daemon policy decisions are re
 
 ### 1. Build and Run from Source
 ```bash
-# Clone and build the native release binary (Zero external C / OpenSSL dependencies)
+# Clone and build from source with the Rust toolchain
 git clone https://github.com/noviqtechnologies/vexa-arc.git
 cd vexa-arc
 cargo build --release
@@ -86,8 +85,8 @@ cargo build --release
 
 ### 2. Immediate Diagnostic Checks
 ```bash
-# ⚡ Test the Pre-Execution Package Firewall (catches hallucinated packages in < 5ms):
-arc shield npm install reactt
+# Advisory package-name check only; this does not run or prevent npm install:
+arc shield check reactt --ecosystem npm
 
 # 🔍 Discover AI assets, MCP configs, and agent rule files across your project:
 arc audit
@@ -100,20 +99,20 @@ arc host install --host claude-code
 arc host install --host cursor
 ```
 
-*(Pre-built standalone binaries for Linux x86_64/arm64, macOS Apple Silicon/Intel, and Windows x86_64 are also downloadable directly from [GitHub Releases](https://github.com/noviqtechnologies/vexa-arc/releases)).*
+*(If versioned binaries are published, use the checksums and provenance attached to that specific [GitHub Release](https://github.com/noviqtechnologies/vexa-arc/releases); do not assume unreleased artifacts are available or validated.)*
 
 ---
 
 ## Core Security Pillars
 
-### 1. Stateful Session Taint DAG & Lethal Trifecta Prevention
+### 1. Stateful Session Taint DAG & Observed Lethal Trifecta Checks
 
 The **Lethal Trifecta** occurs when an autonomous agent simultaneously acquires:
 1. **Private Data Access** (e.g. reading `.env`, database configuration, SSH keys, internal source code)
 2. **Untrusted Context Ingestion** (e.g. reading untrusted issues, web scraping, external PR comments)
 3. **Outbound Egress / Execution** (e.g. posting to external webhooks, running `curl`, executing network scripts)
 
-Vexa Arc tracks session taints monotonically in an in-memory directed acyclic graph (DAG):
+Arc tracks taints on events it receives in an in-memory directed acyclic graph (DAG). It can deny recognized sinks on those mediated events; it does not observe every file read, shell command, or outbound connection. The following illustrates the intended flow, not a guarantee against unrecognized sinks or bypass paths:
 
 ```bash
 # 1. Agent reads sensitive local credentials -> adds PRIVATE_DATA + SECRET_MATERIAL
@@ -122,24 +121,24 @@ arc intercept eval .env --session dev-session
 # 2. Agent ingests untrusted issue context -> adds UNTRUSTED_CONTENT
 arc intercept prompt "https://malicious.com/issue/42" --session dev-session
 
-# 3. Agent attempts outbound Slack message or network egress -> HARD BLOCKED (Exit code 2)
+# 3. If the Slack action reaches Arc and is classified as a sensitive sink, policy denies it
 arc intercept eval slack/slack_post_message --session dev-session
 ```
 
 #### Token-Based Multi-Language Egress Classification
-Vexa Arc classifies shell commands via lexical tokenization rather than brittle binary prefix matching. Outbound egress is detected across:
+Arc lexically recognizes selected command and interpreter signatures. This is heuristic detection, not a packet filter or complete language/runtime analysis. Examples the current classifier is intended to recognize include:
 - **Standard utilities:** `curl`, `wget`, `nc`, `ncat`, `netcat`, `socat`, `ssh`, `scp`, `rsync`
 - **Python:** `python -c "import urllib..."`, `python3 -c "import requests, socket..."`
 - **Node.js:** `node -e "require('http')..."`
 - **Ruby & Perl:** `ruby -e "require 'net/http'..."`, `perl -e "use LWP..."`
 - **PowerShell:** `Invoke-WebRequest`, `Invoke-RestMethod`, `Start-BitsTransfer`
-- **Compound command defense:** Commands like `git status; curl https://evil.com` are parsed as compound execution and prohibited from benign exemptions.
+- **Compound commands:** Some separators/compound forms are recognized; encoded commands, aliases, arbitrary binaries, custom clients, DNS, and unrecognized syntax can evade these checks.
 
 ---
 
 ### 2. Native IDE & Agent Runtime Hooks
 
-Vexa Arc integrates directly into host agent runtimes with zero-friction configuration and **fail-closed** guarantees:
+Vexa Arc offers selected host hooks. Installing a hook does not provide complete mediation or a universal fail-closed guarantee; inspect the installed status and documented event coverage:
 
 ```bash
 # Automatically install hooks into .claude/settings.json or .cursor/hooks.json
@@ -192,29 +191,36 @@ Vexa Arc configures Cursor with `failClosed: true` across `beforeShellExecution`
 When supervising stdio Model Context Protocol (MCP) servers, Vexa Arc acts as an inline security broker with OS-level containment:
 
 ```bash
-# Supervise an MCP server with schema pinning and a 512 MB memory boundary:
+# Bootstrap only after independently verifying the server artifact; capture the JCS hash on stderr:
 arc protect stdio \
   --server github \
-  --pin-schema 3b1f... \
+  --allow-tofu \
+  -- npx @modelcontextprotocol/server-github
+
+# Managed use: provision the reviewed hash in `.arc/signed_policy.json` under
+# `mcp_schema_pins`; the CLI pin is optional and must match the signed pin:
+arc protect stdio \
+  --server github \
   --max-memory-mb 512 \
   -- npx @modelcontextprotocol/server-github
 ```
 
-- **Zero-Race Process Containment:**
-  - **Windows:** Spawns processes with `CREATE_SUSPENDED`, assigns them immediately to a Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and memory limits, and resumes execution (`NtResumeProcess`). Zero window for uncontained execution.
-  - **Linux:** Sets `PR_SET_PDEATHSIG` with parent PID verification and applies `RLIMIT_AS` virtual memory caps.
-  - **macOS / Unix:** Isolates child processes into distinct process groups (`setpgid`), ensuring `SIGKILL` cleanly reaps all child worker trees on exit.
-- **Dynamic Schema Rug-Pull Prevention (`ARC-RUG-001`):** Canonicalizes declared tool schemas using RFC 8785 JSON Canonicalization Scheme (JCS). If a tool's parameters expand dynamically at runtime without matching `--pin-schema`, calls are immediately quarantined.
+- **Process-Lifecycle Containment (not an OS sandbox):**
+  - **Windows:** Creates the child suspended, assigns it to a Job Object, and resumes it; job close terminates assigned processes. Nested-job/assignment failures abort launch.
+  - **Linux:** Arms `PR_SET_PDEATHSIG` for the direct child with a parent-PID race check and applies per-process `RLIMIT_AS`; process-group cleanup runs during supervisor teardown.
+  - **macOS / other Unix:** Uses process-group cleanup during supervisor teardown. A hard-killed Arc parent is not guaranteed to reap detached/orphan descendants.
+  - These controls do not restrict syscalls, filesystem access, or network egress; they are not a sandbox.
+- **Dynamic Schema Rug-Pull Prevention (`ARC-RUG-001`):** Canonicalizes declared tool schemas using RFC 8785 JSON Canonicalization Scheme (JCS). Broker and CLI require a reviewed pin. In managed mode, the pin is taken from the verified signed organization policy; unsigned project/user policy cannot establish trust, CLI overrides must match, and a missing server pin blocks startup. `--allow-tofu` is an explicit development/bootstrap exception and is rejected when signed organization policy is active.
 - **Tool Result Taint Attribution:** Outputs from external tools (e.g. GitHub issue fetches, web scraping) are ingested into the session Taint DAG before returning to the model, preventing delayed Lethal Trifecta bypasses.
 
 ---
 
-### 4. Anti-Slopsquatting Dependency Firewall (`arc shield`)
+### 4. Advisory Package Risk Checks (`arc shield`)
 
-AI agents frequently hallucinate package names or install dependencies without human review. `arc shield` implements an algorithmic **4-gate compound defense** combined with live OSV/EPSS vulnerability scanning:
+AI agents can hallucinate package names, but the current `arc shield` CLI is **not an install firewall**. It parses package names or command text and applies heuristics using seeded popular-package baselines and caller-supplied simulation values; it does not retrieve live registry age, download, lifecycle-script, provenance, or 404 data. It does not execute or intercept package-manager commands. `arc shield check name@version` can separately query OSV for known vulnerabilities in that exact version; that query is not a malicious-package verdict.
 
 ```bash
-# Natural command wrapper (use directly in terminal or agent scripts):
+# Inspect command text only; these do not run or block the package manager:
 arc shield npm install reactt
 arc shield pip install shadow-agent
 arc shield cargo add tokio
@@ -223,20 +229,19 @@ arc shield cargo add tokio
 arc shield check lodash@4.17.21 --ecosystem npm --json
 ```
 
-1. **Established Fast Path:** Well-known popular packages pass without delay based on established baselines.
-2. **Compound Typosquat Gate:** Evaluates Jaro-Winkler string similarity and Levenshtein edit distance against established popular packages.
-3. **Lifecycle Scripts Gate:** Blocks packages containing arbitrary shell execution hooks (`preinstall`, `postinstall`).
-4. **Phantom 404 Gate:** Halts requests for non-existent registry packages before attackers can register them.
-5. **Exact-Coordinate OSV & EPSS Scanning (`ARC-SCA-001`):** Evaluates vulnerabilities via OSV queries with local `.sca-cache` fallback for exact coordinates (`name@version`). If no version is supplied, the scan status is explicitly recorded as `not_scanned_no_version`; if advisory feeds are unavailable and uncached, it fails closed (`incomplete`).
+1. **Ecosystem-scoped seeded popular-package baseline:** A small static baseline informs heuristic results; it is not registry attestation and cannot authorize a same-named package in another ecosystem.
+2. **Name similarity and lifecycle checks:** Jaro-Winkler/Levenshtein comparisons are case-normalized; a caller-reported dangerous lifecycle signal blocks even a popular/established fast path.
+3. **Caller-supplied 404/provenance fields:** These are inputs to the library engine, not signals collected by a registry proxy in this CLI. New low-history packages without SLSA provenance require review rather than an automatic permit.
+4. **Exact-version OSV scan (`ARC-SCA-001`):** A concrete `name@version` may be checked against OSV with local `.sca-cache` use. No version means no exact-version scan; an unavailable uncached query can be incomplete/fail closed.
 
 ---
 
 ### 5. Linear-Time Secret Detection & Redaction
 
-Scans prompts, files, and standard input in $< 0.9\text{ ms}$ for credentials (AWS keys, GitHub tokens, OpenAI keys, Slack tokens, private keys, JWTs):
+Provides targeted secret detection for explicitly scanned inputs and supported mediated payloads. No sub-millisecond latency or universal host/outbound coverage is claimed; actual coverage depends on the invoked command, adapter, and policy:
 - **Linear-Time Aho-Corasick Prefiltering**: Eliminates latency overhead on large source files.
 - **Shannon Entropy Verification**: Validates entropy thresholds on candidate substrings to prevent false alarms on test fixtures.
-- **Local Pseudonymization Vault**: Replaces detected secrets with synthetic surrogate tokens (`<ARC_VAULT_SECRET_XX>`) before sending prompts to external LLMs, with volatile in-memory zeroization of secret buffers on session clearance.
+- **Local Pseudonymization Vault**: Can replace detected secrets with synthetic surrogate tokens (`<ARC_VAULT_SECRET_XX>`) when the applicable mediated path issues and applies a redaction obligation; this is not automatic coverage of every prompt or outbound channel.
 
 ```bash
 # Scan repository or directory
@@ -268,13 +273,13 @@ arc audit --path . --output-bom ai-bom.json
 
 ```mermaid
 flowchart TB
-    HOST["Agent / IDE Runtime\n(Claude Code, Cursor, Windsurf, Cline)"] -->|"CLI Hook / JSON-RPC"| HOOKS["arc-hooks\n(Host Adapters & Interceptors)"]
+    HOST["Agent / IDE Runtime\n(Claude Code / Cursor native hooks; Windsurf / Cline MCP transport only)"] -->|"Native hook where supported; otherwise managed MCP stdio"| HOOKS["arc-hooks\n(Host Adapters & Interceptors)"]
     HOOKS -->|"Normalized ActionEvent"| ENGINE["arc-policy-engine\n(Policy Evaluator)"]
     
     subgraph ENGINE_SUBSYSTEMS["Core Security Subsystems (Pre-Execution Inversion)"]
         DAG["Stateful Taint DAG FSM\n(Lethal Trifecta Guard: ARC-LTT-001)"]
         DLP["arc-dlp\n(Secret Detection, Shannon Entropy & Vault)"]
-        FW["arc-firewall\n(4-Gate Compound Anti-Slopsquatting + OSV)"]
+        FW["arc-firewall\n(Package-Name Heuristics + Exact-Version OSV)"]
         ATLAS["arc-discover\n(CycloneDX v1.6 AI-BOM & Asset Scanner)"]
     end
     
@@ -289,9 +294,9 @@ flowchart TB
 
 ### Core Architectural Invariants
 
-1. **Pre-Execution Inversion**: All security checks trigger *before* code touches disk or shell commands execute.
-2. **Sub-Millisecond Engine Latency Budget**: In-memory policy evaluations, Aho-Corasick pre-filtering, and taint updates complete within $p_{99} < 3.5\text{ ms}$ (CLI invocation of `arc` as a standalone binary incurs OS process spawn overhead).
-3. **Zero Network Egress**: All parsing, code pattern checks, and taint analysis run 100% locally on the host machine.
+1. **Mediated Pre-Execution Checks**: Configured hooks and an explicitly invoked stdio broker evaluate selected actions before forwarding/execution; unconfigured paths bypass these controls.
+2. **Latency Target (Unvalidated)**: Historical in-memory target $p_{99} < 3.5\text{ ms}$ is not measured release evidence. Benchmark full hook/broker paths and cold/warm behavior before production rollout.
+3. **Local Processing With Explicit Network Exceptions**: Local parsing, code pattern checks, and taint analysis run on-host; exact-version OSV checks and the launched MCP server may use network destinations.
 4. **Monotonic Taint Accumulation**: Taints (`PRIVATE_DATA`, `UNTRUSTED_CONTENT`, `SECRET_MATERIAL`, `EXTERNAL_EGRESS`) accumulate across session life cycles and cannot be reset by agent prompts.
 5. **Deterministic Schema Invariance (RFC 8785)**: MCP tool schemas are canonicalized via RFC 8785 JCS and SHA-256 hashed to defeat dynamic rug-pull attacks.
 
@@ -305,10 +310,10 @@ All commands support relative and absolute paths, cross-platform path separators
 | :--- | :--- | :--- | :--- |
 | `arc audit` | Scan project or workstation for AI assets, rules, and MCP configs | `--workstation`, `--json`, `--output-bom <PATH>` | `arc audit --output-bom ai-bom.json` |
 | `arc bom` | Export CycloneDX v1.6 AI-BOM | `-p, --path <PATH>`, `-o, --out <PATH>` | `arc bom --out ai-bom.json` |
-| `arc shield` | Anti-slopsquatting package firewall & OSV scanner | `check <PKG>`, `run <CMD>`, `--dangerous-scripts`, `--json` | `arc shield npm install lodash@4.17.21` |
+| `arc shield` | Advisory package-name heuristics; exact-version OSV check (does not intercept or run installs) | `check <PKG>`, `run <CMD>`, `--show-recommendation`, `--fail-on-risk` | `arc shield run --fail-on-risk -- npm install package` |
 | `arc scan-secrets` | Scan files or stdin for secrets with entropy checks | `-p, --path <PATH>`, `--redact` | `arc scan-secrets --path . --redact` |
 | `arc host` | Manage host integrations (Claude Code, Cursor) | `install`, `status`, `uninstall`, `--host <HOST>` | `arc host install --host claude-code` |
-| `arc protect` | Supervise MCP servers with containment and schema pinning | `stdio --server <NAME>`, `--pin-schema <HASH>`, `--max-memory-mb <MB>` | `arc protect stdio --server fs -- npx server` |
+| `arc protect` | Supervise MCP servers with containment and required schema pinning | `stdio --server <NAME>`, `--pin-schema <HASH>` (or dev-only `--allow-tofu`), `--max-memory-mb <MB>` | `arc protect stdio --server fs --pin-schema "$MCP_SCHEMA_SHA256" -- npx server` |
 | `arc intercept` | Intercept and evaluate agent actions against session Taint DAG | `eval`, `read`, `exec`, `mcp`, `prompt`, `hook`, `session` | `arc intercept hook --host claude-code` |
 | `arc trace` | Inspect event causality and export redacted audit evidence | `<EVENT_ID>`, `latest`, `--export <PATH>`, `--json` | `arc trace latest --export trace.json` |
 | `arc doctor` | Check host adapters, policy engine, and cumulative metrics | `--metrics`, `--json` | `arc doctor --metrics` |
@@ -355,26 +360,25 @@ jobs:
 
 ## Automated Tests & Verification
 
-Vexa Arc is thoroughly verified by **118 automated unit and integration tests** across all 7 workspace crates:
+The workspace includes unit and integration test suites across its crates. Tests, formatting, and Clippy were not run during this source review because the Rust toolchain was unavailable; run these checks and review the current CI matrix before merge or deployment:
 
 ```bash
-# Run the entire workspace test suite (118 tests)
+# Run the entire workspace test suite
 cargo test --workspace
 
 # Run strict clippy verification (zero warnings allowed)
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-| Crate | Tests | Coverage Areas |
-| :--- | :---: | :--- |
-| **`arc-core`** | 7 | Domain models, 3D capability risk profiling, RFC 8785 JCS canonicalization, Verdict serialization |
-| **`arc-dlp`** | 14 | Secret detector, Shannon entropy, pseudonymization vault with memory zeroization, code injection pattern checks (`ARC-AST-001`) |
-| **`arc-policy-engine`** | 20 | Stateful Taint DAG FSM, Lethal Trifecta (`ARC-LTT-001`), server/content untrusted taint, token-based shell egress |
-| **`arc-discover`** | 5 | Workstation & repository asset discovery, agent instruction files, CycloneDX v1.6 AI-BOM export |
-| **`arc-firewall`** | 18 | 4-gate anti-slopsquatting, exact-coordinate OSV/EPSS scans (`ARC-SCA-001`), command parsing (`npm`, `pip`, `cargo`, `go`) |
-| **`arc-hooks`** | 23 | Claude Code (`.claude/settings.json`) & Cursor (`.cursor/hooks.json`) adapters, OS process containment, schema pinning |
-| **`arc-cli`** | 31 | CLI subcommands (5 unit tests) + end-to-end integration test suite (26 integration tests) |
-| **Total** | **118** | **100% Passing** across Linux, macOS, and Windows |
+| Crate | Source/test coverage summary |
+| :--- | :--- |
+| **`arc-core`** | Domain models, RFC 8785 JCS canonicalization, verdict serialization |
+| **`arc-dlp`** | Secret detectors, Shannon entropy, pseudonymization vault, targeted code-pattern checks (not a parser/AST analyzer; `ARC-AST-001`) |
+| **`arc-policy-engine`** | Stateful Taint DAG, Lethal Trifecta (`ARC-LTT-001`), server/content untrusted taint, heuristic shell-egress classification |
+| **`arc-discover`** | Workstation/repository asset discovery, agent instruction files, CycloneDX v1.6 AI-BOM export |
+| **`arc-firewall`** | Advisory package-name heuristics, exact-coordinate OSV scanner (`ARC-SCA-001`), command parsing; no install interception |
+| **`arc-hooks`** | Claude Code and Cursor adapters, process-lifecycle controls (not sandboxing), required-by-default MCP schema pins |
+| **`arc-cli`** | CLI dispatch and integration flows; current test results require CI validation |
 
 ---
 
@@ -384,6 +388,8 @@ For complete architecture diagrams, implementation walk-throughs, and configurat
 
 - 📘 [**User Guide**](docs/user-guide.md): Complete setup, CLI workflows, IDE integration (Claude Code, Cursor, Windsurf), Lethal Trifecta mitigation, and FAQ.
 - 🛠️ [**Developer Guide**](docs/developer-guide.md): Technical architecture, crate topology, normalized `ActionEvent` contracts, RFC 8785 JCS, and extending test suites.
+- [**Product Tier Matrix**](docs/product-tiers.md): Community features for the upcoming release and explicitly planned Team/Enterprise options; roadmap, not an availability promise.
+- [**Community Release Scope**](docs/community-release-scope.md): Supported local use, limitations, and stable-release gates.
 
 ---
 

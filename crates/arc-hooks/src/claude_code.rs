@@ -1,7 +1,7 @@
 use arc_core::event::{
     Action, ActionEvent, AgentHost, Artifact, OsPrincipal, Phase, ServerIdentity,
 };
-use arc_core::verdict::Verdict;
+use arc_core::verdict::{Obligation, Verdict};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -11,6 +11,18 @@ use crate::host_config::{
 };
 
 pub struct ClaudeCodeAdapter;
+
+fn has_unapplied_redaction(obligations: &[Obligation]) -> bool {
+    obligations.iter().any(|obligation| match obligation {
+        Obligation::Redact { spans } => !spans.is_empty(),
+        _ => false,
+    })
+}
+
+const DLP_UNAPPLIED_REDACTION_MESSAGE: &str = concat!(
+    "[ARC-DLP-001] Secret detected; this hook cannot safely rewrite the action, ",
+    "so it was blocked. Remove the secret or use a mediated redaction-capable MCP transport."
+);
 
 /// Tools whose *results* can carry untrusted external content and therefore must be
 /// reported to the taint tracker via a PostToolUse hook.
@@ -217,6 +229,13 @@ impl HostAdapter for ClaudeCodeAdapter {
     /// feeds stderr back to the model; `permissionDecision: "ask"` defers to the user.
     fn encode(&self, verdict: &Verdict) -> HostResponse {
         match verdict {
+            Verdict::Allow { obligations } if has_unapplied_redaction(obligations) => {
+                HostResponse {
+                    stdout: Vec::new(),
+                    stderr: DLP_UNAPPLIED_REDACTION_MESSAGE.as_bytes().to_vec(),
+                    exit_code: 2,
+                }
+            }
             Verdict::Allow { .. } => HostResponse {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
@@ -421,6 +440,19 @@ mod tests {
         ClaudeCodeAdapter
             .decode(v.to_string().as_bytes(), OsPrincipal::Uid(1000))
             .unwrap()
+    }
+
+    #[test]
+    fn hook_denies_when_redaction_obligation_cannot_be_applied() {
+        let verdict = Verdict::Allow {
+            obligations: vec![Obligation::Redact {
+                spans: vec![(0, 12, "<ARC_SECRET>".to_string())],
+            }],
+        };
+
+        let response = ClaudeCodeAdapter.encode(&verdict);
+        assert_eq!(response.exit_code, 2);
+        assert!(String::from_utf8_lossy(&response.stderr).contains("ARC-DLP-001"));
     }
 
     #[test]

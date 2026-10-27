@@ -22,6 +22,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_jcs = "0.2"
 sha2 = "0.10"
+ring = "0.17.14"
 uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
 bitflags = { version = "2.6", features = ["serde"] }
 aho-corasick = "1.1"

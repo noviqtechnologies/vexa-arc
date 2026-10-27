@@ -85,6 +85,7 @@ impl SlopsquatVerdict {
 
 pub struct CompoundAntiSlopsquatEngine {
     popular_packages: Vec<String>,
+    custom_popular_packages: Vec<String>,
 }
 
 impl Default for CompoundAntiSlopsquatEngine {
@@ -142,12 +143,14 @@ impl CompoundAntiSlopsquatEngine {
 
         Self {
             popular_packages: popular.into_iter().map(|s| s.to_string()).collect(),
+            custom_popular_packages: Vec::new(),
         }
     }
 
     pub fn with_popular_packages(packages: Vec<String>) -> Self {
         Self {
-            popular_packages: packages,
+            popular_packages: Vec::new(),
+            custom_popular_packages: packages,
         }
     }
 
@@ -155,58 +158,97 @@ impl CompoundAntiSlopsquatEngine {
     pub fn is_popular_package(&self, name: &str) -> bool {
         self.popular_packages
             .iter()
+            .chain(self.custom_popular_packages.iter())
             .any(|p| p.eq_ignore_ascii_case(name))
     }
 
-    /// Evaluates candidate package metadata using the 4-gate compound anti-slopsquatting engine.
+    /// Checks the curated baseline within an ecosystem; a popular npm name must not
+    /// automatically authorize an unrelated package with the same name on PyPI or Cargo.
+    pub fn is_popular_package_for_ecosystem(&self, name: &str, ecosystem: &str) -> bool {
+        let ecosystem_packages: &[&str] = match ecosystem.to_ascii_lowercase().as_str() {
+            "npm" | "node" => &[
+                "react", "react-dom", "lodash", "express", "axios", "request", "next",
+                "vue", "angular", "typescript", "chalk", "commander", "webpack", "babel",
+                "eslint", "prettier", "jest", "mocha", "socket.io", "async",
+            ],
+            "pypi" | "pip" | "python" => &[
+                "requests", "numpy", "pandas", "scipy", "flask", "django", "urllib3",
+                "cryptography", "pytest", "boto3", "torch", "tensorflow", "pydantic",
+            ],
+            "cargo" | "crates.io" | "rust" => &[
+                "serde", "tokio", "syn", "quote", "rand", "regex", "clap", "anyhow",
+            ],
+            _ => &[],
+        };
+        self.custom_popular_packages
+            .iter()
+            .any(|package| package.eq_ignore_ascii_case(name))
+            || self.popular_packages.iter().any(|package| {
+                package.eq_ignore_ascii_case(name)
+                    && ecosystem_packages
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(package))
+            })
+    }
+
+    /// Evaluates caller-supplied package metadata using the compound anti-slopsquatting heuristic.
     pub fn evaluate(&self, metadata: &PackageRegistryMetadata) -> SlopsquatVerdict {
-        // Fast Path (< 1.5 ms): Curated standard popular packages pass immediately unless dangerous scripts detected
-        if self.is_popular_package(&metadata.name) && !metadata.has_dangerous_lifecycle_scripts {
-            return SlopsquatVerdict::Permitted {
-                reason: "Verified standard package from official popular dependency baseline",
+        // Lifecycle execution is high risk regardless of package age, downloads, or popularity.
+        if metadata.has_dangerous_lifecycle_scripts {
+            return SlopsquatVerdict::Blocked {
+                gate: "CompoundLifecycleGate",
+                reason: format!(
+                    "Package '{}' contains dangerous install lifecycle execution signals",
+                    metadata.name
+                ),
             };
         }
 
-        // Fast Path (< 1.5 ms): Established package names with proven history pass immediately
+        if metadata.recent_registry_404 {
+            return SlopsquatVerdict::Blocked {
+                gate: "CompoundPhantomGate",
+                reason: format!(
+                    "Package '{}' has a caller-reported recent registry 404 signal",
+                    metadata.name
+                ),
+            };
+        }
+
+        // This is a curated name baseline, not a registry-authenticated allowlist.
+        if self.is_popular_package_for_ecosystem(&metadata.name, &metadata.ecosystem) {
+            return SlopsquatVerdict::Permitted {
+                reason: "Name appears in the curated popular-package baseline (not a live registry verification)",
+            };
+        }
+
+        // Established packages with sufficient history and repository evidence pass this heuristic.
         if metadata.age_days > 30
             && metadata.monthly_downloads > 1_000
             && metadata.has_verified_repository_link
         {
             return SlopsquatVerdict::Permitted {
-                reason: "Established package with proven registry history and verified provenance",
+                reason: "Caller-supplied age/download/repository metadata met the established-package heuristic; not independently verified",
             };
         }
 
         // Compound Block Gate: Newly registered package name (< 14 days AND < 500 downloads)
         // AND triggers at least one high-risk compound indicator:
         if metadata.age_days < 14 && metadata.monthly_downloads < 500 {
-            // Indicator 1: Dangerous Install Lifecycle Scripts (preinstall/postinstall/setup.py shell exec)
-            if metadata.has_dangerous_lifecycle_scripts {
-                return SlopsquatVerdict::Blocked {
-                    gate: "CompoundLifecycleGate",
-                    reason: format!(
-                        "New package '{}' attempts arbitrary shell/network execution in install lifecycle scripts",
-                        metadata.name
-                    ),
-                };
-            }
-
-            // Indicator 2: Phantom Registry Watchlist
-            if metadata.recent_registry_404 {
-                return SlopsquatVerdict::Blocked {
-                    gate: "CompoundPhantomGate",
-                    reason: format!(
-                        "Package '{}' matches known phantom package name returning recent 404 / LLM hallucination watchlist",
-                        metadata.name
-                    ),
-                };
-            }
-
-            // Indicator 3: Hallucination / Typosquat Distance (Levenshtein <= 2 or Jaro-Winkler >= 0.92)
-            for popular in &self.popular_packages {
-                if &metadata.name != popular {
-                    let jw = strsim::jaro_winkler(&metadata.name, popular);
-                    let lev = strsim::levenshtein(&metadata.name, popular);
+            // Indicator 1: Hallucination / Typosquat Distance. Normalize case to avoid
+            // trivial case-only evasion, and compare only within the package ecosystem.
+            let normalized_name = metadata.name.to_ascii_lowercase();
+            for popular in self
+                .popular_packages
+                .iter()
+                .chain(self.custom_popular_packages.iter())
+            {
+                if self.is_popular_package_for_ecosystem(popular, &metadata.ecosystem) {
+                    let normalized_popular = popular.to_ascii_lowercase();
+                    if normalized_name == normalized_popular {
+                        continue;
+                    }
+                    let jw = strsim::jaro_winkler(&normalized_name, &normalized_popular);
+                    let lev = strsim::levenshtein(&normalized_name, &normalized_popular);
                     if jw >= 0.92 || lev <= 2 {
                         return SlopsquatVerdict::Blocked {
                             gate: "CompoundTyposquatGate",
@@ -219,7 +261,7 @@ impl CompoundAntiSlopsquatEngine {
                 }
             }
 
-            // Indicator 4: Missing or Spoofed Source Provenance
+            // Indicator 2: Missing or spoofed source repository signals.
             if !metadata.has_verified_repository_link
                 || (metadata.repository_stars == 0 && metadata.repository_commits == 0)
             {
@@ -229,6 +271,21 @@ impl CompoundAntiSlopsquatEngine {
                         "New package '{}' lacks verified source repository provenance (0 stars, 0 commits, unverified repo link)",
                         metadata.name
                     ),
+                };
+            }
+
+            // Indicator 3: Registry/repository presence alone is not an attestation. Missing SLSA
+            // provenance requires human review rather than an automatic green verdict.
+            if !metadata.has_slsa_provenance {
+                return SlopsquatVerdict::Review {
+                    gate: "CompoundProvenanceGate",
+                    reason: format!(
+                        "New package '{}' has no verified SLSA provenance attestation",
+                        metadata.name
+                    ),
+                    containment_recommendation:
+                        "Require a signed provenance attestation or an explicit security review before installation."
+                            .to_string(),
                 };
             }
         }
@@ -264,6 +321,54 @@ mod tests {
     }
 
     #[test]
+    fn dangerous_lifecycle_signal_blocks_even_established_popular_package() {
+        let engine = CompoundAntiSlopsquatEngine::new();
+        let meta = PackageRegistryMetadata {
+            name: "react".to_string(),
+            ecosystem: "npm".to_string(),
+            age_days: 3000,
+            monthly_downloads: 50_000_000,
+            has_verified_repository_link: true,
+            repository_stars: 200_000,
+            repository_commits: 15_000,
+            has_slsa_provenance: true,
+            has_dangerous_lifecycle_scripts: true,
+            recent_registry_404: false,
+        };
+        assert!(matches!(
+            engine.evaluate(&meta),
+            SlopsquatVerdict::Blocked {
+                gate: "CompoundLifecycleGate",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recent_404_signal_blocks_even_a_popular_package_name() {
+        let engine = CompoundAntiSlopsquatEngine::new();
+        let meta = PackageRegistryMetadata {
+            name: "express".to_string(),
+            ecosystem: "npm".to_string(),
+            age_days: 3000,
+            monthly_downloads: 50_000_000,
+            has_verified_repository_link: true,
+            repository_stars: 100_000,
+            repository_commits: 10_000,
+            has_slsa_provenance: true,
+            has_dangerous_lifecycle_scripts: false,
+            recent_registry_404: true,
+        };
+        assert!(matches!(
+            engine.evaluate(&meta),
+            SlopsquatVerdict::Blocked {
+                gate: "CompoundPhantomGate",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_slopsquat_typosquat_blocked() {
         let engine = CompoundAntiSlopsquatEngine::new();
         // Candidate: 'reactt' (Levenshtein 1 from 'react')
@@ -287,6 +392,67 @@ mod tests {
             assert!(reason.contains("reactt"));
             assert!(reason.contains("react"));
         }
+    }
+
+    #[test]
+    fn typosquat_comparison_is_case_insensitive_and_ecosystem_scoped() {
+        let engine = CompoundAntiSlopsquatEngine::new();
+        let mut candidate = PackageRegistryMetadata {
+            name: "ReAcTt".to_string(),
+            ecosystem: "npm".to_string(),
+            age_days: 2,
+            monthly_downloads: 12,
+            has_verified_repository_link: true,
+            repository_stars: 1,
+            repository_commits: 1,
+            has_slsa_provenance: true,
+            has_dangerous_lifecycle_scripts: false,
+            recent_registry_404: false,
+        };
+        assert!(matches!(
+            engine.evaluate(&candidate),
+            SlopsquatVerdict::Blocked {
+                gate: "CompoundTyposquatGate",
+                ..
+            }
+        ));
+
+        candidate.name = "react".to_string();
+        candidate.ecosystem = "pypi".to_string();
+        candidate.has_verified_repository_link = false;
+        candidate.repository_stars = 0;
+        candidate.repository_commits = 0;
+        assert!(matches!(
+            engine.evaluate(&candidate),
+            SlopsquatVerdict::Blocked {
+                gate: "CompoundProvenanceGate",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn new_package_without_slsa_attestation_requires_review() {
+        let engine = CompoundAntiSlopsquatEngine::new();
+        let meta = PackageRegistryMetadata {
+            name: "new-but-documented-lib".to_string(),
+            ecosystem: "npm".to_string(),
+            age_days: 4,
+            monthly_downloads: 40,
+            has_verified_repository_link: true,
+            repository_stars: 3,
+            repository_commits: 8,
+            has_slsa_provenance: false,
+            has_dangerous_lifecycle_scripts: false,
+            recent_registry_404: false,
+        };
+        assert!(matches!(
+            engine.evaluate(&meta),
+            SlopsquatVerdict::Review {
+                gate: "CompoundProvenanceGate",
+                ..
+            }
+        ));
     }
 
     #[test]

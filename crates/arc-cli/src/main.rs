@@ -200,9 +200,13 @@ enum ProtectAction {
         #[arg(long, default_value = "default-session")]
         session: String,
 
-        /// Pin the server's tools/list schema (hex SHA-256 JCS fingerprint); mismatches disable tool calls
+        /// Schema SHA-256 JCS fingerprint; a signed organization policy pin takes precedence
         #[arg(long)]
         pin_schema: Option<String>,
+
+        /// Explicitly allow trust-on-first-use for development/bootstrap only; unsuitable for managed deployment
+        #[arg(long)]
+        allow_tofu: bool,
 
         /// Maximum memory for the supervised server (MiB; Windows job-wide, Linux per-process)
         #[arg(long)]
@@ -216,7 +220,7 @@ enum ProtectAction {
 
 #[derive(Subcommand)]
 enum ShieldAction {
-    /// Check a package against the 4-gate compound anti-slopsquatting engine
+    /// Advisory package risk check; this command does not intercept or execute installs
     Check {
         /// Package name, scoped package (e.g. 'npm:reactt'), or install command ('npm install reactt')
         package: String,
@@ -242,13 +246,18 @@ enum ShieldAction {
         json: bool,
     },
 
-    /// Execute or contain a package install command under protected mode firewall (FR-PKG-004)
+    /// Inspect a package install command and print a verdict; the command is never executed
     Run {
-        /// Automatically enforce containment by wrapping command with --ignore-scripts or blocking
+        /// Print a proposed safer command variant for manual review; Arc does not execute it
         #[arg(long)]
-        enforce: bool,
+        show_recommendation: bool,
 
-        /// Command to supervise and evaluate (e.g. npm install express)
+        /// Exit non-zero for REVIEW or BLOCK verdicts; this is a CI result, not install
+        /// interception.
+        #[arg(long)]
+        fail_on_risk: bool,
+
+        /// Package-manager command to inspect only (e.g. npm install express)
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
@@ -523,8 +532,12 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            ShieldAction::Run { command, enforce } => {
-                if !run_shield_run(command, enforce) {
+            ShieldAction::Run {
+                command,
+                show_recommendation,
+                fail_on_risk,
+            } => {
+                if !run_shield_run(command, show_recommendation, fail_on_risk) {
                     std::process::exit(1);
                 }
             }
@@ -723,6 +736,7 @@ fn main() {
                 server,
                 session,
                 pin_schema,
+                allow_tofu,
                 max_memory_mb,
                 command,
             } => {
@@ -730,6 +744,7 @@ fn main() {
                     &server,
                     &session,
                     pin_schema.as_deref(),
+                    allow_tofu,
                     max_memory_mb,
                     command,
                 ) {
@@ -798,7 +813,13 @@ fn main() {
 fn run_doctor(json: bool, metrics: bool) -> bool {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let policy = PolicyConfig::load_with_precedence(Some(Path::new(".")));
+    let policy = match PolicyConfig::try_load_with_precedence(Some(Path::new("."))) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("[Arc Doctor] Policy load failed: {error}");
+            return false;
+        }
+    };
     let session_dir = resolve_session_storage_dir(None, false);
     let session_status = match &session_dir {
         Ok(dir) => format!("writable ({})", dir.display()),
@@ -901,28 +922,42 @@ fn run_protect_stdio(
     server: &str,
     session: &str,
     pin_schema: Option<&str>,
+    allow_tofu: bool,
     max_memory_mb: Option<u64>,
     command: Vec<String>,
 ) -> bool {
-    let pinned = match parse_schema_fingerprint(pin_schema) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[Arc Protect] Invalid --pin-schema: {e}");
+    let policy = match PolicyConfig::try_load_with_precedence(Some(Path::new("."))) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("[Arc Protect] Policy load failed: {error}");
             return false;
         }
     };
-    let policy = PolicyConfig::load_with_precedence(Some(Path::new(".")));
+    let pinned = match resolve_schema_pin(&policy, server, pin_schema, allow_tofu) {
+        Ok(pin) => pin,
+        Err(error) => {
+            eprintln!("[Arc Protect] Schema pin configuration rejected: {error}");
+            return false;
+        }
+    };
     let evaluator = PolicyEvaluator::new(policy);
     let mut broker = McpStdioBroker::new(server, session, evaluator)
         .with_command(command)
         .with_limits(arc_hooks::ContainmentLimits {
             max_memory_bytes: max_memory_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
         });
+    if allow_tofu {
+        broker = broker.allow_schema_tofu();
+    }
     if let Some(hash) = pinned {
         broker = broker.with_pinned_schema(hash);
     }
 
-    eprintln!("[Arc Protect] Supervising MCP server '{server}' in session '{session}' (Fail-Closed Protected Edge)");
+    if allow_tofu {
+        eprintln!("[Arc Protect] WARNING: TOFU explicitly enabled for '{server}'; review the observed schema hash and pin it before managed use.");
+    } else {
+        eprintln!("[Arc Protect] Supervising MCP server '{server}' in session '{session}' (schema pin required)");
+    }
     if let Err(e) = broker.run_stdio() {
         eprintln!("[Arc Protect] Stdio broker error: {e}");
         return false;
@@ -1061,8 +1096,8 @@ fn run_host_uninstall(host: &str, workspace: Option<&Path>) -> bool {
     }
 }
 
-/// Evaluates and optionally enforces containment on a package install command (FR-PKG-004)
-fn run_shield_run(command: Vec<String>, enforce: bool) -> bool {
+/// Advises on a package install command without executing or intercepting it.
+fn run_shield_run(command: Vec<String>, show_recommendation: bool, fail_on_risk: bool) -> bool {
     let cmd_str = command.join(" ");
     let pkgs = PackageFirewall::parse_command(&cmd_str);
 
@@ -1075,7 +1110,7 @@ fn run_shield_run(command: Vec<String>, enforce: bool) -> bool {
     let firewall = PackageFirewall::new();
     let mut all_safe = true;
 
-    println!("\n[Arc Shield Run] Evaluating install command: {cmd_str}");
+    println!("\n[Arc Shield Run] Advisory check (command not executed): {cmd_str}");
     for (eco, pkg_name) in &pkgs {
         let verdict = firewall.inspect_package_protected(*eco, pkg_name, false);
         match &verdict {
@@ -1089,17 +1124,21 @@ fn run_shield_run(command: Vec<String>, enforce: bool) -> bool {
                 ..
             } => {
                 println!("  ⚠️  REVIEW  {pkg_name} ({eco:?}) — {gate}");
-                if enforce {
-                    match PackageFirewall::enforce_containment(&cmd_str, &verdict) {
-                        Ok(safe_cmd) => println!("  → Containment applied: {safe_cmd}"),
+                if show_recommendation {
+                    match PackageFirewall::suggest_safer_command(&cmd_str, &verdict) {
+                        Ok(safe_cmd) => {
+                            println!("  → Suggested command (not executed by Arc): {safe_cmd}")
+                        }
                         Err(e) => {
-                            println!("  → Blocked: {e}");
-                            all_safe = false;
+                            println!("  → No command suggestion: {e}");
                         }
                     }
                 } else {
                     println!("  → Recommendation: {containment_recommendation}");
-                    println!("  → Use --enforce to automatically apply containment");
+                    println!("  → Use --show-recommendation to print a command for manual review");
+                }
+                if fail_on_risk {
+                    all_safe = false;
                 }
             }
             SlopsquatVerdict::Permitted { reason } => {
@@ -1329,7 +1368,7 @@ fn run_test(json: bool) -> bool {
         let verdict = fw.inspect_package(Ecosystem::Npm, "reactt", Some(2), Some(10), true);
         verdict.is_blocked()
     };
-    results.push(("Anti-Slopsquatting Package Firewall Gate", package_pass));
+    results.push(("Advisory Package-Name Heuristic", package_pass));
 
     let all_passed = results.iter().all(|(_, p)| *p);
 
@@ -1894,14 +1933,14 @@ fn run_shield_check(
     println!("└────────────────────────────────────────────────────────┘");
     println!("Package:            {package} ({ecosystem})");
     if let (Some(age), Some(dl)) = (age_days, downloads) {
-        println!("Registry Metrics:   Age: {age} days | Monthly Downloads: {dl}");
+        println!("Simulation Inputs:  Age: {age} days | Monthly Downloads: {dl}");
     } else if let Some(age) = age_days {
-        println!("Registry Metrics:   Age: {age} days");
+        println!("Simulation Input:   Age: {age} days");
     } else if let Some(dl) = downloads {
-        println!("Registry Metrics:   Monthly Downloads: {dl}");
+        println!("Simulation Input:   Monthly Downloads: {dl}");
     } else {
         println!(
-            "Registry Metrics:   Pre-install Gate (Automated package baseline & slopsquat check)"
+            "Package Baseline:   Seeded heuristic; live registry metadata not fetched"
         );
     }
     println!("Dangerous Scripts:  {dangerous_scripts}");
@@ -1921,9 +1960,8 @@ fn run_shield_check(
                 println!("\nSUGGESTED ACTION:");
                 if gate == &"CompoundTyposquatGate" {
                     println!("  \u{1F4A1} {act}");
-                    println!(
-                        "  \u{2139}\u{FE0F}  If legitimate: arc shield allow {package} --ecosystem {ecosystem}"
-                    );
+                    println!("  \u{2139}\u{FE0F}  If legitimate, verify it independently and use your approved dependency review process.");
+                    println!("     This CLI has no allowlist command.");
                 } else if gate == &"CompoundLifecycleGate" {
                     println!("  \u{26a0}\u{FE0F}  {act}");
                 } else {
@@ -1940,7 +1978,7 @@ fn run_shield_check(
             println!("Triggered Gate:     {gate}");
             println!("Finding:            {reason}");
             println!("Containment:        {containment_recommendation}");
-            println!("Action:             Use 'arc shield run --enforce {package}' to auto-apply containment");
+            println!("Action:             Review independently; `arc shield run --fail-on-risk -- <package-manager-command>` can gate CI but does not install or contain packages.");
         }
     }
 
@@ -2046,7 +2084,14 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
         }
     };
 
-    let evaluator = PolicyEvaluator::new(PolicyConfig::load_with_precedence(Some(Path::new("."))));
+    let policy = match PolicyConfig::try_load_with_precedence(Some(Path::new("."))) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("[Arc Hook] Policy load failed: {error} (failing closed)");
+            return 2;
+        }
+    };
+    let evaluator = PolicyEvaluator::new(policy);
     if let Err(e) = evaluator.load_session_state(&storage_dir, &session) {
         eprintln!("[Arc Hook] Session state for '{session}' is corrupt or unreadable: {e} (failing closed)");
         return 2;
@@ -2245,6 +2290,44 @@ fn parse_schema_fingerprint(schema_input: Option<&str>) -> Result<Option<[u8; 32
     Err(format!(
         "Invalid schema input '{raw}'. Expected a 64-character hex SHA-256 fingerprint, a path to a JSON schema file, or a valid JSON schema string."
     ))
+}
+
+fn resolve_schema_pin(
+    policy: &PolicyConfig,
+    server: &str,
+    schema_input: Option<&str>,
+    allow_tofu: bool,
+) -> Result<Option<[u8; 32]>, String> {
+    let cli_pin = parse_schema_fingerprint(schema_input)?;
+    if policy.source == Some(arc_policy_engine::evaluator::PolicySource::SignedOrganization) {
+        if allow_tofu {
+            return Err(
+                "--allow-tofu is prohibited when a signed organization policy is active".to_string(),
+            );
+        }
+        let fingerprint = policy.mcp_schema_pins.get(server).ok_or_else(|| {
+            format!("signed organization policy has no schema pin for MCP server '{server}'")
+        })?;
+        let managed_pin = parse_schema_fingerprint(Some(fingerprint))?
+            .ok_or_else(|| format!("signed organization policy pin for '{server}' is empty"))?;
+        if let Some(cli_pin) = cli_pin {
+            if cli_pin != managed_pin {
+                return Err(format!(
+                    "--pin-schema does not match the signed organization pin for '{server}'"
+                ));
+            }
+        }
+        return Ok(Some(managed_pin));
+    }
+
+    match (cli_pin, allow_tofu) {
+        (Some(_), true) => Err("--pin-schema and --allow-tofu cannot be used together".to_string()),
+        (Some(pin), false) => Ok(Some(pin)),
+        (None, true) => Ok(None),
+        (None, false) => Err(
+            "provide --pin-schema, use a signed organization policy pin, or explicitly opt into --allow-tofu for development/bootstrap".to_string(),
+        ),
+    }
 }
 
 pub fn classify_cli_provenance(
@@ -2979,6 +3062,46 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_organization_schema_pin_is_authoritative() {
+        let expected = [0x5au8; 32];
+        let encoded = hex::encode(expected);
+        let mismatched = hex::encode([0x11u8; 32]);
+        let mut policy = PolicyConfig::default();
+        policy.source = Some(arc_policy_engine::evaluator::PolicySource::SignedOrganization);
+        policy
+            .mcp_schema_pins
+            .insert("github".to_string(), encoded.clone());
+
+        assert_eq!(
+            resolve_schema_pin(&policy, "github", None, false).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            resolve_schema_pin(&policy, "github", Some(encoded.as_str()), false).unwrap(),
+            Some(expected)
+        );
+        assert!(resolve_schema_pin(&policy, "github", Some(mismatched.as_str()), false).is_err());
+        assert!(resolve_schema_pin(&policy, "other-server", None, false).is_err());
+        assert!(resolve_schema_pin(&policy, "github", None, true).is_err());
+    }
+
+    #[test]
+    fn unsigned_policy_schema_pin_is_not_a_trust_anchor() {
+        let explicit_pin = hex::encode([0x5au8; 32]);
+        let mut policy = PolicyConfig::default();
+        policy.source = Some(arc_policy_engine::evaluator::PolicySource::ProjectLocal);
+        policy
+            .mcp_schema_pins
+            .insert("github".to_string(), explicit_pin.clone());
+
+        assert!(resolve_schema_pin(&policy, "github", None, false).is_err());
+        assert_eq!(
+            resolve_schema_pin(&policy, "github", Some(explicit_pin.as_str()), false).unwrap(),
+            Some([0x5au8; 32])
+        );
+    }
 
     #[test]
     fn test_cli_audit_execution() {

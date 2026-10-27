@@ -10,6 +10,8 @@ arc-core = { path = "../arc-core" }
 arc-dlp = { path = "../arc-dlp" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_jcs = { workspace = true }
+ring = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

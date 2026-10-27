@@ -22,7 +22,8 @@ mod tests {
     #[test]
     fn test_broker_runtime_schema_capture_and_jcs_fingerprint() {
         let evaluator = PolicyEvaluator::default();
-        let mut broker = McpStdioBroker::new("test-mcp", "sess-broker-test", evaluator);
+        let mut broker = McpStdioBroker::new("test-mcp", "sess-broker-test", evaluator)
+            .allow_schema_tofu();
 
         let server_tools_payload = serde_json::json!({
             "jsonrpc": "2.0",
@@ -62,7 +63,8 @@ mod tests {
             ..Default::default()
         };
         let evaluator = PolicyEvaluator::new(cfg);
-        let mut broker = McpStdioBroker::new("unapproved-rogue", "sess-broker-block", evaluator);
+        let mut broker = McpStdioBroker::new("unapproved-rogue", "sess-broker-block", evaluator)
+            .allow_schema_tofu();
 
         let call_line = serde_json::json!({
             "jsonrpc": "2.0",
@@ -93,7 +95,8 @@ mod tests {
     #[test]
     fn test_broker_dlp_secret_redaction_before_forwarding() {
         let evaluator = PolicyEvaluator::default();
-        let mut broker = McpStdioBroker::new("github", "sess-broker-dlp", evaluator);
+        let mut broker = McpStdioBroker::new("github", "sess-broker-dlp", evaluator)
+            .allow_schema_tofu();
 
         let call_with_secret = serde_json::json!({
             "jsonrpc": "2.0",
@@ -143,7 +146,8 @@ mod tests {
         );
         assert!(evaluator.evaluate(&read).is_allowed());
 
-        let mut broker = McpStdioBroker::new("github", session, evaluator);
+        let mut broker =
+            McpStdioBroker::new("github", session, evaluator).allow_schema_tofu();
 
         // Tool name does not match any legacy `github_issue` literal.
         let call = serde_json::json!({
@@ -207,6 +211,55 @@ mod tests {
     }
 
     #[test]
+    fn test_required_schema_pin_rejects_tofu_and_disables_tool_calls() {
+        let evaluator = PolicyEvaluator::default();
+        let mut broker = McpStdioBroker::new("managed", "sess-required-pin", evaluator)
+            .require_schema_pin();
+
+        let tools = serde_json::json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"tools":[{"name":"calc","inputSchema":{"type":"object"}}]}
+        })
+        .to_string();
+        match broker.handle_server_message(&tools) {
+            ServerMessageOutcome::Forward(line) => {
+                assert!(line.contains("ARC-MCP-003"));
+                assert!(line.contains("No trusted schema pin"));
+            }
+            other => panic!("expected fail-closed pin rejection, got {other:?}"),
+        }
+        assert!(broker.schema_pin_violated);
+
+        let call = serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"calc","arguments":{}}
+        })
+        .to_string();
+        assert!(matches!(
+            broker.handle_client_message(&call),
+            ClientMessageOutcome::RespondLocally(_)
+        ));
+    }
+
+    #[test]
+    fn test_required_schema_pin_blocks_call_before_schema_verification() {
+        let evaluator = PolicyEvaluator::default();
+        let mut broker = McpStdioBroker::new("managed", "sess-pending-pin", evaluator)
+            .with_pinned_schema([7u8; 32])
+            .require_schema_pin();
+        let call = serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"calc","arguments":{}}
+        })
+        .to_string();
+
+        assert!(matches!(
+            broker.handle_client_message(&call),
+            ClientMessageOutcome::RespondLocally(_)
+        ));
+    }
+
+    #[test]
     fn test_claude_code_host_integration_lifecycle() {
         let temp_dir =
             std::env::temp_dir().join(format!("vexa_arc_claude_test_{}", uuid::Uuid::now_v7()));
@@ -254,7 +307,8 @@ mod tests {
         // 3. Status check should report configured
         let status_installed = CursorAdapter::check_integration(&temp_dir);
         assert!(status_installed.is_configured);
-        assert!(!status_installed.bypass_risk);
+        assert!(status_installed.bypass_risk);
+        assert!(status_installed.message.contains("file writes are not intercepted"));
         assert!(status_installed.hook_command.unwrap().contains("arc"));
 
         // 4. Uninstall

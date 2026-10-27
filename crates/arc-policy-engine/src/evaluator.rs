@@ -95,6 +95,8 @@ pub struct PolicyConfig {
     pub allowed_mcp_servers: HashSet<String>,
     #[serde(default)]
     pub allowed_mcp_identities: Vec<McpIdentityRule>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mcp_schema_pins: HashMap<String, String>,
     pub block_unapproved_mcp: bool,
     pub enforce_taint_dag: bool,
     pub redact_secrets: bool,
@@ -117,6 +119,7 @@ impl Default for PolicyConfig {
             source: Some(PolicySource::BuiltInDefault),
             allowed_mcp_servers: allowed,
             allowed_mcp_identities: Vec::new(),
+            mcp_schema_pins: HashMap::new(),
             block_unapproved_mcp: false,
             enforce_taint_dag: true,
             redact_secrets: true,
@@ -126,77 +129,212 @@ impl Default for PolicyConfig {
     }
 }
 
-impl PolicyConfig {
-    /// Reads one policy file. Absent file => `None` silently; unreadable or malformed
-    /// file => `None` with a loud stderr warning (never silently ignored).
-    fn read_policy_file(path: &std::path::Path, source: PolicySource) -> Option<PolicyConfig> {
-        if !path.exists() {
-            return None;
+const POLICY_SIGNATURE_DOMAIN: &[u8] = b"VEXA-ARC-POLICY-V1\0";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPolicyEnvelope {
+    format_version: u32,
+    algorithm: String,
+    key_id: String,
+    sequence: u64,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    payload: serde_json::Value,
+    signature: String,
+}
+
+fn parse_trusted_policy_keys(raw: &str) -> Result<HashMap<String, Vec<u8>>, String> {
+    let mut keys = HashMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+        let (key_id, encoded_key) = entry
+            .split_once(':')
+            .ok_or_else(|| "trusted-key entries must use key-id:hex-public-key".to_string())?;
+        if key_id.is_empty()
+            || !key_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            return Err(format!("invalid trusted policy key id '{key_id}'"));
         }
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("arc: WARNING: cannot read policy {}: {e}", path.display());
-                return None;
-            }
-        };
-        match serde_json::from_str::<PolicyConfig>(&content) {
-            Ok(mut parsed) => {
-                parsed.source = Some(source);
-                Some(parsed)
-            }
-            Err(e) => {
-                eprintln!(
-                    "arc: WARNING: malformed policy {} ignored (defaults apply): {e}",
-                    path.display()
-                );
-                None
-            }
+        let public_key = hex::decode(encoded_key)
+            .map_err(|e| format!("invalid public key for '{key_id}': {e}"))?;
+        if public_key.len() != 32 {
+            return Err(format!(
+                "Ed25519 public key '{key_id}' must be exactly 32 bytes"
+            ));
+        }
+        if keys.insert(key_id.to_string(), public_key).is_some() {
+            return Err(format!("duplicate trusted policy key id '{key_id}'"));
         }
     }
+    if keys.is_empty() {
+        return Err("no trusted policy keys were configured".to_string());
+    }
+    Ok(keys)
+}
 
-    /// Loads policy with documented precedence (FR-CORE-005):
-    /// BuiltInDefault < UserGlobal (~/.arc/policy.json) < ProjectLocal (.arc/policy.json) < SignedOrganization
-    pub fn load_with_precedence(project_dir: Option<&std::path::Path>) -> Self {
+fn parse_signed_policy(
+    content: &str,
+    trusted_keys: &HashMap<String, Vec<u8>>,
+    minimum_sequence: u64,
+    now_unix_ms: u64,
+) -> Result<PolicyConfig, String> {
+    let envelope: SignedPolicyEnvelope = serde_json::from_str(content)
+        .map_err(|e| format!("invalid signed policy envelope: {e}"))?;
+    if envelope.format_version != 1 || envelope.algorithm != "Ed25519" {
+        return Err("unsupported signed policy format or signature algorithm".to_string());
+    }
+    let public_key = trusted_keys
+        .get(&envelope.key_id)
+        .ok_or_else(|| format!("policy key id '{}' is not trusted", envelope.key_id))?;
+    if envelope.sequence < minimum_sequence {
+        return Err(format!(
+            "signed policy sequence {} is below the managed minimum {}",
+            envelope.sequence, minimum_sequence
+        ));
+    }
+    if envelope.issued_at_unix_ms > now_unix_ms.saturating_add(300_000) {
+        return Err("signed policy issue time is more than five minutes in the future".to_string());
+    }
+    if envelope.expires_at_unix_ms <= envelope.issued_at_unix_ms
+        || envelope.expires_at_unix_ms <= now_unix_ms
+    {
+        return Err("signed policy is expired or has an invalid validity interval".to_string());
+    }
+    let signature = hex::decode(&envelope.signature)
+        .map_err(|e| format!("policy signature is not valid hex: {e}"))?;
+    if signature.len() != 64 {
+        return Err("Ed25519 policy signature must be exactly 64 bytes".to_string());
+    }
+
+    let signed_document = serde_json::json!({
+        "format_version": envelope.format_version,
+        "algorithm": &envelope.algorithm,
+        "key_id": &envelope.key_id,
+        "sequence": envelope.sequence,
+        "issued_at_unix_ms": envelope.issued_at_unix_ms,
+        "expires_at_unix_ms": envelope.expires_at_unix_ms,
+        "payload": &envelope.payload
+    });
+    let canonical_document = serde_jcs::to_vec(&signed_document)
+        .map_err(|e| format!("cannot canonicalize signed policy document: {e}"))?;
+    let mut signed_bytes = POLICY_SIGNATURE_DOMAIN.to_vec();
+    signed_bytes.extend_from_slice(&canonical_document);
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+        .verify(&signed_bytes, &signature)
+        .map_err(|_| "organization policy signature verification failed".to_string())?;
+
+    let mut policy: PolicyConfig = serde_json::from_value(envelope.payload)
+        .map_err(|e| format!("signed policy payload has an invalid policy schema: {e}"))?;
+    for (server, fingerprint) in &policy.mcp_schema_pins {
+        if server.trim().is_empty() || server.trim() != server.as_str() {
+            return Err("signed MCP schema pin server names must be non-empty and trimmed".to_string());
+        }
+        let bytes = hex::decode(fingerprint).map_err(|e| {
+            format!("signed MCP schema pin for '{server}' is not valid hexadecimal: {e}")
+        })?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "signed MCP schema pin for '{server}' must contain exactly 32 bytes"
+            ));
+        }
+    }
+    policy.source = Some(PolicySource::SignedOrganization);
+    Ok(policy)
+}
+
+impl PolicyConfig {
+    fn read_policy_file(
+        path: &std::path::Path,
+        source: PolicySource,
+    ) -> Result<Option<PolicyConfig>, String> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read policy {}: {e}", path.display()))?;
+        let mut parsed: PolicyConfig = serde_json::from_str(&content)
+            .map_err(|e| format!("malformed policy {}: {e}", path.display()))?;
+        parsed.source = Some(source);
+        // Local project/user files are not trust anchors for MCP schema hashes.
+        parsed.mcp_schema_pins.clear();
+        Ok(Some(parsed))
+    }
+
+    fn read_signed_policy_file(path: &std::path::Path) -> Result<Option<PolicyConfig>, String> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let trusted_keys = std::env::var("ARC_POLICY_TRUSTED_PUBLIC_KEYS").map_err(|_| {
+            "ARC_POLICY_TRUSTED_PUBLIC_KEYS is required to load .arc/signed_policy.json"
+                .to_string()
+        })?;
+        let trusted_keys = parse_trusted_policy_keys(&trusted_keys)?;
+        let minimum_sequence = std::env::var("ARC_POLICY_MIN_SEQUENCE")
+            .map_err(|_| {
+                "ARC_POLICY_MIN_SEQUENCE is required to prevent signed-policy rollback".to_string()
+            })?
+            .parse::<u64>()
+            .map_err(|e| format!("ARC_POLICY_MIN_SEQUENCE must be an unsigned integer: {e}"))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read signed policy {}: {e}", path.display()))?;
+        let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        parse_signed_policy(&content, &trusted_keys, minimum_sequence, now_unix_ms).map(Some)
+    }
+
+    /// Loads policy with documented precedence. Errors are returned rather than silently ignored.
+    /// A signed organization policy requires an Ed25519 trust store in
+    /// `ARC_POLICY_TRUSTED_PUBLIC_KEYS` (`key-id:hex-public-key` entries, comma separated).
+    pub fn try_load_with_precedence(
+        project_dir: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
         let mut effective = Self::default();
 
-        // 1. Check user global path (~/.arc/policy.json)
         if let Some(user_home) = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(std::path::PathBuf::from)
         {
             let user_cfg = user_home.join(".arc").join("policy.json");
-            if let Some(parsed) = Self::read_policy_file(&user_cfg, PolicySource::UserGlobal) {
+            if let Some(parsed) = Self::read_policy_file(&user_cfg, PolicySource::UserGlobal)? {
                 effective.merge_lower_precedence(parsed);
             }
         }
 
-        // 2. Check project local path (.arc/policy.json or .arc.json)
         if let Some(dir) = project_dir {
             let candidate_paths = [dir.join(".arc").join("policy.json"), dir.join(".arc.json")];
             for path in &candidate_paths {
-                if let Some(parsed) = Self::read_policy_file(path, PolicySource::ProjectLocal) {
+                if let Some(parsed) = Self::read_policy_file(path, PolicySource::ProjectLocal)? {
                     effective.merge_lower_precedence(parsed);
                     break;
                 }
             }
 
-            // 3. Check organization policy (.arc/signed_policy.json)
-            // NOTE: no signature verification is implemented; this file lives in the
-            // project directory and is trusted only as much as the directory itself.
             let org_path = dir.join(".arc").join("signed_policy.json");
-            if let Some(parsed) =
-                Self::read_policy_file(&org_path, PolicySource::SignedOrganization)
-            {
-                eprintln!(
-                    "arc: WARNING: {} is NOT cryptographically verified; treat as unsigned",
-                    org_path.display()
-                );
+            if let Some(parsed) = Self::read_signed_policy_file(&org_path)? {
                 effective.merge_lower_precedence(parsed);
             }
         }
 
-        effective
+        Ok(effective)
+    }
+
+    /// Compatibility loader. On any policy-read or signature error, returns a restrictive
+    /// MCP-deny configuration; security-sensitive callers should prefer the fallible API.
+    pub fn load_with_precedence(project_dir: Option<&std::path::Path>) -> Self {
+        match Self::try_load_with_precedence(project_dir) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!(
+                    "arc: ERROR: policy load failed; applying restrictive MCP fallback: {error}"
+                );
+                let mut fallback = Self::default();
+                fallback.allowed_mcp_servers.clear();
+                fallback.block_unapproved_mcp = true;
+                fallback.source = Some(PolicySource::EmergencyDeny);
+                fallback
+            }
+        }
     }
 
     /// Merges higher precedence config over current config, preserving emergency deny rules
@@ -206,6 +344,9 @@ impl PolicyConfig {
         self.block_unapproved_mcp = higher.block_unapproved_mcp;
         self.enforce_taint_dag = higher.enforce_taint_dag;
         self.redact_secrets = higher.redact_secrets;
+        if higher.source == Some(PolicySource::SignedOrganization) {
+            self.mcp_schema_pins = higher.mcp_schema_pins;
+        }
 
         // Emergency deny rules cannot be removed by local policy
         for s in higher.emergency_deny_servers {
@@ -238,8 +379,8 @@ impl PolicyConfig {
         }
     }
 
-    /// Loads a policy configuration from an optional project directory (.arc/policy.json or .arc.json)
-    /// Falling back to the default configuration if the file does not exist.
+    /// Loads policy from the project directory; absent files use defaults, invalid files use the
+    /// compatibility loader's restrictive MCP-deny fallback.
     pub fn load_from_dir(dir: &std::path::Path) -> Self {
         Self::load_with_precedence(Some(dir))
     }
@@ -568,6 +709,54 @@ mod tests {
     use super::*;
     use arc_core::event::{Action, AgentHost, Artifact, OsPrincipal, Phase, ServerIdentity};
     use std::path::PathBuf;
+
+    #[test]
+    fn unsigned_policy_file_cannot_supply_schema_pins() {
+        let dir = std::env::temp_dir().join(format!("arc_policy_pin_test_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.json");
+        let mut policy = PolicyConfig::default();
+        policy
+            .mcp_schema_pins
+            .insert("github".to_string(), hex::encode([0x5au8; 32]));
+        std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+
+        let loaded = PolicyConfig::read_policy_file(&path, PolicySource::ProjectLocal)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.mcp_schema_pins.is_empty());
+        assert_eq!(loaded.source, Some(PolicySource::ProjectLocal));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_signed_organization_policy_pins_survive_precedence_merge() {
+        let mut effective = PolicyConfig::default();
+        let mut local = PolicyConfig::default();
+        local.source = Some(PolicySource::ProjectLocal);
+        local
+            .mcp_schema_pins
+            .insert("github".to_string(), hex::encode([1u8; 32]));
+        effective.merge_lower_precedence(local);
+        assert!(effective.mcp_schema_pins.is_empty());
+
+        let mut signed = PolicyConfig::default();
+        signed.source = Some(PolicySource::SignedOrganization);
+        let expected_pin = hex::encode([2u8; 32]);
+        signed
+            .mcp_schema_pins
+            .insert("github".to_string(), expected_pin.clone());
+        effective.merge_lower_precedence(signed);
+        assert_eq!(effective.mcp_schema_pins.get("github"), Some(&expected_pin));
+
+        let mut emergency = PolicyConfig::default();
+        emergency.source = Some(PolicySource::EmergencyDeny);
+        emergency
+            .emergency_deny_servers
+            .insert("rogue".to_string());
+        effective.merge_lower_precedence(emergency);
+        assert_eq!(effective.mcp_schema_pins.get("github"), Some(&expected_pin));
+    }
 
     #[test]
     fn test_evaluator_unapproved_mcp_block() {
@@ -1094,5 +1283,69 @@ mod tests {
         if let Verdict::Deny { rule, .. } = v_curl {
             assert_eq!(rule.0, "ARC-LTT-001");
         }
+    }
+
+    #[test]
+    fn signed_policy_accepts_valid_ed25519_signature_and_rejects_tampering() {
+        use ring::signature::KeyPair;
+
+        let key_pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[42u8; 32]).unwrap();
+        let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let payload = serde_json::json!({
+            "version": "1.0.0",
+            "allowed_mcp_servers": ["github"],
+            "mcp_schema_pins": {"github": hex::encode([9u8; 32])},
+            "block_unapproved_mcp": true,
+            "enforce_taint_dag": true,
+            "redact_secrets": true
+        });
+        let mut envelope = serde_json::json!({
+            "format_version": 1,
+            "algorithm": "Ed25519",
+            "key_id": "test-key",
+            "sequence": 7,
+            "issued_at_unix_ms": now_unix_ms.saturating_sub(1_000),
+            "expires_at_unix_ms": now_unix_ms.saturating_add(60_000),
+            "payload": payload
+        });
+        let canonical = serde_jcs::to_vec(&envelope).unwrap();
+        let mut signed_bytes = POLICY_SIGNATURE_DOMAIN.to_vec();
+        signed_bytes.extend_from_slice(&canonical);
+        let signature = hex::encode(key_pair.sign(&signed_bytes).as_ref());
+        envelope["signature"] = serde_json::json!(signature);
+        let mut trusted_keys = HashMap::new();
+        trusted_keys.insert("test-key".to_string(), key_pair.public_key().as_ref().to_vec());
+
+        let policy =
+            parse_signed_policy(&envelope.to_string(), &trusted_keys, 7, now_unix_ms).unwrap();
+        assert_eq!(policy.source, Some(PolicySource::SignedOrganization));
+        assert!(policy.block_unapproved_mcp);
+        assert_eq!(policy.mcp_schema_pins.get("github"), Some(&hex::encode([9u8; 32])));
+        assert!(
+            parse_signed_policy(&envelope.to_string(), &trusted_keys, 8, now_unix_ms).is_err()
+        );
+        assert!(parse_signed_policy(
+            &envelope.to_string(),
+            &trusted_keys,
+            7,
+            now_unix_ms.saturating_add(60_001)
+        )
+        .is_err());
+
+        let mut tampered_sequence = envelope.clone();
+        tampered_sequence["sequence"] = serde_json::json!(8);
+        assert!(parse_signed_policy(
+            &tampered_sequence.to_string(),
+            &trusted_keys,
+            7,
+            now_unix_ms
+        )
+        .is_err());
+
+        let mut tampered = envelope;
+        tampered["payload"]["allowed_mcp_servers"] = serde_json::json!(["attacker-mcp"]);
+        assert!(
+            parse_signed_policy(&tampered.to_string(), &trusted_keys, 7, now_unix_ms).is_err()
+        );
     }
 }

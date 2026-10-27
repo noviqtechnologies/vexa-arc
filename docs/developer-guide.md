@@ -23,6 +23,7 @@ Welcome to the **Vexa Arc (Agentic Runtime Control)** Developer Guide. This docu
 8. [Host Adapters & MCP JSON-RPC Interceptors (`arc-hooks`)](#8-host-adapters--mcp-json-rpc-interceptors-arc-hooks)
 9. [CLI Binary (`arc-cli`)](#9-cli-binary-arc-cli)
 10. [Development, Testing & Extension Points](#10-development-testing--extension-points)
+11. [Community, Team & Enterprise Roadmap](#11-community-team--enterprise-roadmap)
     - [Adding a New Secret Detector](#adding-a-new-secret-detector)
     - [Adding a New Package Ecosystem](#adding-a-new-package-ecosystem)
     - [Adding a New Host Adapter](#adding-a-new-host-adapter)
@@ -32,10 +33,10 @@ Welcome to the **Vexa Arc (Agentic Runtime Control)** Developer Guide. This docu
 
 ## 1. Architecture Principles & System Blueprint
 
-Vexa Arc operates under three core engineering invariants:
-1. **The Pre-Execution Inversion:** Security enforcement must occur *pre-execution* on the developer endpoint and in CI, before malicious shell scripts or indirect prompt injections reach disk or execute.
-2. **Sub-Millisecond Latency Budget:** All in-memory evaluations, regex prefiltering, and taint checking must meet $p_{99} < 3.5\text{ ms}$ budgets to guarantee zero perceived developer friction.
-3. **Zero Network Egress Invariant:** All discovery, parsing, DLP pattern matching, and taint tracking occur entirely in-process without network transmissions.
+The following are engineering goals, not universal or independently validated guarantees:
+1. **Pre-Execution on Mediated Paths:** Configured host hooks and `arc protect stdio` evaluate selected actions before forwarding/execution; direct or unsupported paths are not intercepted.
+2. **Latency Target:** A historical in-memory target is $p_{99} < 3.5\text{ ms}$, but full hook/broker latency and developer workflow impact still require reproducible measurements.
+3. **Local Processing With Network Exceptions:** Local discovery, parsing, DLP matching, and taint tracking execute on-host. Exact-version OSV queries and explicitly launched MCP servers may use network access.
 
 ```mermaid
 flowchart TB
@@ -244,7 +245,33 @@ Projects can customize runtime governance by placing `.arc/policy.json` or `.arc
   "redact_secrets": true
 }
 ```
-`PolicyConfig::load_from_dir(&Path)` automatically resolves project-level configurations, falling back to defaults if omitted.
+`PolicyConfig::try_load_with_precedence(Some(&path))` applies BuiltIn < UserGlobal < ProjectLocal < SignedOrganization precedence and returns an error for unreadable/malformed files. Security-sensitive CLI paths abort rather than silently using defaults. The compatibility `load_with_precedence` wrapper uses a restrictive MCP-deny fallback on errors.
+
+### Signed Organization Policy (Ed25519)
+
+`.arc/signed_policy.json` is accepted only when its Ed25519 signature verifies against a trusted key from `ARC_POLICY_TRUSTED_PUBLIC_KEYS` and its sequence meets `ARC_POLICY_MIN_SEQUENCE`. Provide one or more comma-separated `key-id:64-hex-character-public-key` entries and a managed minimum sequence through environment configuration. Multiple key IDs allow overlap during key rotation; remove revoked keys from the trust list. The public key is 32 bytes and the signature is 64 bytes.
+
+```json
+{
+  "format_version": 1,
+  "algorithm": "Ed25519",
+  "key_id": "org-2026-q4",
+  "sequence": 42,
+  "issued_at_unix_ms": 1793100000000,
+  "expires_at_unix_ms": 1793704800000,
+  "payload": {
+    "version": "1.0.0",
+    "allowed_mcp_servers": ["github"],
+    "mcp_schema_pins": {"github": "<64-hex-character-JCS-SHA256>"},
+    "block_unapproved_mcp": true,
+    "enforce_taint_dag": true,
+    "redact_secrets": true
+  },
+  "signature": "<128-hex-character-signature>"
+}
+```
+
+The signature covers the bytes `VEXA-ARC-POLICY-V1`, followed by one NUL byte and then the RFC 8785 JCS serialization of the envelope fields other than `signature`. `mcp_schema_pins` is a map from exact MCP server configuration name to a 64-hex-character SHA-256 JCS fingerprint. Only a verified signed organization policy can supply these pins; user/project `policy.json` entries are discarded as untrusted, CLI pins cannot override a signed pin, and a signed policy with no pin for the requested server fails closed. The managed minimum sequence blocks replay of older signed policies; expiry and a five-minute future-clock tolerance are enforced. An unknown key, missing trust list/sequence, malformed envelope, expired policy, stale sequence, or invalid signature is an error; the CLI fails closed. Arc does not include a private-key signing utility: generate and sign policy through your controlled KMS/HSM or offline signing workflow, and protect the trust-list and minimum-sequence environment from project-controlled changes.
 
 ### Why a Directed Acyclic Graph (DAG)?
 
@@ -286,15 +313,11 @@ pub struct SessionTaintDag {
 
 ---
 
-## 7. Dependency Firewall & Compound Anti-Slopsquatting (`arc-firewall`)
+## 7. Package Heuristics & OSV Scanner (`arc-firewall`)
 
-The 4-gate compound scoring engine (`CompoundAntiSlopsquatEngine`):
-1. **Dangerous Lifecycle Gate:** Blocks newly registered packages attempting execution in `preinstall`/`postinstall`/`setup.py`.
-2. **Phantom Watchlist Gate:** Blocks packages on hallucination / recent 404 watchlists.
-3. **Typosquat Gate:** Blocks packages with Levenshtein $\le 2$ or Jaro-Winkler $\ge 0.92$ against top popular packages.
-4. **Provenance Gate:** Blocks packages lacking active repository history ($0$ stars, $0$ commits).
+`CompoundAntiSlopsquatEngine` evaluates a `PackageRegistryMetadata` value supplied by its caller. The current CLI does not obtain authoritative lifecycle, registry age/download, repository provenance, or recent-404 observations from a registry proxy. Its default popular-package baseline is seeded/heuristic data, not proof of package identity or safety. The implementation now scopes built-in names to ecosystems, case-normalizes typo comparisons, blocks caller-reported dangerous lifecycle signals before any fast path, and returns REVIEW for low-history packages lacking SLSA provenance. These are still only as trustworthy as caller-supplied metadata; they must not be described as live registry enforcement.
 
-Package command interceptors (`PackageFirewall::parse_command`) support:
+`PackageFirewall::parse_command` extracts candidate names from command text for evaluation; it does not invoke, wrap, or intercept the corresponding package manager. Supported command forms include:
 - `npm install`, `npm i`, `npm add`
 - `pnpm add`, `pnpm install`
 - `yarn add`
@@ -303,16 +326,16 @@ Package command interceptors (`PackageFirewall::parse_command`) support:
 - `cargo add`
 - `go get`
 
-### OSV/EPSS Integration (`OsvPackageScanner`) — FR-PKG-005 & FR-PKG-006
+### Exact-Version OSV Integration (`OsvPackageScanner`) — FR-PKG-005 & FR-PKG-006
 
 [`crates/arc-firewall/src/osv_scanner.rs`](file:///c:/vexa-arc/crates/arc-firewall/src/osv_scanner.rs) provides `OsvPackageScanner`:
 
 ```rust
-let scanner = OsvPackageScanner::default(); // uses .sca-cache by default
+let scanner = OsvPackageScanner::default(); // local .sca-cache; not an install hook
 let result = scanner.scan_package("lodash", "4.17.15", "npm")?;
 
 if result.should_block() {
-    // FR-PKG-006: structured JSON-RPC error
+    // Scanner result for the caller to handle; this does not block an install by itself.
     let error_json = result.aggregate_jsonrpc_error();
     // {"error": "Vulnerable package lodash@4.17.15; update constraint to >=4.17.21",
     //  "rule_id": "ARC-SCA-001", "severity": "HIGH", ...}
@@ -347,9 +370,9 @@ pub trait HostAdapter: Send + Sync {
 - **`CursorAdapter`**: Manages `.cursor/hooks.json` hook configurations with explicit `failClosed: true` enforcement (`beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`, and `afterMCPExecution`). Decodes payload arguments, commands, paths, and tool outputs, mapping verdicts to Cursor-native permissions (`allow`, `deny`, `ask`).
 - **`host_config` helpers**: Provides atomic, non-destructive JSON upsert and deletion routines (`read_json_object`, `write_json_atomic`, `upsert_event_entry`) guaranteeing user-configured third-party hooks are preserved.
 - **`McpJsonRpcInterceptor`**: Decodes standard MCP JSON-RPC requests, extracts RFC 8785 canonical schema fingerprints, and produces compliant `isError: true` JSON-RPC error responses with remediation options.
-- **`McpStdioBroker`**: A managed stdio supervisor proxying child process stdin/stdout, enforcing pre-execution allow-list rules, outbound DLP secret redaction, initial and runtime schema pin verification (`--pin-schema`), and bidirectional taint tracking.
+- **`McpStdioBroker`**: A stdio supervisor proxying an explicitly launched child process stdin/stdout, enforcing pre-execution policy, supported outbound DLP redaction, schema-pin verification, and bidirectional taint tracking. The broker API requires a schema pin by default. The CLI can obtain the authoritative pin from verified `.arc/signed_policy.json`; unsigned local policy cannot supply pins, and a supplied CLI pin must match the signed value. `--allow-tofu` is development-only and rejected when signed organization policy is active. This wrapper does not prevent direct/unwrapped MCP launches.
 
-### OS-Level Process Containment (`OsProcessSupervisor`) — FR-HOOKS-003
+### Process-Lifecycle Controls (`OsProcessSupervisor`) — FR-HOOKS-003
 
 [`crates/arc-hooks/src/process_containment.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/process_containment.rs) provides `OsProcessSupervisor` which is used by `McpStdioBroker::run_stdio` and `arc protect stdio` before child processes execute any user code:
 
@@ -362,9 +385,9 @@ let mut child = supervisor.spawn(&mut cmd)?;
 
 | Target | Implementation | Guarantee |
 | :--- | :--- | :--- |
-| `cfg(windows)` | `CreateProcess(CREATE_SUSPENDED)` + `AssignProcessToJobObject` + `NtResumeProcess` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` & optional job memory limits | Eliminates post-launch race windows; child and descendants terminate immediately when Job handle closes |
-| `cfg(target_os = "linux")` | `cmd.process_group(0)` + `pre_exec(prctl(PR_SET_PDEATHSIG, SIGKILL))` with parent PID race verification + `setrlimit(RLIMIT_AS)` | Kernel terminates child if parent dies; memory address space is strictly bounded |
-| `cfg(unix)` (macOS, BSD) | `cmd.process_group(0)` — dedicated process group reaped via `kill(-pgid, SIGKILL)` on Drop | Entire process subtree is reaped on exit or supervisor drop |
+| `cfg(windows)` | `CreateProcess(CREATE_SUSPENDED)` + `AssignProcessToJobObject` + `NtResumeProcess` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` & optional job memory limits | Child is assigned before resume; closing the Job handle terminates assigned processes. This is not a syscall/filesystem/network sandbox. |
+| `cfg(target_os = "linux")` | `cmd.process_group(0)` + `pre_exec(prctl(PR_SET_PDEATHSIG, SIGKILL))` with parent PID race verification + `setrlimit(RLIMIT_AS)` | PDEATHSIG targets the direct child; process-group cleanup runs during supervisor teardown; `RLIMIT_AS` is per-process. Descendants after a hard parent crash are not universally covered. |
+| `cfg(unix)` (macOS, BSD) | `cmd.process_group(0)` — process-group cleanup via `kill(-pgid, SIGKILL)` on Drop | Orderly teardown can kill the process group; hard-parent-crash, detached-child, and orphan behavior is not guaranteed. |
 
 ---
 
@@ -382,8 +405,8 @@ The root binary tying the subsystems together with `clap`.
 | **Export CycloneDX BOM** | `PS C:\vexa-arc\target\release> .\arc.exe bom --path . --out bom.json` | `arc bom --path . --out bom.json` |
 | **Scan Directory Secrets** | `PS C:\vexa-arc\target\release> .\arc.exe scan-secrets --path .\src` | `arc scan-secrets --path ./src` |
 | **Scan Piped Stdin** | `Get-Content log.txt \| .\arc.exe scan-secrets --redact` | `cat log.txt \| arc scan-secrets --redact` |
-| **Shield Firewall Check** | `PS C:\vexa-arc\target\release> .\arc.exe shield check reactt` | `arc shield check reactt` |
-| **Shield Containment Run** | `PS C:\vexa-arc\target\release> .\arc.exe shield run --enforce npm i express` | `arc shield run --enforce npm i express` |
+| **Shield Advisory Check** | `PS C:\vexa-arc\target\release> .\arc.exe shield check reactt` | `arc shield check reactt` |
+| **Shield Advisory Run** | `PS C:\vexa-arc\target\release> .\arc.exe shield run --fail-on-risk -- npm i express` | `arc shield run --fail-on-risk -- npm i express` |
 | **Host Integration** | `PS C:\vexa-arc\target\release> .\arc.exe host install --host claude-code` | `arc host install --host claude-code` |
 | **Diagnostics & Metrics** | `PS C:\vexa-arc\target\release> .\arc.exe doctor --metrics` | `arc doctor --metrics` |
 | **Trace & Export Evidence** | `PS C:\vexa-arc\target\release> .\arc.exe trace latest --export trace.json` | `arc trace latest --export trace.json` |
@@ -403,7 +426,7 @@ The root binary tying the subsystems together with `clap`.
 
 1. Add the ecosystem variant to `Ecosystem` in [`crates/arc-core/src/event.rs`](file:///c:/vexa-arc/crates/arc-core/src/event.rs).
 2. Extend CLI command parsing in `PackageFirewall::parse_command()` in [`crates/arc-firewall/src/proxy.rs`](file:///c:/vexa-arc/crates/arc-firewall/src/proxy.rs).
-3. Implement containment shimming (`--ignore-scripts` injection) in `PackageFirewall::enforce_containment()`.
+3. Implement a real install interception point and verified metadata feed; `PackageFirewall::suggest_safer_command()` only returns output for manual review.
 
 ### Adding a New Host Adapter
 
@@ -413,21 +436,19 @@ The root binary tying the subsystems together with `clap`.
 
 ### Running Tests & Verification Suite
 
-Vexa Arc maintains an automated test suite across all 7 workspace crates:
+The workspace contains unit and integration tests across its crates. Do not cite a fixed test count or claim passing results without checking the current checkout and CI. The Rust toolchain was unavailable during the current source review, so execution results remain pending.
 
 ```bash
-# Run all workspace unit and integration tests (82 tests):
-cargo test --workspace
+# Run all workspace unit and integration tests
+cargo test --workspace --locked
 
 # Run integration tests specifically:
-cargo test --test integration_tests
+cargo test --test integration_tests --locked
 
-# Run latency benchmark suite:
-cargo test --test integration_tests test_complete_path_latency_benchmark -- --nocapture
-
-# Validate code formatting and zero-warning linting:
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
+# Validate code formatting, locked build, and zero-warning linting:
+cargo fmt --all -- --check
+cargo build --workspace --release --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 ### Building & Running Tests Across Operating Systems
@@ -435,25 +456,53 @@ cargo clippy --workspace -- -D warnings
 #### Windows (PowerShell)
 ```powershell
 # Build workspace in release mode
-PS C:\vexa-arc> cargo build --release
+PS C:\vexa-arc> cargo build --workspace --release --locked
 PS C:\vexa-arc\target\release> .\arc.exe --version
 
-# Run all unit tests across the 7 crates
-PS C:\vexa-arc> cargo test --workspace
+# Run all workspace unit tests
+PS C:\vexa-arc> cargo test --workspace --locked
 
 # Run integration tests specifically
-PS C:\vexa-arc> cargo test --test integration_tests
+PS C:\vexa-arc> cargo test --test integration_tests --locked
 ```
 
 #### Linux & macOS (Bash / Zsh)
 ```bash
 # Build workspace in release mode
-cargo build --release
+cargo build --workspace --release --locked
 ./target/release/arc --version
 
-# Run all unit tests across the 7 crates
-cargo test --workspace
+# Run all workspace unit tests
+cargo test --workspace --locked
 
 # Run integration tests specifically
-cargo test --test integration_tests
+cargo test --test integration_tests --locked
 ```
+
+## 11. Community, Team & Enterprise Roadmap
+
+This is an implementation direction, not an availability or pricing commitment. The next intended release is **Community only**, and it is conditional on passing its published build, CI, smoke-test, and artifact gates. Team and Enterprise are not shipping capabilities. The exact release-facing comparison is in [Product Tiers](product-tiers.md); scope and release gates are in [Community Release Scope](community-release-scope.md).
+
+### Community — local-first single developer
+
+Keep the CLI/library useful without a Vexa-hosted dependency. Community covers selected Claude Code/Cursor hook events, explicit MCP stdio brokering, user-controlled schema pins or clearly labeled local development TOFU, observed-event heuristics, local secret scanning, and advisory package checks. Do not represent these as universal mediation, complete taint/DLP, install-time package enforcement, or sandboxing. Cursor direct editor writes, unwrapped MCP transports, and direct network clients remain outside the documented boundary.
+
+### Team — planned, not implemented
+
+The lowest-risk first Team increment is collaborative policy in Git: versioned project policy and MCP schema baselines, code review/ownership, CI templates, and deterministic machine-readable output for supported checks. Add team user/role concepts only when required by actual customers. Do not begin with a cloud console, central policy service, or fleet agent until evidence shows Git and CI are insufficient. Team behavior must remain additive and must not change Community's local decision semantics silently.
+
+Candidate engineering seams are:
+
+- Keep the normalized event/verdict and policy formats versioned, document compatibility, and add migration tests before fields become shared policy contracts.
+- Define policy loading behind a narrow provider interface (local defaults, user/project files, later remote provider) while retaining explicit precedence and fail behavior. Remote policy must not be implicit in Community.
+- Keep MCP schema pin files serializable, reviewable, and portable. Shared pin changes should produce diffs and require ordinary repository review; do not label unsigned Git data as an authenticated enterprise trust root.
+- Emit stable, redacted CLI/CI result formats only after defining schema versions and privacy rules. A CI nonzero status is a pipeline decision, not an endpoint install interceptor.
+- Provide dry-run/observe modes, diagnostics, and clear source attribution before any shared deny policy becomes a team default.
+
+### Enterprise — future, not implemented
+
+Enterprise is a separate managed-service and endpoint-operations problem. Before offering it, design and build authenticated tenant identity and authorization, signed policy distribution, key rotation/revocation, rollback/replay protection, endpoint inventory and version health, audit/privacy/retention controls, support and incident response, upgrade/rollback operations, and any SIEM/remote MCP integrations. Threat-model service compromise and control-plane outages. Demonstrate that expired, missing, malformed, or unavailable remote policy cannot silently weaken a device's declared local policy. Require red-team and multi-platform pilot evidence before claiming enforcement.
+
+### Tier implementation rule
+
+Do not split the core security logic into artificially weaker paid/free variants. Keep the local engine and basic protections available in Community; future paid value should come from coordination, administration, validated integrations, fleet operations, auditability, and support. Keep the tier-to-code boundary in adapters/services rather than embedding pricing checks in policy evaluation. Any proposed closed component requires a documented threat model, license/open-core decision, and compatibility contract before implementation.

@@ -17,6 +17,19 @@ use crate::process_containment::{ContainmentLimits, OsProcessSupervisor};
 /// Upper bound on in-flight `tools/call` requests tracked for result taint attribution.
 const MAX_PENDING_CALLS: usize = 4096;
 
+fn command_fingerprint(command: &[String]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"VEXA-ARC-MCP-COMMAND-ARGV\0v1");
+    for part in command {
+        let bytes = part.as_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    hasher.finalize().into()
+}
+
 #[derive(Debug, Error)]
 pub enum BrokerError {
     #[error("Failed to spawn child MCP server: {0}")]
@@ -65,6 +78,8 @@ pub struct McpStdioBroker {
     pub secrets_redacted: usize,
     /// When set, the first (and every later) `tools/list` schema must hash to this value.
     pub pinned_schema_hash: Option<[u8; 32]>,
+    /// When true, a trusted pin is mandatory and TOFU is not accepted.
+    schema_pin_required: bool,
     /// Set once a `tools/list` response failed the pin check; all tool calls are then denied.
     pub schema_pin_violated: bool,
     pub limits: ContainmentLimits,
@@ -89,6 +104,7 @@ impl McpStdioBroker {
             requests_blocked: 0,
             secrets_redacted: 0,
             pinned_schema_hash: None,
+            schema_pin_required: true,
             schema_pin_violated: false,
             limits: ContainmentLimits::default(),
             pending_calls: HashMap::new(),
@@ -109,6 +125,18 @@ impl McpStdioBroker {
     /// initial schema; without it the first observed schema is simply trusted-on-first-use).
     pub fn with_pinned_schema(mut self, hash: [u8; 32]) -> Self {
         self.pinned_schema_hash = Some(hash);
+        self
+    }
+
+    /// Requires an externally provisioned schema pin; the first observed schema is not trusted.
+    pub fn require_schema_pin(mut self) -> Self {
+        self.schema_pin_required = true;
+        self
+    }
+
+    /// Explicitly enables trust-on-first-use for controlled development/bootstrap only.
+    pub fn allow_schema_tofu(mut self) -> Self {
+        self.schema_pin_required = false;
         self
     }
 
@@ -156,13 +184,15 @@ impl McpStdioBroker {
 
         match method {
             Some("tools/call") => {
-                if self.schema_pin_violated {
+                if self.schema_pin_violated
+                    || (self.schema_pin_required && self.current_schema_hash.is_none())
+                {
                     self.requests_blocked += 1;
                     let verdict = Self::deny_verdict(
                         "ARC-MCP-003",
                         format!(
-                            "MCP server '{}' presented a tool schema that does not match the pinned hash; tool calls are disabled.",
-                            self.server_name
+                            "MCP server '{}' cannot be used because its schema has not passed a trusted pin check; tool calls are disabled.",
+                            self.server_name,
                         ),
                         vec![
                             "Verify the server binary/version and update the pinned schema hash."
@@ -187,13 +217,8 @@ impl McpStdioBroker {
                 let caps = Capability::infer(&tool_name, false, false, false);
 
                 let artifact = if !self.command.is_empty() {
-                    use sha2::{Digest, Sha256};
-                    let mut hasher = Sha256::new();
-                    for part in &self.command {
-                        hasher.update(part.as_bytes());
-                    }
                     Artifact::Local {
-                        command_sha256: hasher.finalize().into(),
+                        command_sha256: command_fingerprint(&self.command),
                     }
                 } else {
                     Artifact::Unknown
@@ -310,6 +335,24 @@ impl McpStdioBroker {
 
         // Check for tools/list response
         if let Some(tools) = parsed.get("result").and_then(|r| r.get("tools")) {
+            if self.schema_pin_required && self.pinned_schema_hash.is_none() {
+                self.schema_pin_violated = true;
+                self.requests_blocked += 1;
+                let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+                let err = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32001,
+                        "message": format!(
+                            "[ARC-MCP-003] No trusted schema pin is configured for MCP server '{}'; refusing TOFU.",
+                            self.server_name
+                        )
+                    }
+                });
+                return ServerMessageOutcome::Forward(err.to_string());
+            }
+
             if let Ok(tools_bytes) = serde_json::to_vec(tools) {
                 if let Ok(hash) = arc_core::compute_jcs_schema_hash(&tools_bytes) {
                     if let Some(pin) = self.pinned_schema_hash {
@@ -458,7 +501,14 @@ impl McpStdioBroker {
                             let outcome = lock(shared_ref).handle_server_message(&line_buf);
                             let forward = match outcome {
                                 ServerMessageOutcome::Forward(l) => l,
-                                ServerMessageOutcome::CapturedSchema { forward_line, .. } => {
+                                ServerMessageOutcome::CapturedSchema {
+                                    fingerprint,
+                                    forward_line,
+                                } => {
+                                    eprintln!(
+                                        "[Arc Protect] Observed MCP schema JCS SHA-256: {}",
+                                        hex::encode(fingerprint)
+                                    );
                                     forward_line
                                 }
                             };
@@ -513,5 +563,19 @@ impl McpStdioBroker {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::command_fingerprint;
+
+    #[test]
+    fn command_fingerprint_preserves_argument_boundaries() {
+        let split = vec!["ab".to_string(), "c".to_string()];
+        let joined = vec!["a".to_string(), "bc".to_string()];
+        assert_ne!(command_fingerprint(&split), command_fingerprint(&joined));
+        assert_eq!(command_fingerprint(&split), command_fingerprint(&split));
+        assert_ne!(command_fingerprint(&[]), command_fingerprint(&[String::new()]));
     }
 }

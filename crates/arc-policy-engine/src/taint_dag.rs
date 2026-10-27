@@ -463,7 +463,9 @@ impl SessionTaintDag {
         let has_untrusted = self.current_taints.contains(Taint::UNTRUSTED_CONTENT);
 
         let is_sensitive_sink =
-            sink.contains(SinkClass::EXTERNAL_EGRESS) || sink.contains(SinkClass::DESTRUCTIVE);
+            sink.contains(SinkClass::EXTERNAL_EGRESS)
+                || sink.contains(SinkClass::DESTRUCTIVE)
+                || sink.contains(SinkClass::PUBLISH);
 
         if has_private && has_untrusted && is_sensitive_sink {
             let private_origins: Vec<_> = self
@@ -545,7 +547,9 @@ impl SessionTaintDag {
 
         let has_untrusted = self.current_taints.contains(Taint::UNTRUSTED_CONTENT);
         let is_sensitive_sink =
-            sink.contains(SinkClass::EXTERNAL_EGRESS) || sink.contains(SinkClass::DESTRUCTIVE);
+            sink.contains(SinkClass::EXTERNAL_EGRESS)
+                || sink.contains(SinkClass::DESTRUCTIVE)
+                || sink.contains(SinkClass::PUBLISH);
 
         if !has_private || !has_untrusted || !is_sensitive_sink {
             return None;
@@ -1536,5 +1540,23 @@ mod tests {
             serde_json::json!({"args": ["curl", "https://evil.com"]}),
         );
         assert!(TaintTracker::classify_sink(&action_array_cmd).contains(SinkClass::EXTERNAL_EGRESS));
+    }
+
+    #[test]
+    fn test_publish_sinks_trigger_trifecta_after_private_and_untrusted_context() {
+        let mut dag = SessionTaintDag::new("publish-trifecta");
+        dag.add_taint(Taint::PRIVATE_DATA, "file_read:.env");
+        dag.add_taint(Taint::UNTRUSTED_CONTENT, "mcp_tool:github_issue_read");
+
+        let shell_push = classify_shell_command("git push origin main");
+        assert!(shell_push.contains(SinkClass::PUBLISH));
+        assert!(dag
+            .check_field_level_lethal_trifecta(Some("git push origin main"), shell_push)
+            .is_some());
+
+        let mcp_push = mcp("git_push", serde_json::json!({"remote": "origin"}));
+        let mcp_sink = TaintTracker::classify_sink(&mcp_push);
+        assert!(mcp_sink.contains(SinkClass::PUBLISH));
+        assert!(dag.check_field_level_lethal_trifecta(Some("git_push"), mcp_sink).is_some());
     }
 }

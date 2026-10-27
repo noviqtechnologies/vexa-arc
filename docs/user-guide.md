@@ -16,7 +16,7 @@ Welcome to the **Vexa Arc (Agentic Runtime Control)** User Guide. This document 
    - [`arc audit`: Zero-Touch AI & MCP Asset Discovery](#arc-audit-zero-touch-ai--mcp-asset-discovery)
    - [`arc bom`: CycloneDX v1.6 AI-BOM Generation](#arc-bom-cyclonedx-v16-ai-bom-generation)
    - [`arc scan-secrets`: Secret Detection & Pseudonymization Vault](#arc-scan-secrets-secret-detection--pseudonymization-vault)
-   - [`arc shield`: Install-Time Anti-Slopsquatting Firewall](#arc-shield-install-time-anti-slopsquatting-firewall)
+   - [`arc shield`: Advisory Package Risk Checks](#arc-shield-advisory-package-risk-checks)
    - [`arc intercept eval`: Runtime Action & Taint Tracking (DAG)](#arc-intercept-eval-runtime-action--taint-tracking-dag)
 4. [Host Agent & IDE Integration](#4-host-agent--ide-integration)
    - [Claude Code Integration](#claude-code-integration)
@@ -33,10 +33,10 @@ Welcome to the **Vexa Arc (Agentic Runtime Control)** User Guide. This document 
 
 ## 1. Overview & Key Concepts
 
-**Vexa Arc** is an open-source, zero-dependency, ultra-low-latency native Rust pre-execution policy firewall and developer workstation security control. Built specifically for AI coding agents and MCP interactions, it evaluates and governs actions before code, dependencies, or shell commands touch disk:
+**Vexa Arc** is an open-source Rust policy engine with selected Claude Code/Cursor hooks and an explicitly invoked MCP stdio broker. It evaluates configured actions before execution on those mediated paths; it does not govern all code, dependency, shell, or editor activity on the workstation:
 
 * **Arc Intercept:** Evaluates agent tool calls in real time against a monotonic **Stateful Session Taint DAG** (Directed Acyclic Graph).
-* **Arc Veil:** Performs linear-time secret detection and Data Loss Prevention (DLP) ($< 0.9\text{ ms}$), prompt injection sanitization, and deterministic local vaulting (`<ARC_VAULT_SECRET_XX>`).
+* **Arc Veil:** Provides targeted secret detection, DLP/redaction obligations on supported mediated paths, prompt-injection sanitization, and local vaulting (`<ARC_VAULT_SECRET_XX>`). Latency varies by input and host; no end-to-end sub-millisecond performance claim is validated here.
 * **Arc Shield:** Evaluates package names and install commands against anti-slopsquatting compound heuristics and queries OSV for exact version coordinates.
 * **Arc Atlas:** Discovers shadow MCP (Model Context Protocol) servers, agent instruction files, and model checkpoints, producing standardized CycloneDX v1.6 AI-BOM (AI Bill of Materials) artifacts.
 
@@ -310,9 +310,9 @@ Vault Tokens Registered (1):
 
 ---
 
-### `arc shield`: Install-Time Anti-Slopsquatting Firewall
+### `arc shield`: Advisory Package Risk Checks (Not an Install Firewall)
 
-Evaluates packages before running `npm install`, `pnpm add`, `pip install`, `python -m pip install`, `cargo add`, or `go get`. Arc prevents developers and AI coding agents from installing hallucinated, typosquatted, or malicious packages.
+Arc evaluates a package name or parsed package-manager command against a seeded popular-package heuristic. It does **not** intercept, execute, or prevent the install command. Age, download, and lifecycle-script values supplied as flags are simulation inputs, not live registry observations. An exact `name@version` passed to `arc shield check` may additionally be queried against OSV; that vulnerability query is not a malware verdict or proof that a package is safe. Treat these commands as advisory checks only and retain your existing registry, lockfile, and endpoint controls.
 
 #### Windows (PowerShell):
 ```powershell
@@ -324,7 +324,7 @@ PS C:\vexa-arc\target\release> .\arc.exe shield npm:reactt
 PS C:\vexa-arc\target\release> .\arc.exe shield pypi:shadow-agent --dangerous-scripts
 PS C:\vexa-arc\target\release> .\arc.exe shield go:github.com/gin-gonic/gin
 
-# Option 3: Natural CLI command wrapper (paste your full install command!)
+# Option 3: Parse command text only; Arc does not run the install command
 PS C:\vexa-arc\target\release> .\arc.exe shield npm install reactt
 PS C:\vexa-arc\target\release> .\arc.exe shield pnpm add reactt
 PS C:\vexa-arc\target\release> .\arc.exe shield pip install shadow-agent --dangerous-scripts
@@ -347,7 +347,7 @@ arc shield npm:reactt
 arc shield pypi:shadow-agent --dangerous-scripts
 arc shield go:github.com/gin-gonic/gin
 
-# Option 3: Natural CLI command wrapper (paste your full install command!)
+# Option 3: Parse command text only; Arc does not run the install command
 arc shield npm install reactt
 arc shield pnpm add reactt
 arc shield pip install shadow-agent --dangerous-scripts
@@ -360,13 +360,20 @@ arc shield check reactt
 arc shield check reactt -e npm --json
 ```
 
-**Diagnostic Output (Typosquat / AI Hallucination):**
+The following are illustrative heuristic results, not live registry observations. Age/download values and lifecycle-script flags must be supplied by the caller; the CLI does not retrieve or verify them. A returned `PERMITTED` verdict is not a package safety attestation.
+
+```bash
+arc shield check reactt --ecosystem npm --age-days 2 --downloads 12
+arc shield check pypi:shadow-agent --dangerous-scripts
+```
+
+**Illustrative Diagnostic Output (Typosquat / AI Hallucination):**
 ```text
 ┌────────────────────────────────────────────────────────┐
 │        ARC SHIELD ANTI-SLOPSQUATTING EVALUATION        │
 └────────────────────────────────────────────────────────┘
 Package:            reactt (npm)
-Registry Metrics:   Age: 2 days | Monthly Downloads: 12
+Simulation Inputs:  Age: 2 days | Monthly Downloads: 12
 Dangerous Scripts:  false
 ----------------------------------------------------------
 STATUS:             🛑 BLOCKED (HARD GATE REJECTION)
@@ -375,7 +382,7 @@ Finding:            Package 'reactt' is a suspected hallucination/typosquat of '
 
 SUGGESTED ACTION:
   💡 Did you mean: 'react'? Run: npm install react
-  ℹ️  If legitimate: arc shield allow reactt --ecosystem npm
+  ℹ️  If legitimate: verify package identity independently and use your approved dependency review process
 ──────────────────────────────────────────────────────────
 ```
 
@@ -385,7 +392,7 @@ SUGGESTED ACTION:
 │        ARC SHIELD ANTI-SLOPSQUATTING EVALUATION        │
 └────────────────────────────────────────────────────────┘
 Package:            shadow-agent (pypi)
-Registry Metrics:   Age: 1 days | Monthly Downloads: 0
+Simulation Inputs:  Age: 1 days | Monthly Downloads: 0
 Dangerous Scripts:  true
 ----------------------------------------------------------
 STATUS:             🛑 BLOCKED (HARD GATE REJECTION)
@@ -398,53 +405,34 @@ SUGGESTED ACTION:
 ```
 
 **Exit Codes:**
-* `0`: Package evaluation permitted (passed all security gates).
-* `1`: Package evaluation blocked (hard gate rejection, stopping CI/CD build or installation).
+* `0`: The submitted advisory check returned a non-blocking verdict; this does not establish that the package is safe.
+* `1`: The submitted check returned a blocking verdict (or, for a versioned OSV check, an incomplete/blocked scan). This exit code cannot stop a separate package-manager process unless your CI or wrapper explicitly enforces it.
 
 #### OSV/EPSS Vulnerability Scanning (`ARC-SCA-001`) — FR-PKG-005 & FR-PKG-006
 
-`arc shield` integrates **vexa-sca** as a native Rust crate. Every package check now runs a live OSV batch-query + EPSS scoring after the slopsquat evaluation:
+`arc shield check` can invoke the **vexa-sca** OSV scanner when given an exact package version. A bare package name or a command parsed by `arc shield run` is not an exact-version vulnerability scan. This query checks known vulnerability records; it does not establish that a package is benign or detect all malicious packages.
 
-- **Air-gapped safe:** Only public package coordinates (name + ecosystem) leave the host. Source code never leaves localhost.
-- **`.sca-cache` fallback:** 24-hour TTL local cache enables offline / air-gapped operation after the first successful query.
-- **EPSS threshold:** Findings at ≥ 70th EPSS percentile are flagged as actively exploited.
-- **JSON-RPC inline remediation:** Structured error payload `{"error": "Vulnerable package {name}@{version}; update constraint to >={safe}", "rule_id": "ARC-SCA-001"}` for agent self-healing (FR-PKG-006).
+- Exact coordinates may be sent to the public OSV service; source code is not part of the query.
+- A local `.sca-cache` is used, but the repository does not provide an enterprise-managed, pre-warmed air-gap cache process. An unavailable exact-version scan can be incomplete and may fail closed.
+- EPSS, when returned by the SCA provider, is a prioritization signal for known vulnerabilities—not a typosquat or malware verdict.
+- `--json` returns CLI JSON output; it is not a JSON-RPC agent remediation channel.
 
 ```bash
-# Get JSON output with OSV findings and inline remediation
-arc shield check lodash --ecosystem npm --json
+# Query OSV for an exact package version
+arc shield check lodash@4.17.15 --ecosystem npm --json
 
-# Terminal output shows OSV section after slopsquat evaluation
-arc shield lodash
-```
-
-**Example terminal output with OSV findings:**
-```text
-┌────────────────────────────────────────────────────────┐
-│        ARC SHIELD ANTI-SLOPSQUATTING EVALUATION        │
-└────────────────────────────────────────────────────────┘
-Package:            lodash (npm)
-Registry Metrics:   Pre-install Gate (Automated package baseline & slopsquat check)
-Dangerous Scripts:  false
-----------------------------------------------------------
-STATUS:             ✅ PERMITTED (PASS)
-Reason:             Package 'lodash' is an established popular package.
-----------------------------------------------------------
-OSV VULNERABILITY SCAN  [ARC-SCA-001]
-  🔴 GHSA-jf85-cpcp-j695 – HIGH (CVSS: 7.5)
-     Vulnerable package lodash@4.17.15; update constraint to >=4.17.21
-  JSON-RPC remediation: {"error":"Vulnerable package lodash@4.17.15; update constraint to >=4.17.21","rule_id":"ARC-SCA-001","severity":"HIGH"}
-----------------------------------------------------------
+# A name without a version is not an exact-version OSV scan
+arc shield check lodash --ecosystem npm
 ```
 
 > [!IMPORTANT]
-> `arc shield` returns **exit code 1** (blocking) when either the slopsquat gate fires **or** an OSV finding with CRITICAL/HIGH severity or EPSS ≥ 70% is detected.
+> Exact-version OSV checks may return a blocked/incomplete result and exit non-zero. `arc shield` does not intercept installations; your CI must explicitly honor the result, and must define its own safe offline/cache policy.
 
 ---
 
-### AST Pattern Injection Hook (`ARC-AST-001`) — FR-CORE-006
+### Code-Pattern Pre-Write Check (`ARC-AST-001`) — FR-CORE-006
 
-Every `FileWrite` action evaluated by `arc intercept eval` triggers the **`AstPatternEngine`** before bytes reach disk. The check runs in **< 8ms** on files up to 256 KiB using Aho-Corasick prefiltering + regex matching:
+For a `FileWrite` action that is actually submitted to `arc intercept eval` or another mediated pre-write hook, Arc runs `AstPatternEngine` before that mediated write proceeds. It uses Aho-Corasick prefiltering and targeted regexes; it does **not** parse an AST and only detects selected patterns. Cursor's configured hooks do not include a pre-file-write event, so direct Cursor editor writes and shell/script writes are not scanned by this hook. Do not treat this as a general file-write DLP control.
 
 | Injection Category | Detection Pattern |
 | :--- | :--- |
@@ -453,23 +441,32 @@ Every `FileWrite` action evaluated by `arc intercept eval` triggers the **`AstPa
 | Raw innerHTML | `element.innerHTML = untrustedVar` |
 | Plaintext private keys | `-----BEGIN PRIVATE KEY-----` / `-----BEGIN RSA PRIVATE KEY-----` |
 
-A blocked write returns rule ID `ARC-AST-001` with a structured JSON-RPC error.
+A blocked mediated write returns rule ID `ARC-AST-001` with a structured JSON-RPC error. Existing latency measurements apply to the scanner path only, not full editor-hook execution.
 
 ---
 
-### OS-Level Process Containment (`FR-HOOKS-003`)
+### Process Lifecycle Controls (`FR-HOOKS-003`)
 
-When `arc protect stdio` launches an MCP server, the child process is wrapped in OS-level containment before executing user code:
+When `arc protect stdio` launches an MCP server, it applies the listed process-lifecycle/resource controls before executing user code; these controls are not an OS sandbox:
 
 | Platform | Mechanism | Guarantee |
 | :--- | :--- | :--- |
 | **Windows** | `CreateProcess(CREATE_SUSPENDED)` + `AssignProcessToJobObject` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` | Eliminates launch race window; child and descendants terminate when Job handle closes. Supports `--max-memory-mb`. |
-| **Linux** | `prctl(PR_SET_PDEATHSIG, SIGKILL)` in pre-exec + parent PID race verification + `setrlimit(RLIMIT_AS)` | SIGKILL on broker parent death; enforces virtual address space bounds. |
-| **macOS/Unix** | `setpgrp()` process group isolation — `kill(-pgid, SIGKILL)` on Drop | Reaps entire process subtree on supervisor shutdown or crash. |
+| **Linux** | `prctl(PR_SET_PDEATHSIG, SIGKILL)` in pre-exec + parent PID race verification + `setrlimit(RLIMIT_AS)` | Signals the direct child on parent death; process-group cleanup runs during supervisor teardown. Descendant survival after hard parent death is not guaranteed against. |
+| **macOS/other Unix** | `setpgrp()` process-group isolation — `kill(-pgid, SIGKILL)` during supervisor teardown | Orderly teardown can kill the process group; hard-parent-crash, detached-child, and orphan behavior is not guaranteed. |
+
+These mechanisms bound process lifecycle/resource use only. They do not sandbox syscalls, filesystem access, or network egress.
 
 ```bash
-# Supervise an MCP server with schema pinning and 512 MB memory boundary:
-arc protect stdio --server github --pin-schema 6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b --max-memory-mb 512 -- npx @modelcontextprotocol/server-github
+# Controlled enrollment only: independently verify the server artifact, then record the JCS hash printed to stderr
+arc protect stdio --server github --allow-tofu -- npx @modelcontextprotocol/server-github
+
+# Managed use: provision the reviewed hash under `mcp_schema_pins` in the verified
+# `.arc/signed_policy.json`; the CLI pin may be omitted (if supplied, it must match)
+arc protect stdio --server github --max-memory-mb 512 -- npx @modelcontextprotocol/server-github
+
+# Standalone non-managed use: supply a reviewed pin directly
+arc protect stdio --server github --pin-schema "$MCP_SCHEMA_SHA256" -- npx @modelcontextprotocol/server-github
 ```
 
 ---
@@ -547,16 +544,19 @@ arc intercept session dev-sess --reset  # Reset session state
 
 ---
 
-### `arc shield run`: Supervised Package Containment Wrapper (FR-PKG-004)
+### `arc shield run`: Advisory Command Inspection (Not a Supervisor)
 
-Wraps package manager commands (`npm`, `pnpm`, `yarn`, `pip`, `cargo`, `go`) to inspect target dependencies before child processes spawn. When dangerous lifecycle scripts are detected, Arc can automatically inject `--ignore-scripts` to contain pre/post-install code execution:
+Parses package-manager command text and prints package verdicts. Arc does **not** launch or supervise a child process. `--show-recommendation` prints a proposed command variant (for example, with `--ignore-scripts` for selected npm-family cases); it does not execute or enforce that suggestion. `--fail-on-risk` returns a nonzero CI status for REVIEW or BLOCK, but still does not intercept or run an install. The result is heuristic and caller-supplied metadata is not registry-verified.
 
 ```bash
-# Evaluate and wrap install command:
+# Inspect command text only; this does not run npm:
 arc shield run npm install express
 
-# Automatically enforce containment:
-arc shield run --enforce npm install questionable-package
+# Print a proposed safer command only; this does not install the package:
+arc shield run --show-recommendation -- npm install questionable-package
+
+# Gate CI on review/block verdicts; this still only inspects the command:
+arc shield run --fail-on-risk -- npm install questionable-package
 ```
 
 ---
@@ -729,8 +729,8 @@ arc host uninstall --host cursor
 Some AI coding environments (e.g. Windsurf, Cline) do not currently provide documented pre-execution hook APIs for intercepting internal editor commands, file reads, or shell tasks before they execute.
 
 In these environments:
-- **MCP Brokering (`arc protect stdio`):** Any MCP server configured in the editor can be wrapped via `arc protect stdio --server <NAME> -- <COMMAND>`. Arc will enforce runtime schema pinning (`--pin-schema`), quarantine dynamic rug-pulls, redact sensitive secrets, ingest result taints, and enforce OS process lifetime and memory limits.
-- **Direct Editor Terminal / File Writes:** Actions performed directly inside the host editor without using MCP tools bypass Arc because the host provides no hook interception points.
+- **MCP Brokering (`arc protect stdio`):** An explicitly launched stdio server can be wrapped via `arc protect stdio --server <NAME> -- <COMMAND>`. The CLI obtains managed pins from verified `.arc/signed_policy.json`; outside managed policy, supply `--pin-schema <HASH>`. `--allow-tofu` is development/bootstrap only and is rejected when signed organization policy is active. This wrapper does not stop users/agents from launching an unwrapped server or using another transport. It redacts supported secrets, ingests results into the taint tracker, and applies process-lifecycle/memory controls; these do not sandbox filesystem access or network egress.
+- **Direct Editor Terminal / File Writes:** Cursor's installed hooks mediate selected shell, MCP, and read events, but there is no configured pre-file-write event; direct editor writes bypass ARC-AST-001 and file-write DLP. Writes through scripts/processes also exceed the scanner's mediated `FileWrite` path. Windsurf and Cline have no native adapters here; only MCP traffic explicitly wrapped by `arc protect stdio` is mediated.
 
 ### Generic Model Context Protocol (MCP) JSON-RPC
 
@@ -771,7 +771,7 @@ An autonomous agent becomes dangerous when three properties converge:
 2. **Untrusted Context Ingestion:** External web pages, public GitHub issues, PR comments, or Slack messages.
 3. **Outbound Capability:** Network egress (`curl`, `fetch`, `slack_post`) or shell execution.
 
-Arc's monotonic **Taint DAG** tracks this state. Once a session has ingested both Private Data and Untrusted Context, all outbound network and destructive commands are blocked deterministically.
+Arc's monotonic **Taint DAG** tracks taints observed on mediated events and denies actions that its policy engine classifies as a matching outbound sink. This is not byte-level taint tracking or a network firewall: unrecognized shell syntax, custom binaries, direct network clients, unwrapped tools, and host events that bypass Arc can evade sink mediation. Do not assume every outbound or destructive command is blocked.
 
 ### Dynamic Schema Rug-Pull Quarantine (`ARC-RUG-001`)
 
@@ -815,10 +815,10 @@ Instead of terminating agent workflows when secrets are encountered, Arc can rep
 ## 7. Frequently Asked Questions (FAQ)
 
 **Q: Does Arc transmit my source code or prompts to an external cloud?**  
-A: No. Arc's open-core engine operates with **zero network egress**. All scans, taint evaluations, and DLP pattern matches execute locally on your machine in native Rust.
+A: The local engine does not upload source code or prompts as part of its local scans, taint evaluations, or DLP matching. Network behavior is not universally zero-egress: an exact-version `arc shield check` may send public package coordinates to OSV, and the MCP server you explicitly launch may access its own network destinations.
 
 **Q: Does Arc slow down my developer terminal or IDE loops?**  
-A: No. In-daemon decision latency is designed for $p_{99} < 3.5\text{ ms}$ and secret scans complete in $< 0.9\text{ ms}$.
+A: The repository contains performance targets, but end-to-end hook/broker latency and developer workflow impact have not been validated in this assessment. Benchmark on your supported hosts and run in shadow mode before enabling blocking policy.
 
 **Q: Can I run `arc audit` in CI/CD pipelines?**  
 A: Yes. `arc audit --json` or `arc bom --out bom.json` can run as a build step or pre-commit hook to continuously audit repositories.

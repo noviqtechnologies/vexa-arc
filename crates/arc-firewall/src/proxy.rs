@@ -2,6 +2,30 @@ use arc_core::event::Ecosystem;
 
 use crate::slopsquat::{CompoundAntiSlopsquatEngine, PackageRegistryMetadata, SlopsquatVerdict};
 
+fn normalize_ecosystem(ecosystem: &str) -> &str {
+    match ecosystem.to_ascii_lowercase().as_str() {
+        "npm" | "node" => "npm",
+        "pypi" | "pip" | "python" => "pypi",
+        "cargo" | "crates.io" | "rust" => "cargo",
+        "go" | "golang" => "go",
+        _ => "unknown",
+    }
+}
+
+fn ecosystem_label(ecosystem: Ecosystem) -> &'static str {
+    match ecosystem {
+        Ecosystem::Npm => "npm",
+        Ecosystem::Pypi => "pypi",
+        Ecosystem::Cargo => "cargo",
+        Ecosystem::Go => "go",
+    }
+}
+
+fn package_cache_key(ecosystem: &str, name: &str) -> String {
+    format!("{}:{}", normalize_ecosystem(ecosystem), name.to_ascii_lowercase())
+}
+
+/// Legacy name: this contains seeded heuristic placeholders, not authoritative registry records.
 #[derive(Debug, Clone)]
 pub struct AuthoritativeRegistryCache {
     pub verified_packages: std::collections::HashMap<String, PackageRegistryMetadata>,
@@ -29,10 +53,10 @@ impl AuthoritativeRegistryCache {
             ("numpy", "PyPI"),
         ] {
             verified.insert(
-                pkg.to_string(),
+                package_cache_key(eco, pkg),
                 PackageRegistryMetadata {
                     name: pkg.to_string(),
-                    ecosystem: eco.to_string(),
+                    ecosystem: normalize_ecosystem(eco).to_string(),
                     age_days: 1000,
                     monthly_downloads: 50_000_000,
                     has_verified_repository_link: true,
@@ -49,8 +73,21 @@ impl AuthoritativeRegistryCache {
         }
     }
 
+    pub fn lookup_for_ecosystem(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+    ) -> Option<&PackageRegistryMetadata> {
+        self.verified_packages
+            .get(&package_cache_key(ecosystem_label(ecosystem), name))
+    }
+
+    /// Legacy, ambiguous name-only lookup. Do not use for security decisions.
+    #[deprecated(note = "use lookup_for_ecosystem to avoid cross-ecosystem collisions")]
     pub fn lookup(&self, name: &str) -> Option<&PackageRegistryMetadata> {
-        self.verified_packages.get(name)
+        self.verified_packages
+            .values()
+            .find(|metadata| metadata.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -73,7 +110,7 @@ impl PackageFirewall {
         }
     }
 
-    /// Evaluates an install request for a specific package.
+    /// Evaluates caller-supplied/heuristic package metadata; does not fetch registry information.
     pub fn inspect_package(
         &self,
         ecosystem: Ecosystem,
@@ -82,10 +119,13 @@ impl PackageFirewall {
         monthly_downloads: Option<u64>,
         has_dangerous_scripts: bool,
     ) -> SlopsquatVerdict {
-        let is_popular = self.engine.is_popular_package(package_name);
+        let eco = ecosystem_label(ecosystem);
+        let is_popular = self
+            .engine
+            .is_popular_package_for_ecosystem(package_name, eco);
         let meta = PackageRegistryMetadata {
             name: package_name.to_string(),
-            ecosystem: format!("{ecosystem:?}").to_lowercase(),
+            ecosystem: eco.to_string(),
             age_days: age_days.unwrap_or(if is_popular { 365 } else { 1 }),
             monthly_downloads: monthly_downloads.unwrap_or(if is_popular { 10_000_000 } else { 0 }),
             has_verified_repository_link: is_popular,
@@ -99,15 +139,15 @@ impl PackageFirewall {
         self.engine.evaluate(&meta)
     }
 
-    /// Evaluates an install request in authoritative protected mode (FR-PKG-002).
-    /// Caller-supplied age/download simulation overrides cannot bypass verification.
+    /// Legacy name: evaluates against the seeded local heuristic baseline, not an authoritative
+    /// registry check. This method does not verify package metadata or intercept installation.
     pub fn inspect_package_protected(
         &self,
         ecosystem: Ecosystem,
         package_name: &str,
         has_dangerous_scripts: bool,
     ) -> SlopsquatVerdict {
-        if let Some(verified_meta) = self.cache.lookup(package_name) {
+        if let Some(verified_meta) = self.cache.lookup_for_ecosystem(ecosystem, package_name) {
             let mut meta = verified_meta.clone();
             if has_dangerous_scripts {
                 meta.has_dangerous_lifecycle_scripts = true;
@@ -115,10 +155,13 @@ impl PackageFirewall {
             self.engine.evaluate(&meta)
         } else {
             // Unverified package: evaluate strictly with conservative bounds
-            let is_popular = self.engine.is_popular_package(package_name);
+            let eco = ecosystem_label(ecosystem);
+            let is_popular = self
+                .engine
+                .is_popular_package_for_ecosystem(package_name, eco);
             let meta = PackageRegistryMetadata {
                 name: package_name.to_string(),
-                ecosystem: format!("{ecosystem:?}").to_lowercase(),
+                ecosystem: eco.to_string(),
                 age_days: if is_popular { 365 } else { 1 },
                 monthly_downloads: if is_popular { 10_000_000 } else { 0 },
                 has_verified_repository_link: is_popular,
@@ -132,8 +175,8 @@ impl PackageFirewall {
         }
     }
 
-    /// Enforces execution containment for an install command (FR-PKG-004)
-    pub fn enforce_containment(
+    /// Returns a suggested command variant for a caller to review; it does not execute or isolate it.
+    pub fn suggest_safer_command(
         command: &str,
         verdict: &SlopsquatVerdict,
     ) -> Result<String, String> {
@@ -146,6 +189,11 @@ impl PackageFirewall {
                 ..
             } => {
                 let trimmed = command.trim();
+                if !containment_recommendation.contains("--ignore-scripts") {
+                    return Err(format!(
+                        "no automatic command rewrite satisfies this review; review manually: {containment_recommendation}"
+                    ));
+                }
                 if trimmed.starts_with("npm")
                     || trimmed.starts_with("pnpm")
                     || trimmed.starts_with("yarn")
@@ -156,8 +204,8 @@ impl PackageFirewall {
                         Ok(trimmed.to_string())
                     }
                 } else {
-                    Ok(format!(
-                        "{trimmed} # [containment: {containment_recommendation}]"
+                    Err(format!(
+                        "no automatic command rewrite is available; review manually: {containment_recommendation}"
                     ))
                 }
             }
@@ -397,12 +445,28 @@ mod tests {
     }
 
     #[test]
-    fn test_enforce_containment_execution_wrapping() {
+    fn seeded_cache_is_scoped_by_ecosystem() {
+        let firewall = PackageFirewall::new();
+        let cargo_tokio = firewall.inspect_package_protected(Ecosystem::Cargo, "tokio", false);
+        assert!(matches!(cargo_tokio, SlopsquatVerdict::Permitted { .. }));
+
+        let npm_tokio = firewall.inspect_package_protected(Ecosystem::Npm, "tokio", false);
+        assert!(matches!(
+            npm_tokio,
+            SlopsquatVerdict::Blocked {
+                gate: "CompoundProvenanceGate",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_suggest_safer_command_output_only() {
         let blocked = SlopsquatVerdict::Blocked {
             gate: "Gate 1",
             reason: "Untrusted new package".to_string(),
         };
-        let err = PackageFirewall::enforce_containment("npm install bad-pkg", &blocked);
+        let err = PackageFirewall::suggest_safer_command("npm install bad-pkg", &blocked);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("Blocked by Gate 1"));
 
@@ -412,14 +476,29 @@ mod tests {
             containment_recommendation: "Run with --ignore-scripts".to_string(),
         };
         let wrapped_npm =
-            PackageFirewall::enforce_containment("npm install suspicious-pkg", &review).unwrap();
+            PackageFirewall::suggest_safer_command("npm install suspicious-pkg", &review).unwrap();
         assert_eq!(wrapped_npm, "npm install suspicious-pkg --ignore-scripts");
+        assert!(
+            PackageFirewall::suggest_safer_command("pip install suspicious-pkg", &review).is_err()
+        );
+
+        let provenance_review = SlopsquatVerdict::Review {
+            gate: "CompoundProvenanceGate",
+            reason: "Missing provenance".to_string(),
+            containment_recommendation: "Require a signed provenance attestation or explicit security review before installation.".to_string(),
+        };
+        let no_false_rewrite = PackageFirewall::suggest_safer_command(
+            "npm install new-lib",
+            &provenance_review,
+        )
+        .unwrap_err();
+        assert!(no_false_rewrite.contains("review manually"));
 
         let permitted = SlopsquatVerdict::Permitted {
             reason: "Passed all gates",
         };
         let clean =
-            PackageFirewall::enforce_containment("npm install express", &permitted).unwrap();
+            PackageFirewall::suggest_safer_command("npm install express", &permitted).unwrap();
         assert_eq!(clean, "npm install express");
     }
 }

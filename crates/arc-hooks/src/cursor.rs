@@ -1,7 +1,7 @@
 use arc_core::event::{
     Action, ActionEvent, AgentHost, Artifact, OsPrincipal, Phase, ServerIdentity,
 };
-use arc_core::verdict::Verdict;
+use arc_core::verdict::{Obligation, Verdict};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -11,6 +11,18 @@ use crate::host_config::{
 };
 
 pub struct CursorAdapter;
+
+fn has_unapplied_redaction(obligations: &[Obligation]) -> bool {
+    obligations.iter().any(|obligation| match obligation {
+        Obligation::Redact { spans } => !spans.is_empty(),
+        _ => false,
+    })
+}
+
+const DLP_UNAPPLIED_REDACTION_MESSAGE: &str = concat!(
+    "[ARC-DLP-001] Secret detected; this hook cannot safely rewrite the action, ",
+    "so it was blocked. Remove the secret or use a mediated redaction-capable MCP transport."
+);
 
 /// Cursor hook events Arc installs on. Before-hooks enforce; the after-MCP hook reports results
 /// so untrusted tool output is tainted.
@@ -168,6 +180,19 @@ impl HostAdapter for CursorAdapter {
     /// `agent_message`). Blocking verdicts additionally exit with code 2, which Cursor treats as deny.
     fn encode(&self, verdict: &Verdict) -> HostResponse {
         match verdict {
+            Verdict::Allow { obligations } if has_unapplied_redaction(obligations) => {
+                let text = DLP_UNAPPLIED_REDACTION_MESSAGE;
+                HostResponse {
+                    stdout: serde_json::to_vec(&serde_json::json!({
+                        "permission": "deny",
+                        "user_message": "Blocked by Vexa Arc (ARC-DLP-001): secret detected",
+                        "agent_message": text,
+                    }))
+                    .unwrap_or_default(),
+                    stderr: text.as_bytes().to_vec(),
+                    exit_code: 2,
+                }
+            }
             Verdict::Allow { .. } => HostResponse {
                 stdout: serde_json::to_vec(&serde_json::json!({"permission": "allow"}))
                     .unwrap_or_default(),
@@ -315,14 +340,22 @@ impl CursorAdapter {
             let mcp = hooks
                 .and_then(|h| h.get("beforeMCPExecution"))
                 .and_then(find_arc_command);
-            if let (Some(cmd), Some(_)) = (shell.clone(), mcp) {
+            let read = hooks
+                .and_then(|h| h.get("beforeReadFile"))
+                .and_then(find_arc_command);
+            let post_mcp = hooks
+                .and_then(|h| h.get("afterMCPExecution"))
+                .and_then(find_arc_command);
+            if let (Some(cmd), Some(_), Some(_), Some(_)) =
+                (shell.clone(), mcp, read, post_mcp)
+            {
                 return crate::adapter::HostIntegrationStatus {
                     host: AgentHost::Cursor,
                     is_configured: true,
                     hook_path: Some(config_path),
                     hook_command: Some(cmd),
-                    bypass_risk: false,
-                    message: "Cursor beforeShellExecution/beforeMCPExecution hooks are active and protected by Vexa Arc".to_string(),
+                    bypass_risk: true,
+                    message: "Arc's Cursor shell/MCP/read hooks are active, but ordinary editor file writes are not intercepted; Cursor has no configured pre-file-write hook here.".to_string(),
                 };
             }
             if shell.is_some() {
@@ -360,6 +393,24 @@ mod tests {
         CursorAdapter
             .decode(v.to_string().as_bytes(), OsPrincipal::Uid(1000))
             .unwrap()
+    }
+
+    #[test]
+    fn hook_denies_when_redaction_obligation_cannot_be_applied() {
+        let verdict = Verdict::Allow {
+            obligations: vec![Obligation::Redact {
+                spans: vec![(0, 12, "<ARC_SECRET>".to_string())],
+            }],
+        };
+
+        let response = CursorAdapter.encode(&verdict);
+        assert_eq!(response.exit_code, 2);
+        let payload: Value = serde_json::from_slice(&response.stdout).unwrap();
+        assert_eq!(payload["permission"], "deny");
+        assert!(payload["agent_message"]
+            .as_str()
+            .unwrap()
+            .contains("ARC-DLP-001"));
     }
 
     #[test]

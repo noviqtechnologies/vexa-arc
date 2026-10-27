@@ -1384,7 +1384,8 @@ fn test_complete_path_latency_benchmark() {
     use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
 
     let evaluator = PolicyEvaluator::new(PolicyConfig::default());
-    let mut broker = McpStdioBroker::new("benchmark-server", "sess-perf-benchmark", evaluator);
+    let mut broker = McpStdioBroker::new("benchmark-server", "sess-perf-benchmark", evaluator)
+        .allow_schema_tofu();
 
     // Warm-up iteration
     let sample_payload = serde_json::json!({
