@@ -71,6 +71,7 @@ flowchart BT
     DISCOVER["arc-discover"]
     FIREWALL["arc-firewall"]
     HOOKS["arc-hooks"]
+    TELEMETRY["arc-telemetry"]
     CLI["arc-cli"]
 
     DLP --> CORE
@@ -81,12 +82,14 @@ flowchart BT
     FIREWALL --> CORE
     HOOKS --> CORE
     HOOKS --> POLICY
+    HOOKS --> TELEMETRY
     CLI --> CORE
     CLI --> DLP
     CLI --> POLICY
     CLI --> DISCOVER
     CLI --> FIREWALL
     CLI --> HOOKS
+    CLI --> TELEMETRY
 ```
 
 * **`#![forbid(unsafe_code)]`** is enforced across domain logic crates.
@@ -395,6 +398,24 @@ let mut child = supervisor.spawn(&mut cmd)?;
 ## 9. CLI Binary (`arc-cli`)
 
 The root binary tying the subsystems together with `clap`.
+
+### Local Pilot Telemetry (`arc-telemetry`)
+
+`arc-telemetry` is an opt-in observation layer, not a policy engine. `TelemetryClient::emit()` sends a bounded, redacted JSON event to a loopback UDP collector without waiting for a receiver. The collector is started with `arc telemetry run` and writes a local NDJSON spool. If the collector is unavailable, the client increments a drop counter and the original security decision and host response remain unchanged.
+
+The event contract records action class, coarse target class, decision, rule ID, taint labels, sink class, schema status, pseudonymous session ID, and latency. It must not serialize `ActionEvent.action`, prompts, source code, file contents, raw commands, MCP arguments, package names, URLs, or secret values. Any new field requires a privacy review and a serialization regression test.
+
+The evaluator exposes `evaluate_with_observation()` so hooks and the MCP broker can observe a decision and post-evaluation taints without invoking policy twice. The existing `evaluate()` API remains the compatibility path and delegates to the same decision implementation.
+
+For local pilot operation:
+
+```text
+ARC_PILOT_TELEMETRY=local arc telemetry run
+arc telemetry status --json
+arc telemetry export --out arc-pilot-telemetry.json
+```
+
+Telemetry is disabled by default and is not evidence that unsupported host paths or direct network clients are mediated.
 
 ### Command Invocations Across Operating Systems
 

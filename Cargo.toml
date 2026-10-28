@@ -7,6 +7,7 @@ members = [
     "crates/arc-discover",
     "crates/arc-firewall",
     "crates/arc-hooks",
+    "crates/arc-telemetry",
     "crates/arc-cli",
 ]
 

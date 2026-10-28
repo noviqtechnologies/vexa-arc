@@ -20,6 +20,7 @@ arc-policy-engine = { path = "../arc-policy-engine" }
 arc-discover = { path = "../arc-discover" }
 arc-firewall = { path = "../arc-firewall" }
 arc-hooks = { path = "../arc-hooks" }
+arc-telemetry = { path = "../arc-telemetry" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

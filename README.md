@@ -317,7 +317,39 @@ All commands support relative and absolute paths, cross-platform path separators
 | `arc intercept` | Intercept and evaluate agent actions against session Taint DAG | `eval`, `read`, `exec`, `mcp`, `prompt`, `hook`, `session` | `arc intercept hook --host claude-code` |
 | `arc trace` | Inspect event causality and export redacted audit evidence | `<EVENT_ID>`, `latest`, `--export <PATH>`, `--json` | `arc trace latest --export trace.json` |
 | `arc doctor` | Check host adapters, policy engine, and cumulative metrics | `--metrics`, `--json` | `arc doctor --metrics` |
+| `arc telemetry` | Run or inspect the opt-in local pilot telemetry collector | `run`, `status --json`, `export --out <PATH>` | `arc telemetry status --json` |
 | `arc version` | Display platform version and build target | N/A | `arc version` |
+
+---
+
+## Local Pilot Telemetry (Opt-In)
+
+Vexa Arc can emit privacy-minimized per-action events for a local developer pilot. Telemetry is **disabled by default**, is sent only to a loopback collector, and never changes an allow/deny decision. It does not collect prompts, source code, file contents, MCP arguments, raw commands, package names, URLs, or secret values.
+
+Start the collector in a separate terminal:
+
+```bash
+arc telemetry run
+```
+
+Enable the hook/broker client for the current process environment:
+
+```bash
+# Linux/macOS
+export ARC_PILOT_TELEMETRY=local
+
+# Windows PowerShell
+$env:ARC_PILOT_TELEMETRY = "local"
+```
+
+Inspect status or export a compact local aggregate:
+
+```bash
+arc telemetry status --json
+arc telemetry export --out arc-pilot-telemetry.json
+```
+
+If the collector is unavailable, Arc continues with its existing security behavior and the event is counted as telemetry loss. This feature measures mediated actions only; it is not endpoint monitoring or proof of complete agent coverage. See [Community Release Scope](docs/community-release-scope.md) and the [User Guide telemetry section](docs/user-guide.md#local-pilot-telemetry).
 
 ---
 

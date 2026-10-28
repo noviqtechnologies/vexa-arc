@@ -17,7 +17,17 @@ pub use process_containment::{ContainmentLimits, OsProcessSupervisor};
 mod tests {
     use super::*;
     use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
+    use arc_telemetry::{TelemetryEvent, TelemetrySink};
     use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingSink(Arc<Mutex<Vec<TelemetryEvent>>>);
+
+    impl TelemetrySink for RecordingSink {
+        fn emit(&self, event: TelemetryEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
 
     #[test]
     fn test_broker_runtime_schema_capture_and_jcs_fingerprint() {
@@ -90,6 +100,31 @@ mod tests {
             }
             _ => panic!("Expected RespondLocally when server is unapproved"),
         }
+    }
+
+    #[test]
+    fn test_broker_emits_redacted_decision_telemetry() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink(events.clone()));
+        let evaluator = PolicyEvaluator::default();
+        let mut broker = McpStdioBroker::new("github", "telemetry-broker", evaluator)
+            .allow_schema_tofu()
+            .with_telemetry(Some(sink));
+        let call = serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"search_issues","arguments":{"q":"secret"}}
+        })
+        .to_string();
+        assert!(matches!(
+            broker.handle_client_message(&call),
+            ClientMessageOutcome::Forward(_)
+        ));
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].action_class, "mcp_call");
+        assert!(!serde_json::to_string(&captured[0])
+            .unwrap()
+            .contains("secret"));
     }
 
     #[test]

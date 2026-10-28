@@ -22,12 +22,13 @@ Welcome to the **Vexa Arc (Agentic Runtime Control)** User Guide. This document 
    - [Claude Code Integration](#claude-code-integration)
    - [Cursor IDE Integration](#cursor-ide-integration)
    - [Generic Model Context Protocol (MCP) JSON-RPC](#generic-model-context-protocol-mcp-json-rpc)
-5. [Understanding Security Violations & Remediation](#5-understanding-security-violations--remediation)
+5. [Local Pilot Telemetry](#local-pilot-telemetry)
+6. [Understanding Security Violations & Remediation](#6-understanding-security-violations--remediation)
    - [The "Lethal Trifecta" Invariant (`ARC-LTT-001`)](#the-lethal-trifecta-invariant-arc-ltt-001)
    - [Dynamic Schema Rug-Pull Quarantine (`ARC-RUG-001`)](#dynamic-schema-rug-pull-quarantine-arc-rug-001)
    - [Self-Explaining Error Contracts](#self-explaining-error-contracts)
-6. [Local Pseudonymization Vault Lifecycle](#6-local-pseudonymization-vault-lifecycle)
-7. [Frequently Asked Questions (FAQ)](#7-frequently-asked-questions-faq)
+7. [Local Pseudonymization Vault Lifecycle](#7-local-pseudonymization-vault-lifecycle)
+8. [Frequently Asked Questions (FAQ)](#8-frequently-asked-questions-faq)
 
 ---
 
@@ -762,7 +763,34 @@ For custom MCP client setups, configure Arc as a loopback stdio proxy:
 
 ---
 
-## 5. Understanding Security Violations & Remediation
+## Local Pilot Telemetry
+
+Vexa Arc includes an opt-in, local-only telemetry collector for small-team pilot measurement. It is disabled by default and does not affect policy decisions. The collector receives redacted event metadata over loopback and writes a local NDJSON spool.
+
+Start it in a separate terminal:
+
+```powershell
+# Windows PowerShell
+arc telemetry run
+$env:ARC_PILOT_TELEMETRY = "local"
+```
+
+```bash
+# Linux/macOS
+arc telemetry run
+export ARC_PILOT_TELEMETRY=local
+```
+
+Inspect the collector and export an aggregate:
+
+```text
+arc telemetry status --json
+arc telemetry export --out arc-pilot-telemetry.json
+```
+
+The event sink records coarse fields such as host, action class, decision, rule ID, taint labels, schema status, and latency. It does not record prompts, source code, file contents, raw commands, MCP arguments, package names, URLs, or secrets. If the collector is down, Arc continues its normal security behavior and records a telemetry drop when possible. Do not treat telemetry completeness as security coverage: direct tools, unsupported host events, ordinary Cursor editor writes, unwrapped MCP servers, and direct network clients remain outside Arc's control.
+
+## 6. Understanding Security Violations & Remediation
 
 ### The "Lethal Trifecta" Invariant (`ARC-LTT-001`)
 
@@ -799,7 +827,7 @@ When Arc denies an action, it **never crashes the agent socket**. It returns a s
 
 ---
 
-## 6. Local Pseudonymization Vault Lifecycle
+## 7. Local Pseudonymization Vault Lifecycle
 
 Instead of terminating agent workflows when secrets are encountered, Arc can replace sensitive credentials with deterministic local placeholders:
 
@@ -812,7 +840,7 @@ Instead of terminating agent workflows when secrets are encountered, Arc can rep
 
 ---
 
-## 7. Frequently Asked Questions (FAQ)
+## 8. Frequently Asked Questions (FAQ)
 
 **Q: Does Arc transmit my source code or prompts to an external cloud?**  
 A: The local engine does not upload source code or prompts as part of its local scans, taint evaluations, or DLP matching. Network behavior is not universally zero-egress: an exact-version `arc shield check` may send public package coordinates to OSV, and the MCP server you explicitly launch may access its own network destinations.

@@ -20,6 +20,10 @@ use arc_hooks::cursor::CursorAdapter;
 use arc_hooks::HostAdapter;
 use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
 use arc_policy_engine::taint_dag::SessionTaintDag;
+use arc_telemetry::{
+    action_class, sink_class_name, taint_names, target_class, verdict_decision, verdict_rule,
+    TelemetryEventBuilder, TelemetrySink,
+};
 
 #[derive(Parser)]
 #[command(
@@ -146,6 +150,28 @@ enum Commands {
 
     /// Display platform version and operational status
     Version,
+
+    /// Run or inspect the local opt-in pilot telemetry collector
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TelemetryAction {
+    /// Listen on loopback and append redacted events to the local spool
+    Run,
+    /// Show local collector configuration and reachability
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a compact aggregate from the local event spool
+    Export {
+        #[arg(short, long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -807,6 +833,54 @@ fn main() {
             println!("Target Architecture: Pure Rust Pre-Execution Endpoint & Agent Firewall");
             println!("License: Apache-2.0");
         }
+        Commands::Telemetry { action } => {
+            if !run_telemetry(action) {
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn run_telemetry(action: TelemetryAction) -> bool {
+    let dir = arc_telemetry::default_spool_dir();
+    match action {
+        TelemetryAction::Run => {
+            let endpoint = std::env::var("ARC_TELEMETRY_ENDPOINT")
+                .unwrap_or_else(|_| "127.0.0.1:39741".to_string());
+            eprintln!(
+                "[Arc Telemetry] Listening on {endpoint}; spool={}",
+                dir.display()
+            );
+            arc_telemetry::run_collector(&dir, &endpoint).is_ok()
+        }
+        TelemetryAction::Status { json } => {
+            let enabled = std::env::var("ARC_PILOT_TELEMETRY").ok().as_deref() == Some("local");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "enabled": enabled,
+                        "collector_endpoint": std::env::var("ARC_TELEMETRY_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:39741".to_string()),
+                        "spool_directory_configured": dir.exists(),
+                        "spool_directory": dir.display().to_string(),
+                    })
+                );
+            } else {
+                println!("Telemetry enabled: {enabled}");
+                println!("Spool directory: {}", dir.display());
+            }
+            true
+        }
+        TelemetryAction::Export { out } => match arc_telemetry::export_aggregate(&dir, &out) {
+            Ok(()) => {
+                println!("[Arc Telemetry] Aggregate exported to {}", out.display());
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Telemetry] Export failed: {e}");
+                false
+            }
+        },
     }
 }
 
@@ -941,8 +1015,16 @@ fn run_protect_stdio(
         }
     };
     let evaluator = PolicyEvaluator::new(policy);
+    let telemetry_client = arc_telemetry::TelemetryClient::from_environment();
+    let telemetry_sink = if telemetry_client.enabled() {
+        Some(std::sync::Arc::new(telemetry_client)
+            as std::sync::Arc<dyn arc_telemetry::TelemetrySink>)
+    } else {
+        None
+    };
     let mut broker = McpStdioBroker::new(server, session, evaluator)
         .with_command(command)
+        .with_telemetry(telemetry_sink)
         .with_limits(arc_hooks::ContainmentLimits {
             max_memory_bytes: max_memory_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
         });
@@ -2095,12 +2177,37 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
         return 2;
     }
 
+    let telemetry = arc_telemetry::TelemetryClient::from_environment();
     let mut response = adapter.encode(&allow);
     for event in &events {
-        let verdict = evaluator.evaluate(event);
+        let started = std::time::Instant::now();
+        let observation = evaluator.evaluate_with_observation(event);
+        let verdict = &observation.verdict;
+        if telemetry.enabled() {
+            let mut telemetry_event = TelemetryEventBuilder {
+                action_class: action_class(event).to_string(),
+                decision: verdict_decision(verdict).to_string(),
+                rule_id: verdict_rule(verdict),
+                taint_flags: taint_names(observation.taints_after),
+                sink_class: Some(sink_class_name(observation.sink_class)),
+                target_class: target_class(event).to_string(),
+                session_id_hash: arc_telemetry::hash_identifier(&session),
+                project_id_hash: None,
+                schema_pin_status: None,
+                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                error_class: None,
+            }
+            .build(host, event.transport.as_deref());
+            telemetry_event.phase = match event.phase {
+                Phase::Pre => "pre",
+                Phase::Post => "post",
+            }
+            .to_string();
+            telemetry.emit(telemetry_event);
+        }
         // Post-phase hooks only report results for taint tracking; they never block.
         if event.phase == Phase::Pre && !verdict.is_allowed() {
-            response = adapter.encode(&verdict);
+            response = adapter.encode(verdict);
             break;
         }
     }

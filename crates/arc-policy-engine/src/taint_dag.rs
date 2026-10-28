@@ -608,6 +608,15 @@ impl TaintTracker {
             .clone()
     }
 
+    pub fn current_taints(&self, session_id: &str) -> Taint {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(session_id)
+            .map(|session| session.current_taints)
+            .unwrap_or_default()
+    }
+
     pub fn update_session_schemas(&self, session_id: &str, schemas: HashMap<String, [u8; 32]>) {
         let mut guard = self.sessions.write().unwrap();
         if let Some(dag) = guard.get_mut(session_id) {

@@ -4,11 +4,16 @@ use arc_core::event::{
 };
 use arc_core::verdict::{Explanation, Obligation, RuleId, Verdict};
 use arc_policy_engine::evaluator::PolicyEvaluator;
+use arc_telemetry::{
+    action_class, sink_class_name, taint_names, target_class, verdict_decision, verdict_rule,
+    TelemetryEventBuilder, TelemetrySink,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
@@ -83,6 +88,7 @@ pub struct McpStdioBroker {
     /// Set once a `tools/list` response failed the pin check; all tool calls are then denied.
     pub schema_pin_violated: bool,
     pub limits: ContainmentLimits,
+    pub telemetry: Option<Arc<dyn TelemetrySink>>,
     /// In-flight `tools/call` request id (JSON text) -> tool name, for result taint attribution.
     pending_calls: HashMap<String, String>,
 }
@@ -107,6 +113,7 @@ impl McpStdioBroker {
             schema_pin_required: true,
             schema_pin_violated: false,
             limits: ContainmentLimits::default(),
+            telemetry: None,
             pending_calls: HashMap::new(),
         }
     }
@@ -143,6 +150,69 @@ impl McpStdioBroker {
     pub fn with_limits(mut self, limits: ContainmentLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Option<Arc<dyn TelemetrySink>>) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    fn emit_observation(
+        &self,
+        event: &ActionEvent,
+        observation: &arc_policy_engine::evaluator::EvaluationObservation,
+        latency_ms: f64,
+    ) {
+        let Some(sink) = &self.telemetry else {
+            return;
+        };
+        let mut telemetry = TelemetryEventBuilder {
+            action_class: action_class(event).to_string(),
+            decision: verdict_decision(&observation.verdict).to_string(),
+            rule_id: verdict_rule(&observation.verdict),
+            taint_flags: taint_names(observation.taints_after),
+            sink_class: Some(sink_class_name(observation.sink_class)),
+            target_class: target_class(event).to_string(),
+            session_id_hash: arc_telemetry::hash_identifier(&self.session_id),
+            project_id_hash: None,
+            schema_pin_status: None,
+            latency_ms,
+            error_class: None,
+        }
+        .build("claude_code", Some("stdio"));
+        telemetry.phase = match event.phase {
+            Phase::Pre => "pre",
+            Phase::Post => "post",
+        }
+        .to_string();
+        sink.emit(telemetry);
+    }
+
+    fn emit_protocol_event(
+        &self,
+        action: &str,
+        decision: &str,
+        rule_id: Option<String>,
+        schema_status: Option<&str>,
+    ) {
+        let Some(sink) = &self.telemetry else {
+            return;
+        };
+        let telemetry = TelemetryEventBuilder {
+            action_class: action.to_string(),
+            decision: decision.to_string(),
+            rule_id,
+            taint_flags: Vec::new(),
+            sink_class: None,
+            target_class: "mcp_protocol".to_string(),
+            session_id_hash: arc_telemetry::hash_identifier(&self.session_id),
+            project_id_hash: None,
+            schema_pin_status: schema_status.map(str::to_string),
+            latency_ms: 0.0,
+            error_class: None,
+        }
+        .build("claude_code", Some("stdio"));
+        sink.emit(telemetry);
     }
 
     fn deny_verdict(rule: &str, summary: String, options: Vec<String>) -> Verdict {
@@ -244,12 +314,19 @@ impl McpStdioBroker {
                 .with_capabilities(caps)
                 .with_transport("stdio");
 
-                let verdict = self.evaluator.evaluate(&event);
+                let started = std::time::Instant::now();
+                let observation = self.evaluator.evaluate_with_observation(&event);
+                let verdict = &observation.verdict;
+                self.emit_observation(
+                    &event,
+                    &observation,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
 
                 if verdict.is_denied() {
                     self.requests_blocked += 1;
                     let local_resp = crate::mcp_jsonrpc::McpJsonRpcInterceptor::format_response(
-                        &req_id, &verdict,
+                        &req_id, verdict,
                     );
                     return ClientMessageOutcome::RespondLocally(local_resp);
                 }
@@ -338,6 +415,12 @@ impl McpStdioBroker {
             if self.schema_pin_required && self.pinned_schema_hash.is_none() {
                 self.schema_pin_violated = true;
                 self.requests_blocked += 1;
+                self.emit_protocol_event(
+                    "mcp_schema",
+                    "deny",
+                    Some("ARC-MCP-003".to_string()),
+                    Some("missing_pin"),
+                );
                 let id = parsed.get("id").cloned().unwrap_or(Value::Null);
                 let err = serde_json::json!({
                     "jsonrpc": "2.0",
@@ -359,6 +442,12 @@ impl McpStdioBroker {
                         if pin != hash {
                             self.schema_pin_violated = true;
                             self.requests_blocked += 1;
+                            self.emit_protocol_event(
+                                "mcp_schema",
+                                "deny",
+                                Some("ARC-MCP-003".to_string()),
+                                Some("mismatch"),
+                            );
                             let id = parsed.get("id").cloned().unwrap_or(Value::Null);
                             let err = serde_json::json!({
                                 "jsonrpc": "2.0",
@@ -377,6 +466,7 @@ impl McpStdioBroker {
                     }
 
                     self.current_schema_hash = Some(hash);
+                    self.emit_protocol_event("mcp_schema", "allow", None, Some("pinned"));
                     // Register in session
                     let event = ActionEvent::new(
                         AgentHost::ClaudeCode,
@@ -434,6 +524,7 @@ impl McpStdioBroker {
                     self.evaluator
                         .taint_tracker
                         .record_event_and_update_taints(&event);
+                    self.emit_protocol_event("mcp_result", "observed", None, None);
                 }
             }
         }

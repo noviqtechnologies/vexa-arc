@@ -1,4 +1,5 @@
 use arc_core::event::{Action, ActionEvent};
+use arc_core::taint::{SinkClass, Taint};
 use arc_core::verdict::{Explanation, Obligation, RuleId, Verdict};
 use arc_dlp::detector::SecretScanEngine;
 use std::collections::{HashMap, HashSet};
@@ -418,6 +419,13 @@ pub struct PolicyEvaluator {
     known_schemas: RwLock<HashMap<(String, String), [u8; 32]>>, // (session_id, server_name) -> canonical JCS sha256
 }
 
+pub struct EvaluationObservation {
+    pub verdict: Verdict,
+    pub taints_after: Taint,
+    pub newly_added_taints: Taint,
+    pub sink_class: SinkClass,
+}
+
 impl Default for PolicyEvaluator {
     fn default() -> Self {
         Self::new(PolicyConfig::default())
@@ -474,6 +482,19 @@ impl PolicyEvaluator {
         let mut schemas = self.known_schemas.write().unwrap();
         schemas.retain(|(s_id, _), _| s_id != session_id);
         self.taint_tracker.clear_session(dir, session_id)
+    }
+
+    pub fn evaluate_with_observation(&self, event: &ActionEvent) -> EvaluationObservation {
+        let before = self.taint_tracker.current_taints(&event.host_session_id);
+        let sink_class = TaintTracker::classify_event_sink(event);
+        let verdict = self.evaluate(event);
+        let taints_after = self.taint_tracker.current_taints(&event.host_session_id);
+        EvaluationObservation {
+            verdict,
+            taints_after,
+            newly_added_taints: taints_after & !before,
+            sink_class,
+        }
     }
 
     /// Evaluates an ActionEvent against enterprise policies and the session Taint DAG.
@@ -731,6 +752,24 @@ mod tests {
         assert!(loaded.mcp_schema_pins.is_empty());
         assert_eq!(loaded.source, Some(PolicySource::ProjectLocal));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn evaluation_observation_preserves_verdict_and_exposes_taints() {
+        let evaluator = PolicyEvaluator::default();
+        let event = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "telemetry-observation",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::FileRead {
+                path: PathBuf::from(".env"),
+            },
+        );
+        let observed = evaluator.evaluate_with_observation(&event);
+        assert!(observed.verdict.is_allowed());
+        assert!(observed.taints_after.contains(Taint::PRIVATE_DATA));
+        assert!(observed.newly_added_taints.contains(Taint::PRIVATE_DATA));
     }
 
     #[test]
