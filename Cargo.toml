@@ -14,6 +14,7 @@ members = [
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.97.0"
 authors = ["Vexa Arc Core Team <contact@vexasec.io>"]
 license = "Apache-2.0"
 repository = "https://github.com/noviqtechnologies/vexa-arc"
