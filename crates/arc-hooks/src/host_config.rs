@@ -106,9 +106,9 @@ pub fn is_arc_command(cmd: &str) -> bool {
     }
     if let Some((exe_part, _)) = cmd.split_once("intercept hook") {
         let trimmed = exe_part.trim().trim_matches('"').trim_matches('\'');
-        let exe_name = Path::new(trimmed)
-            .file_name()
-            .and_then(|n| n.to_str())
+        let exe_name = trimmed
+            .split(['/', '\\'])
+            .rfind(|s| !s.is_empty())
             .unwrap_or(trimmed);
         exe_name == "arc" || exe_name == "arc.exe" || exe_name.starts_with("arc")
     } else {
