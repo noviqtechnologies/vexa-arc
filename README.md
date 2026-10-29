@@ -6,7 +6,7 @@
 [![CycloneDX](https://img.shields.io/badge/CycloneDX-v1.6%20AI--BOM-blueviolet?logo=owasp&logoColor=white)](#6-standardized-cyclonedx-v16-ai-bom-export-arc-bom)
 [![OSV](https://img.shields.io/badge/OSV%2FEPSS-Integrated-orange?logo=opensourcesecurityfoundation&logoColor=white)](#4-advisory-package-risk-checks-arc-shield)
 [![Docs](https://img.shields.io/badge/Docs-Guides%20%26%20Reference-blueviolet?logo=read-the-docs&logoColor=white)](#-documentation--workflow-guides)
-[![Website](https://img.shields.io/badge/Website-vexasec.io-blue)](https://vexasec.io)
+<a href="https://vexasec.io" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Website-vexasec.io-blue" alt="Website" /></a>
 
 **Vexa Arc Community** (`arc`) is an open-source, local-first developer security utility: a Rust policy engine with selected Claude Code/Cursor hook events, an explicitly invoked MCP stdio broker, and advisory package checks. It is designed for individual developers, not as a universal endpoint firewall. Actions outside configured hooks and the broker are not mediated. `arc shield` does not intercept or execute package installs.
 
