@@ -6,11 +6,14 @@
 [![CycloneDX](https://img.shields.io/badge/CycloneDX-v1.6%20AI--BOM-blueviolet?logo=owasp&logoColor=white)](#6-standardized-cyclonedx-v16-ai-bom-export-arc-bom)
 [![OSV](https://img.shields.io/badge/OSV%2FEPSS-Integrated-orange?logo=opensourcesecurityfoundation&logoColor=white)](#4-advisory-package-risk-checks-arc-shield)
 [![Docs](https://img.shields.io/badge/Docs-Guides%20%26%20Reference-blueviolet?logo=read-the-docs&logoColor=white)](#-documentation--workflow-guides)
+[![Website](https://img.shields.io/badge/Website-vexasec.io-blue)](https://vexasec.io)
 
 **Vexa Arc Community** (`arc`) is an open-source, local-first developer security utility: a Rust policy engine with selected Claude Code/Cursor hook events, an explicitly invoked MCP stdio broker, and advisory package checks. It is designed for individual developers, not as a universal endpoint firewall. Actions outside configured hooks and the broker are not mediated. `arc shield` does not intercept or execute package installs.
 
 > [!IMPORTANT]
-> **Community scope:** The supported target is one developer on one workstation. Enterprise fleet enforcement is deferred. Arc is **NOT** a kernel-level EDR, **NOT** a network egress firewall, and **NOT** a replacement for commercial endpoint protection. It provides defense-in-depth only on explicitly mediated paths. Session/sink classification is heuristic, ordinary Cursor file writes bypass the scanner, and end-to-end latency has not been independently validated. See the [Community release scope and GO gates](docs/community-release-scope.md).
+> **Availability:** The Community Core is currently available free under Apache-2.0. Team capabilities are in private Beta; access and enabled scope are cohort-specific. Enterprise is future direction, not a standard offer.
+>
+> **Community scope:** The supported target is one developer on one workstation. Enterprise fleet enforcement is deferred. Arc is **NOT** a kernel-level EDR, **NOT** a network egress firewall, and **NOT** a replacement for commercial endpoint protection. It provides defense-in-depth only on explicitly mediated paths. Session/sink classification is heuristic, ordinary Cursor file writes bypass the scanner, and end-to-end latency has not been independently validated. See the [Community Core scope and release-maintenance notes](docs/community-release-scope.md).
 
 <p align="center">
   <a href="#quick-start-30-seconds"><b>Quick Start</b></a> •
@@ -21,7 +24,7 @@
   <a href="docs/product-tiers.md"><b>Product Tiers</b></a> •
   <a href="#architecture--invariants"><b>Architecture</b></a> •
   <a href="#cli-command-reference"><b>CLI Reference</b></a>
-  • <a href="docs/community-release-scope.md"><b>Community Scope / GO Gates</b></a>
+  • <a href="docs/community-release-scope.md"><b>Community Core Scope / Release Maintenance</b></a>
 </p>
 
 ---
@@ -552,8 +555,8 @@ For complete architecture diagrams, implementation walk-throughs, and configurat
 
 - 📘 [**User Guide**](docs/user-guide.md): Complete setup, CLI workflows, IDE integration (Claude Code, Cursor, Windsurf), Lethal Trifecta mitigation, and FAQ.
 - 🛠️ [**Developer Guide**](docs/developer-guide.md): Technical architecture, crate topology, normalized `ActionEvent` contracts, RFC 8785 JCS, and extending test suites.
-- [**Product Tier Matrix**](docs/product-tiers.md): Community features for the upcoming release and explicitly planned Team/Enterprise options; roadmap, not an availability promise.
-- [**Community Release Scope**](docs/community-release-scope.md): Supported local use, limitations, and stable-release gates.
+- [**Product Tier Matrix**](docs/product-tiers.md): Current free Community Core, cohort-based Team Beta, and Enterprise future direction.
+- [**Community Core Scope**](docs/community-release-scope.md): Current supported local use, limitations, and maintenance checks for future artifacts.
 
 ---
 

@@ -1,42 +1,39 @@
-# Vexa Arc Product Tiers — Release Documentation
+# Vexa Arc Product Tiers — Current Packaging
 
-**Status:** Product direction, not a pricing commitment.  
-**As of:** 27 October 2026.  
-**Upcoming release:** Community only, after the Community release gates pass. Team and Enterprise features below are planned options, not current product capabilities or commitments.
+**Status:** Current packaging guidance.
+**As of:** 29 October 2026.
+
+## Current availability
+
+- **Community Core:** Currently available as free software under Apache-2.0 for individual local use, within the technical boundaries in the [Community Core scope](community-release-scope.md).
+- **Team:** Private Beta. Access and enabled capabilities are cohort-specific; the applicable onboarding notice or written cohort terms define the scope. There is no universal public device cap, evaluation period, price, or SLA.
+- **Enterprise:** Future direction, not a generally available or standard offer. No universal feature commitment, price, cap, or service level is published.
 
 ## Tier matrix
 
-| Capability | Community — upcoming release | Team — planned, not shipping | Enterprise — future, not shipping |
+| Capability | Community Core — current/free | Team — private Beta | Enterprise — future direction |
 |---|---|---|---|
-| Intended customer | One developer on one workstation | A small engineering team coordinating shared project controls | Organizations needing centrally managed governance and support |
-| Core engine | Local Rust CLI/library and selected policy checks | Same core engine; no separate weaker security engine | Same engine plus separately validated management and integration services |
-| Host integrations | Selected Claude Code and Cursor hook events; explicit coverage limitations | Shared, versioned team configuration for supported adapters; broader coverage only after host-specific testing | Managed deployment/configuration and coverage reporting after fleet agent exists |
-| MCP protection | Explicitly launched stdio broker; user-provided reviewed schema pin, or clearly labeled development-only TOFU | Git-reviewed team MCP allowlist and schema pin updates; CI checks for unexpected changes | Authenticated central pin distribution, key rotation/rollback, fleet policy enforcement; remote transports only after proxy is built and assessed |
-| Taint and DLP | Heuristic classification and selected-path scanning; not universal interception or dataflow proof | Shared, reviewable policy and CI reporting for supported checks; enforcement only on validated paths | Fleet-wide policy administration and audit evidence after broader mediation and controls are independently validated |
-| Package checks | Advisory name heuristic; optional exact-version OSV vulnerability query; no install interception | Reproducible CI advisory checks and team-configured thresholds may be explored; not an install firewall | Registry-backed, provenance-aware install controls and managed offline feeds only after they are implemented and tested |
-| Policy distribution | Local files and explicit local configuration | Repository/Git-distributed policy with review and change history; no centralized remote trust service assumed | Signed organization policy bundles, managed trust keys, rollback protection, deployment inventory |
-| CI/CD | CLI can be invoked by the user's pipeline; current checks remain advisory unless that pipeline explicitly fails on status | Team-owned CI templates, shared rules, machine-readable results/SARIF only after validated | Central policy gates, organization-wide reporting, deployment controls and integrations after delivery |
-| Users, identity, and roles | Local OS user; no Arc-managed SSO/RBAC | Lightweight team ownership and reviewer roles are a candidate, not yet designed | SSO, RBAC, group mapping, administrator controls and audit trails, subject to a real service and security review |
-| Audit and integrations | Local output/files; user controls retention | Repository-attached findings and CI artifacts may be supported | Managed audit events, SIEM/OpenTelemetry integrations, retention and privacy controls |
-| Support and availability | Community support; no enterprise SLA implied | Paid support is a future packaging decision | Contracted support/SLA only after service operations and incident response are staffed |
-| Price and limits | Free; no usage quota is specified here | Not priced or committed | Not priced or committed |
+| Intended use | One developer on one workstation | Participating beta teams under cohort-specific scope | Organizations with future centralized-governance requirements |
+| Availability | Current Apache-2.0 local core | Access is granted by cohort; not general availability | Not a standard offer |
+| Host and MCP coverage | Selected Claude Code/Cursor hook events and explicitly launched MCP stdio broker only | Use only the hosts and capabilities explicitly listed for the cohort; do not infer broader coverage | Future scope requires host-specific validation and a delivered service |
+| Policy and coordination | Local files and explicit local configuration | Only beta capabilities explicitly enabled for the cohort; no general promise of shared policy distribution | Future option requiring design, implementation, and security review |
+| Package checks | Advisory; no package-install interception | Cohort-specific only; no install-blocking promise | Future option only after implementation and validation |
+| Identity, audit, and integrations | Local OS identity and user-controlled local output | Cohort-specific; no general SSO, central audit, or SIEM entitlement is implied | Future direction, subject to implemented and validated scope |
+| Support | Community channels; no enterprise SLA implied | Support and response expectations are stated per cohort; no universal SLA | Not offered as a standard support plan |
+| Price, limits, and duration | Free under Apache-2.0; no usage quota is specified here | No universal public price, device cap, or beta duration; follow the specific cohort terms | No standard price, cap, or availability commitment |
 
-**Meaning of statuses:** “Upcoming” means intended for the next scoped Community release but still subject to the release checklist. “Planned” or “future” means a discovery/roadmap option only; there is no working implementation, availability date, or purchase entitlement.
+## How to interpret Team Beta
 
-## Packaging rules
+“Team Beta” confirms that a cohort-based beta exists; it does not mean every capability in the Enterprise column, or every roadmap concept elsewhere in the repository, is available. Only the features, supported hosts, entitlements, support expectations, and terms explicitly supplied to a participating cohort should be represented as enabled. Do not publish a universal numerical cap or preview period unless an approved common policy is adopted.
 
-Do not paywall the basic security primitives that make the local tool useful, or leave Community with a deliberately unsafe engine. Differentiation should come from shared administration, coordination, verified integrations, fleet operations, auditability, and support—not from weakening local decisions.
+## Packaging principles
 
-Keep Community useful without a Vexa-hosted service. The Team path should begin with a repository-controlled policy workflow and CI checks, because those can be reviewed and rolled back with familiar developer practices. Do not build a cloud control plane before teams demonstrate that Git-based coordination is insufficient.
+Keep Community useful without requiring a Vexa-hosted service. Do not weaken local security primitives to create a paid tier. Distinguish the current local core from beta-only coordination and future enterprise operations. Never describe a planned feature as shipped merely because it appears in an architecture document.
 
-Enterprise is not “Team plus a dashboard.” It requires a managed trust root, policy signing and revocation, safe rollback, identity and authorization, endpoint inventory, upgrade/rollback operations, audit retention, incident handling, and independent validation. Build those only against specific customer requirements and operational ownership.
+## Progression beyond beta
 
-## Release gates between tiers
+Team Beta may move to a broader offer only after supported-host coverage, shared policy behavior, CI output, ownership/review, migration, rollback, and support operations are validated. Enterprise requires a separate threat model and operational plan for identity, authorization, policy signing and revocation, rollback protection, endpoint inventory, audit/privacy/retention, incident response, availability, and support. These are readiness criteria, not current entitlements.
 
-**Community → Team:** demonstrate repeated demand from multiple real teams; define the shared policy format and compatibility rules; add policy review/ownership, deterministic CI output, supported-host test coverage, and false-positive/override measurement; validate migration and rollback. Do not call current CLI flags “team governance.”
+## Release maintenance
 
-**Team → Enterprise:** establish a threat model and service architecture; provide authenticated tenant identity and authorization; sign and revoke policy bundles; prevent replay/rollback; inventory endpoint versions and health; define audit, privacy, retention, incident response, availability, and support operations; run adversarial tests and an operational pilot. A remote service must fail safely without silently weakening local policy.
-
-## Tier strategy
-
-Make the progression from individual use to shared team workflow to organization-level governance understandable. Keep Vexa Arc focused on its local agent/MCP wedge, and add each tier's capabilities only after customer evidence, implementation, and validation support them.
+For each new tagged artifact, preserve evidence for formatting, locked tests, lint/security checks across supported platforms, host install/rollback smoke tests, broker failure cases, checksums/provenance, and security-disclosure availability. This maintenance checklist does not change the current Community Core availability and is not, by itself, proof that a particular future artifact passed validation.
