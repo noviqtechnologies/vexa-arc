@@ -64,16 +64,7 @@ pub struct SessionLock {
 
 impl SessionLock {
     pub fn acquire(dir: &Path, session_id: &str) -> std::io::Result<Self> {
-        let safe_name: String = session_id
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let safe_name = SessionTaintDag::safe_file_name(session_id);
         let lock_file = dir.join(format!("{safe_name}.lock"));
         let start = std::time::Instant::now();
         loop {
@@ -115,6 +106,20 @@ impl Drop for SessionLock {
 }
 
 impl SessionTaintDag {
+    /// Sanitizes a session ID into a safe filesystem-compatible basename
+    pub fn safe_file_name(session_id: &str) -> String {
+        session_id
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
     pub fn new(session_id: impl Into<String>) -> Self {
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         Self {
@@ -289,17 +294,7 @@ impl SessionTaintDag {
         std::fs::create_dir_all(dir)?;
         let _lock = SessionLock::acquire(dir, &self.session_id)?;
 
-        let safe_name: String = self
-            .session_id
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let safe_name = Self::safe_file_name(&self.session_id);
         let target_path = dir.join(format!("{safe_name}.json"));
         let temp_path = dir.join(format!("{safe_name}.tmp.{}", uuid::Uuid::now_v7()));
 
@@ -371,16 +366,7 @@ impl SessionTaintDag {
 
     /// Loads a session's state from disk if it exists, acquiring a lock for safety.
     pub fn load_from_dir(dir: &Path, session_id: &str) -> std::io::Result<Option<Self>> {
-        let safe_name: String = session_id
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let safe_name = Self::safe_file_name(session_id);
         let path = dir.join(format!("{safe_name}.json"));
         if !path.exists() {
             return Ok(None);
@@ -402,7 +388,7 @@ impl SessionTaintDag {
         Ok(Some(dag))
     }
 
-    /// Safely prunes all expired session files from a directory (NFR-PRIV-004)
+    /// Safely prunes all expired session files and associated audit logs from a directory (NFR-PRIV-004)
     pub fn cleanup_expired_sessions(dir: &Path, max_age_hours: u64) -> std::io::Result<usize> {
         if !dir.exists() || !dir.is_dir() {
             return Ok(0);
@@ -413,17 +399,40 @@ impl SessionTaintDag {
 
         for entry in std::fs::read_dir(dir)?.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let is_audit = file_name.ends_with(".audit.jsonl");
+
+            if is_json {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(dag) = serde_json::from_str::<SessionTaintDag>(&content) {
-                        let is_old = if let Some(exp) = dag.expires_at_ms {
-                            now > exp
-                        } else {
-                            now.saturating_sub(dag.created_at_ms) > max_age_ms
-                        };
+                        let is_expired_by_ttl = dag.expires_at_ms.is_some_and(|exp| now > exp);
+                        let is_older_than_threshold =
+                            now.saturating_sub(dag.created_at_ms) >= max_age_ms;
+                        let is_old = is_expired_by_ttl || is_older_than_threshold;
                         if is_old {
                             let _ = std::fs::remove_file(&path);
+                            // Also prune associated audit log if present
+                            let audit_path = path.with_file_name(format!(
+                                "{}.audit.jsonl",
+                                path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
+                            ));
+                            if audit_path.exists() {
+                                let _ = std::fs::remove_file(&audit_path);
+                            }
                             pruned += 1;
+                        }
+                    }
+                }
+            } else if is_audit {
+                // If orphaned or older than max_age_ms, prune it
+                if let Ok(meta) = path.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(elapsed) = modified.elapsed() {
+                            if elapsed.as_millis() as u64 > max_age_ms {
+                                let _ = std::fs::remove_file(&path);
+                                pruned += 1;
+                            }
                         }
                     }
                 }
@@ -432,20 +441,15 @@ impl SessionTaintDag {
         Ok(pruned)
     }
 
-    /// Removes a session's persisted file from disk.
+    /// Removes a session's persisted file and operational audit log from disk.
     pub fn delete_from_dir(dir: &Path, session_id: &str) -> std::io::Result<bool> {
         let _lock = SessionLock::acquire(dir, session_id)?;
-        let safe_name: String = session_id
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let safe_name = Self::safe_file_name(session_id);
         let path = dir.join(format!("{safe_name}.json"));
+        let audit_path = dir.join(format!("{safe_name}.audit.jsonl"));
+        if audit_path.exists() {
+            let _ = std::fs::remove_file(audit_path);
+        }
         if path.exists() {
             std::fs::remove_file(path)?;
             Ok(true)
@@ -1246,6 +1250,161 @@ pub fn classify_shell_command(command: &str) -> SinkClass {
     sink
 }
 
+/// Represents a structured operational audit log entry for a mediated session event (Pillar 2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAuditRecord {
+    pub timestamp: u64,
+    pub event_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub action_kind: String,
+    pub verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub redactions: usize,
+}
+
+impl SessionAuditRecord {
+    pub fn new(
+        event_id: impl Into<String>,
+        tool: impl Into<String>,
+        action_kind: impl Into<String>,
+        verdict: impl Into<String>,
+        rule_id: Option<String>,
+        redactions: usize,
+    ) -> Self {
+        let timestamp = chrono::Utc::now().timestamp().max(0) as u64;
+        Self {
+            timestamp,
+            event_id: event_id.into(),
+            tool: tool.into(),
+            action_kind: action_kind.into(),
+            verdict: verdict.into(),
+            rule_id,
+            redactions,
+        }
+    }
+
+    /// Appends this audit record as a single JSON line to <storage_dir>/<safe_session_id>.audit.jsonl
+    pub fn append_to_dir(&self, dir: &Path, session_id: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let safe_name = SessionTaintDag::safe_file_name(session_id);
+        let path = dir.join(format!("{safe_name}.audit.jsonl"));
+        let json_line = serde_json::to_string(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", json_line)?;
+        Ok(())
+    }
+
+    /// Reads all audit records for a given session from <storage_dir>/<safe_session_id>.audit.jsonl
+    pub fn read_all_from_dir(
+        dir: &Path,
+        session_id: &str,
+    ) -> std::io::Result<Vec<SessionAuditRecord>> {
+        let safe_name = SessionTaintDag::safe_file_name(session_id);
+        let path = dir.join(format!("{safe_name}.audit.jsonl"));
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let mut records = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(rec) = serde_json::from_str::<SessionAuditRecord>(line) {
+                records.push(rec);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Reads all audit records across all *.audit.jsonl files in <storage_dir>
+    pub fn read_all_sessions_from_dir(
+        dir: &Path,
+    ) -> std::io::Result<HashMap<String, Vec<SessionAuditRecord>>> {
+        let mut result = HashMap::new();
+        if !dir.exists() || !dir.is_dir() {
+            return Ok(result);
+        }
+        for entry in std::fs::read_dir(dir)?.flatten() {
+            let path = entry.path();
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(session_stem) = file_name.strip_suffix(".audit.jsonl") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let mut records = Vec::new();
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if !line.is_empty() {
+                            if let Ok(rec) = serde_json::from_str::<SessionAuditRecord>(line) {
+                                records.push(rec);
+                            }
+                        }
+                    }
+                    result.insert(session_stem.to_string(), records);
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// Aggregated metrics computed from operational audit log records
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionAuditSummary {
+    pub session_id: String,
+    pub total_events: usize,
+    pub allows: usize,
+    pub denies: usize,
+    pub approvals: usize,
+    pub quarantines: usize,
+    pub total_redactions: usize,
+    pub rule_breakdown: HashMap<String, usize>,
+    pub tool_breakdown: HashMap<String, usize>,
+    pub first_event_timestamp: Option<u64>,
+    pub last_event_timestamp: Option<u64>,
+}
+
+impl SessionAuditSummary {
+    pub fn from_records(session_id: &str, records: &[SessionAuditRecord]) -> Self {
+        let mut summary = SessionAuditSummary {
+            session_id: session_id.to_string(),
+            total_events: records.len(),
+            ..Default::default()
+        };
+        for r in records {
+            match r.verdict.to_lowercase().as_str() {
+                "allow" => summary.allows += 1,
+                "deny" => summary.denies += 1,
+                "requireapproval" | "approval" => summary.approvals += 1,
+                "quarantine" => summary.quarantines += 1,
+                _ => {}
+            }
+            summary.total_redactions += r.redactions;
+            if let Some(ref rule) = r.rule_id {
+                *summary.rule_breakdown.entry(rule.clone()).or_insert(0) += 1;
+            }
+            *summary.tool_breakdown.entry(r.tool.clone()).or_insert(0) += 1;
+            summary.first_event_timestamp = match summary.first_event_timestamp {
+                None => Some(r.timestamp),
+                Some(ts) => Some(ts.min(r.timestamp)),
+            };
+            summary.last_event_timestamp = match summary.last_event_timestamp {
+                None => Some(r.timestamp),
+                Some(ts) => Some(ts.max(r.timestamp)),
+            };
+        }
+        summary
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1567,5 +1726,73 @@ mod tests {
         assert!(dag
             .check_field_level_lethal_trifecta(Some("git_push"), mcp_sink)
             .is_some());
+    }
+
+    #[test]
+    fn test_session_audit_record_lifecycle_and_pruning() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "arc-audit-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let session_id = "test-audit-sess";
+
+        // 1. Append records
+        let rec1 = SessionAuditRecord::new("ev-1", "read", "file_read", "Allow", None, 0);
+        let rec2 = SessionAuditRecord::new(
+            "ev-2",
+            "curl",
+            "shell",
+            "Deny",
+            Some("ARC-LTT-001".to_string()),
+            1,
+        );
+        let rec3 = SessionAuditRecord::new(
+            "ev-3",
+            "tool",
+            "mcp_call",
+            "RequireApproval",
+            Some("ARC-APP-001".to_string()),
+            0,
+        );
+
+        rec1.append_to_dir(&temp_dir, session_id).unwrap();
+        rec2.append_to_dir(&temp_dir, session_id).unwrap();
+        rec3.append_to_dir(&temp_dir, session_id).unwrap();
+
+        // 2. Read back
+        let records = SessionAuditRecord::read_all_from_dir(&temp_dir, session_id).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].verdict, "Allow");
+        assert_eq!(records[1].verdict, "Deny");
+        assert_eq!(records[2].verdict, "RequireApproval");
+
+        // 3. Summarize
+        let summary = SessionAuditSummary::from_records(session_id, &records);
+        assert_eq!(summary.total_events, 3);
+        assert_eq!(summary.allows, 1);
+        assert_eq!(summary.denies, 1);
+        assert_eq!(summary.approvals, 1);
+        assert_eq!(summary.quarantines, 0);
+        assert_eq!(summary.total_redactions, 1);
+        assert_eq!(summary.rule_breakdown.get("ARC-LTT-001"), Some(&1));
+        assert_eq!(summary.tool_breakdown.get("curl"), Some(&1));
+
+        // 4. Also create a session DAG and test deletion cleans up both
+        let dag = SessionTaintDag::new(session_id);
+        dag.save_to_dir(&temp_dir).unwrap();
+        let safe_name = SessionTaintDag::safe_file_name(session_id);
+        assert!(temp_dir.join(format!("{safe_name}.json")).exists());
+        assert!(temp_dir.join(format!("{safe_name}.audit.jsonl")).exists());
+
+        // Deleting the session removes both
+        assert!(SessionTaintDag::delete_from_dir(&temp_dir, session_id).unwrap());
+        assert!(!temp_dir.join(format!("{safe_name}.json")).exists());
+        assert!(!temp_dir.join(format!("{safe_name}.audit.jsonl")).exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use crate::adapter::{AdapterError, HostAdapter, HostResponse};
 use crate::host_config::{
-    find_arc_command, read_json_object, upsert_event_entry, write_json_atomic,
+    backup_existing_config, find_arc_command, format_hook_command, read_json_object,
+    resolve_canonical_arc_binary, upsert_event_entry, validate_hooks_object, write_json_atomic,
+    HostInstallSummary,
 };
 
 pub struct CursorAdapter;
@@ -242,16 +244,39 @@ impl CursorAdapter {
         base_dir.join(".cursor").join("settings.json")
     }
 
-    /// `failClosed: true` makes Cursor block the action if the hook crashes, times out, or
-    /// returns invalid output (Cursor otherwise fails open).
-    fn hook_entry() -> Value {
-        serde_json::json!({ "command": Self::DEFAULT_HOOK_CMD, "failClosed": true })
+    fn hook_entry_with_cmd(cmd: &str) -> Value {
+        serde_json::json!({ "command": cmd, "failClosed": true })
     }
 
     /// Installs enforcement hooks into `.cursor/hooks.json` using Cursor's documented schema.
-    pub fn install_integration(base_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    ///
+    /// Performs preflight validation: resolves canonical binary path, checks permissions,
+    /// backs up existing config to `.cursor/hooks.json.arc.bak`, and fails closed
+    /// if `hooks` is not a valid JSON object.
+    pub fn install_integration(base_dir: &std::path::Path) -> std::io::Result<HostInstallSummary> {
+        Self::install_integration_with_custom_exe(base_dir, None)
+    }
+
+    pub fn install_integration_with_custom_exe(
+        base_dir: &std::path::Path,
+        custom_exe: Option<&std::path::Path>,
+    ) -> std::io::Result<HostInstallSummary> {
         let config_path = Self::hooks_path(base_dir);
+
+        // Preflight 1: Binary resolution & executable permissions check
+        let (exe_path, volatile_warning) = match custom_exe {
+            Some(p) => (p.to_path_buf(), None),
+            None => resolve_canonical_arc_binary()?,
+        };
+
+        let hook_cmd = format_hook_command(&exe_path, "cursor");
+
+        // Preflight 2: Byte-for-byte backup of existing configuration
+        let backup_path = backup_existing_config(&config_path)?;
+
+        // Preflight 3: Safe structural JSON reading and validation
         let mut root = read_json_object(&config_path)?;
+        validate_hooks_object(&root, &config_path)?;
 
         let obj = root.as_object_mut().expect("validated as object");
         obj.entry("version".to_string())
@@ -259,23 +284,29 @@ impl CursorAdapter {
         let hooks = obj
             .entry("hooks".to_string())
             .or_insert_with(|| serde_json::json!({}));
-        if !hooks.is_object() {
-            *hooks = serde_json::json!({});
-        }
+
         for event in BEFORE_EVENTS {
-            upsert_event_entry(hooks, event, Some(Self::hook_entry()));
+            upsert_event_entry(hooks, event, Some(Self::hook_entry_with_cmd(&hook_cmd)));
         }
         for event in AFTER_EVENTS {
             // After-hooks only report; they must never break the agent if Arc is unavailable.
             upsert_event_entry(
                 hooks,
                 event,
-                Some(serde_json::json!({ "command": Self::DEFAULT_HOOK_CMD })),
+                Some(serde_json::json!({ "command": hook_cmd })),
             );
         }
 
         write_json_atomic(&config_path, &root)?;
-        Ok(config_path)
+
+        Ok(HostInstallSummary {
+            host: AgentHost::Cursor,
+            config_path,
+            backup_path,
+            executable_path: exe_path,
+            hook_command: hook_cmd,
+            volatile_warning,
+        })
     }
 
     pub fn uninstall_integration(base_dir: &std::path::Path) -> std::io::Result<bool> {
@@ -456,16 +487,42 @@ mod tests {
     #[test]
     fn install_writes_hooks_json_with_fail_closed() {
         let dir = std::env::temp_dir().join(format!("arc_cursor_schema_{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = CursorAdapter::install_integration(&dir).unwrap();
+        std::fs::create_dir_all(dir.join(".cursor")).unwrap();
+        let initial_json = r#"{"version":1,"hooks":{"beforeShellExecution":[{"command":"./existing.sh","failClosed":false}]}}"#;
+        std::fs::write(dir.join(".cursor").join("hooks.json"), initial_json).unwrap();
+
+        let summary = CursorAdapter::install_integration(&dir).unwrap();
+        assert!(summary.backup_path.is_some());
+        let bak = dir.join(".cursor").join("hooks.json.arc.bak");
+        assert!(bak.exists());
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), initial_json);
+
         CursorAdapter::install_integration(&dir).unwrap();
+        let path = summary.config_path;
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["version"], 1);
         let shell = v["hooks"]["beforeShellExecution"].as_array().unwrap();
-        assert_eq!(shell.len(), 1);
-        assert_eq!(shell[0]["failClosed"], true);
+        assert_eq!(shell.len(), 2);
+        assert!(shell.iter().any(|e| e["failClosed"] == true));
         assert!(v["hooks"]["beforeMCPExecution"].is_array());
         assert!(CursorAdapter::uninstall_integration(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_install_rejects_malformed_hooks() {
+        let dir = std::env::temp_dir().join(format!("arc_cursor_bad_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join(".cursor")).unwrap();
+        let p = dir.join(".cursor").join("hooks.json");
+
+        // Test non-object hooks
+        std::fs::write(&p, r#"{"version":1,"hooks":"invalid"}"#).unwrap();
+        assert!(CursorAdapter::install_integration(&dir).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            r#"{"version":1,"hooks":"invalid"}"#
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

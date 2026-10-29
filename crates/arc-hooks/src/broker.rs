@@ -331,6 +331,42 @@ impl McpStdioBroker {
                     return ClientMessageOutcome::RespondLocally(local_resp);
                 }
 
+                let final_verdict = match verdict {
+                    Verdict::RequireApproval {
+                        rule, explanation, ..
+                    } => {
+                        // Secondary Mechanism: Out-of-band OS modal confirmation for stdio sessions
+                        match self.evaluator.approval_manager.request_approval(
+                            &self.session_id,
+                            &rule.0,
+                            &tool_name,
+                            &self.server_name,
+                            &args,
+                            &explanation.summary,
+                        ) {
+                            Ok(grant) => {
+                                // Human approved via OS modal!
+                                Verdict::Allow {
+                                    obligations: vec![arc_core::verdict::Obligation::ExceptionGranted {
+                                        id: format!("approval-{}", hex::encode(&grant.grant_key[..8])),
+                                        reason: format!("Human operator approved via OS confirmation modal: {}", explanation.summary),
+                                    }],
+                                }
+                            }
+                            Err(deny_verdict) => {
+                                self.requests_blocked += 1;
+                                let local_resp =
+                                    crate::mcp_jsonrpc::McpJsonRpcInterceptor::format_response(
+                                        &req_id,
+                                        &deny_verdict,
+                                    );
+                                return ClientMessageOutcome::RespondLocally(local_resp);
+                            }
+                        }
+                    }
+                    other => other.clone(),
+                };
+
                 // Remember the call so its result can be attributed (and taint-classified).
                 if !req_id.is_null() {
                     if self.pending_calls.len() >= MAX_PENDING_CALLS {
@@ -341,7 +377,7 @@ impl McpStdioBroker {
                 }
 
                 // If allowed with DLP obligations, redact arguments before forwarding!
-                if let Verdict::Allow { ref obligations } = verdict {
+                if let Verdict::Allow { ref obligations } = final_verdict {
                     let mut modified_args = args;
                     for ob in obligations {
                         if let Obligation::Redact { spans } = ob {

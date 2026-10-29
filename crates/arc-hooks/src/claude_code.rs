@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use crate::adapter::{AdapterError, HostAdapter, HostResponse};
 use crate::host_config::{
-    find_arc_command, is_arc_command, read_json_object, upsert_event_entry, write_json_atomic,
+    backup_existing_config, find_arc_command, format_hook_command, is_arc_command,
+    read_json_object, resolve_canonical_arc_binary, upsert_event_entry, validate_hooks_object,
+    write_json_atomic, HostInstallSummary,
 };
 
 pub struct ClaudeCodeAdapter;
@@ -279,31 +281,70 @@ impl ClaudeCodeAdapter {
         base_dir.join(".claude.json")
     }
 
-    fn hook_entry(matcher: &str) -> Value {
+    fn hook_entry_with_cmd(matcher: &str, hook_cmd: &str) -> Value {
         serde_json::json!({
             "matcher": matcher,
-            "hooks": [{ "type": "command", "command": Self::DEFAULT_HOOK_CMD }]
+            "hooks": [{ "type": "command", "command": hook_cmd }]
         })
     }
 
     /// Installs PreToolUse (enforcement) and PostToolUse (result taint) hooks into
     /// `.claude/settings.json` using Claude Code's documented matcher/handler schema.
-    pub fn install_integration(base_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    ///
+    /// Performs preflight validation: resolves canonical binary path, checks permissions,
+    /// backs up existing config to `.claude/settings.json.arc.bak`, and fails closed
+    /// if `hooks` is not a valid JSON object.
+    pub fn install_integration(base_dir: &std::path::Path) -> std::io::Result<HostInstallSummary> {
+        Self::install_integration_with_custom_exe(base_dir, None)
+    }
+
+    pub fn install_integration_with_custom_exe(
+        base_dir: &std::path::Path,
+        custom_exe: Option<&std::path::Path>,
+    ) -> std::io::Result<HostInstallSummary> {
         let config_path = Self::settings_path(base_dir);
+
+        // Preflight 1: Binary resolution & executable permissions check
+        let (exe_path, volatile_warning) = match custom_exe {
+            Some(p) => (p.to_path_buf(), None),
+            None => resolve_canonical_arc_binary()?,
+        };
+
+        let hook_cmd = format_hook_command(&exe_path, "claude-code");
+
+        // Preflight 2: Byte-for-byte backup of existing configuration
+        let backup_path = backup_existing_config(&config_path)?;
+
+        // Preflight 3: Safe structural JSON reading and validation
         let mut root = read_json_object(&config_path)?;
+        validate_hooks_object(&root, &config_path)?;
 
         let obj = root.as_object_mut().expect("validated as object");
         let hooks = obj
             .entry("hooks".to_string())
             .or_insert_with(|| serde_json::json!({}));
-        if !hooks.is_object() {
-            *hooks = serde_json::json!({});
-        }
-        upsert_event_entry(hooks, "PreToolUse", Some(Self::hook_entry("*")));
-        upsert_event_entry(hooks, "PostToolUse", Some(Self::hook_entry(POST_MATCHER)));
+
+        upsert_event_entry(
+            hooks,
+            "PreToolUse",
+            Some(Self::hook_entry_with_cmd("*", &hook_cmd)),
+        );
+        upsert_event_entry(
+            hooks,
+            "PostToolUse",
+            Some(Self::hook_entry_with_cmd(POST_MATCHER, &hook_cmd)),
+        );
 
         write_json_atomic(&config_path, &root)?;
-        Ok(config_path)
+
+        Ok(HostInstallSummary {
+            host: AgentHost::ClaudeCode,
+            config_path,
+            backup_path,
+            executable_path: exe_path,
+            hook_command: hook_cmd,
+            volatile_warning,
+        })
     }
 
     pub fn uninstall_integration(base_dir: &std::path::Path) -> std::io::Result<bool> {
@@ -521,14 +562,17 @@ mod tests {
     fn install_writes_documented_schema_and_preserves_user_hooks() {
         let dir = std::env::temp_dir().join(format!("arc_claude_schema_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        std::fs::write(
-            dir.join(".claude").join("settings.json"),
-            r#"{"model":"x","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./mine.sh"}]}]}}"#,
-        )
-        .unwrap();
+        let initial_json = r#"{"model":"x","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./mine.sh"}]}]}}"#;
+        std::fs::write(dir.join(".claude").join("settings.json"), initial_json).unwrap();
 
-        let path = ClaudeCodeAdapter::install_integration(&dir).unwrap();
+        let summary = ClaudeCodeAdapter::install_integration(&dir).unwrap();
+        assert!(summary.backup_path.is_some());
+        let bak = dir.join(".claude").join("settings.json.arc.bak");
+        assert!(bak.exists());
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), initial_json);
+
         ClaudeCodeAdapter::install_integration(&dir).unwrap(); // idempotent
+        let path = summary.config_path;
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["model"], "x");
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
@@ -546,9 +590,28 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("arc_claude_bad_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         let p = dir.join(".claude").join("settings.json");
+
+        // Test 1: Syntax error
         std::fs::write(&p, "{ not json").unwrap();
         assert!(ClaudeCodeAdapter::install_integration(&dir).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{ not json");
+
+        // Test 2: Non-object hooks (string)
+        std::fs::write(&p, r#"{"hooks":"not-an-object"}"#).unwrap();
+        assert!(ClaudeCodeAdapter::install_integration(&dir).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            r#"{"hooks":"not-an-object"}"#
+        );
+
+        // Test 3: Non-object hooks (array)
+        std::fs::write(&p, r#"{"hooks":["not-an-object"]}"#).unwrap();
+        assert!(ClaudeCodeAdapter::install_integration(&dir).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            r#"{"hooks":["not-an-object"]}"#
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

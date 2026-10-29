@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use arc_hooks::claude_code::ClaudeCodeAdapter;
 use arc_hooks::cursor::CursorAdapter;
 use arc_hooks::HostAdapter;
 use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
-use arc_policy_engine::taint_dag::SessionTaintDag;
+use arc_policy_engine::taint_dag::{SessionAuditRecord, SessionAuditSummary, SessionTaintDag};
 use arc_telemetry::{
     action_class, sink_class_name, taint_names, target_class, verdict_decision, verdict_rule,
     TelemetryEventBuilder, TelemetrySink,
@@ -156,6 +157,103 @@ enum Commands {
         #[command(subcommand)]
         action: TelemetryAction,
     },
+
+    /// Manage, inspect DAG, report operational audit logs, and resolve storage for sessions (Pillar 2)
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+
+    /// Consensual, disposable-worktree Software Composition Analysis (SCA) & automated remediation (Pillar 4)
+    Sca {
+        #[command(subcommand)]
+        action: ScaAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScaAction {
+    /// Run scoped SCA audit with standard OASIS SARIF v2.1.0 output and location sanitization
+    Audit {
+        /// Target project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Export standard OASIS SARIF v2.1.0 report to file
+        #[arg(long)]
+        sarif: Option<PathBuf>,
+
+        /// Pseudonymize relative file paths, suppress line/col coordinates, and remove source code snippets
+        #[arg(long)]
+        sanitize_locations: bool,
+
+        /// Fail with non-zero exit code if findings meet or exceed severity threshold (critical, high, medium, low)
+        #[arg(long)]
+        fail_on: Option<String>,
+
+        /// Scan only reachable vulnerabilities
+        #[arg(long)]
+        reachable_only: bool,
+
+        /// Allow scan to succeed if remote OSV advisory service is unavailable (uses local cache)
+        #[arg(long)]
+        allow_unavailable: bool,
+
+        /// Output scan results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Propose or open automated dependency remediation PRs using scratch diffs or isolated disposable worktrees
+    Fix {
+        /// Target project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Dry-run scratch proposal: output unified diff of proposed manifest/lockfile changes without modifying local state
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Open an automated Pull Request from an isolated detached git worktree
+        #[arg(long)]
+        open_pr: bool,
+
+        /// Target base branch (default: auto-detected current branch or 'main')
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Explicit branch name for remediation PR
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Target GitHub repository in format 'owner/repo' (auto-detected if omitted)
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Explicitly bypass local unpushed commit divergence check and target remote origin base ref directly
+        #[arg(long)]
+        force_remote_base: bool,
+
+        /// Opt-in test execution: run test suite ('cargo test' or 'npm test') inside remediation worktree before PR creation
+        #[arg(long)]
+        run_tests: bool,
+
+        /// GitHub authentication token (or set GITHUB_TOKEN / GH_TOKEN env var)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Scan and safely prune abandoned arc-remediation-* worktrees older than threshold
+        #[arg(long)]
+        cleanup_stale: bool,
+
+        /// Maximum age threshold in seconds for stale worktree cleanup (default: 3600s / 1h)
+        #[arg(long, default_value = "3600")]
+        max_age_secs: u64,
+
+        /// Output remediation results as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -171,6 +269,91 @@ enum TelemetryAction {
     Export {
         #[arg(short, long)]
         out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Inspect causal DAG graph structure, causal depth, tainted paths, and pinned schemas
+    Dag {
+        /// Session identifier (or omit to inspect the latest session)
+        session_id: Option<String>,
+
+        /// Pick the most recently modified session in the storage directory
+        #[arg(long)]
+        latest: bool,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
+
+        /// Output graph inspection as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Generate an operational audit report aggregating metrics and rule evaluations from <session_id>.audit.jsonl
+    Report {
+        /// Session identifier (or omit to pick latest, or use --all)
+        session_id: Option<String>,
+
+        /// Pick the most recently modified session in the storage directory
+        #[arg(long)]
+        latest: bool,
+
+        /// Aggregate audit logs across all sessions in the storage directory
+        #[arg(long)]
+        all: bool,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
+
+        /// Output report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Safely prune expired sessions and audit logs older than max-age-hours
+    Clean {
+        /// Session expiration threshold in hours for cleanup (default: 24)
+        #[arg(long, default_value = "24")]
+        max_age_hours: u64,
+
+        /// Custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Use project-local .arc/sessions storage directory
+        #[arg(long)]
+        project_local: bool,
+
+        /// Output cleanup results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Display resolved session storage directory path and hierarchy resolution details
+    Storage {
+        /// Custom session storage directory override to test
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+
+        /// Test project-local mode
+        #[arg(long)]
+        project_local: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -838,6 +1021,360 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Session { action } => match action {
+            SessionAction::Dag {
+                session_id,
+                latest,
+                session_dir,
+                project_local,
+                json,
+            } => {
+                if !run_session_dag(
+                    session_id.as_deref(),
+                    latest,
+                    session_dir.as_deref(),
+                    project_local,
+                    json,
+                ) {
+                    std::process::exit(1);
+                }
+            }
+            SessionAction::Report {
+                session_id,
+                latest,
+                all,
+                session_dir,
+                project_local,
+                json,
+            } => {
+                if !run_session_report(
+                    session_id.as_deref(),
+                    latest,
+                    all,
+                    session_dir.as_deref(),
+                    project_local,
+                    json,
+                ) {
+                    std::process::exit(1);
+                }
+            }
+            SessionAction::Clean {
+                max_age_hours,
+                session_dir,
+                project_local,
+                json,
+            } => {
+                if !run_session_clean(max_age_hours, session_dir.as_deref(), project_local, json) {
+                    std::process::exit(1);
+                }
+            }
+            SessionAction::Storage {
+                session_dir,
+                project_local,
+                json,
+            } => {
+                if !run_session_storage(session_dir.as_deref(), project_local, json) {
+                    std::process::exit(1);
+                }
+            }
+        },
+        Commands::Sca { action } => match action {
+            ScaAction::Audit {
+                path,
+                sarif,
+                sanitize_locations,
+                fail_on,
+                reachable_only,
+                allow_unavailable,
+                json,
+            } => {
+                if !run_sca_audit_cmd(
+                    &path,
+                    sarif,
+                    sanitize_locations,
+                    fail_on,
+                    reachable_only,
+                    allow_unavailable,
+                    json,
+                ) {
+                    std::process::exit(1);
+                }
+            }
+            ScaAction::Fix {
+                path,
+                dry_run,
+                open_pr,
+                base,
+                branch,
+                repo,
+                force_remote_base,
+                run_tests,
+                token,
+                cleanup_stale,
+                max_age_secs,
+                json,
+            } => {
+                if !run_sca_fix_cmd(
+                    &path,
+                    dry_run,
+                    open_pr,
+                    base,
+                    branch,
+                    repo,
+                    force_remote_base,
+                    run_tests,
+                    token,
+                    cleanup_stale,
+                    max_age_secs,
+                    json,
+                ) {
+                    std::process::exit(1);
+                }
+            }
+        },
+    }
+}
+
+fn run_sca_audit_cmd(
+    path: &Path,
+    sarif: Option<PathBuf>,
+    sanitize_locations: bool,
+    fail_on: Option<String>,
+    reachable_only: bool,
+    allow_unavailable: bool,
+    json: bool,
+) -> bool {
+    let opts = arc_firewall::remediation::ScaAuditOptions {
+        dev: true,
+        reachable_only,
+        allow_unavailable,
+        sarif_out: sarif,
+        sanitize_locations,
+        fail_on,
+    };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[Arc SCA] Failed to initialize runtime: {e}");
+            return false;
+        }
+    };
+
+    match rt.block_on(arc_firewall::remediation::run_sca_audit(path, &opts)) {
+        Ok(res) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res).unwrap_or_default());
+            } else {
+                println!(
+                    "\n═══════════════════════════════════════════════════════════════════════"
+                );
+                println!("                    ARC SCA VULNERABILITY AUDIT                        ");
+                println!("═══════════════════════════════════════════════════════════════════════");
+                println!(" Project:       {}", res.project_dir);
+                println!(
+                    " Manifest:      {} ({})",
+                    res.manifest_file, res.manifest_type
+                );
+                println!(" Vulnerabilities: {}", res.total_vulnerabilities);
+                println!("   ├─ Critical: {}", res.critical_count);
+                println!("   ├─ High:     {}", res.high_count);
+                println!("   ├─ Medium:   {}", res.medium_count);
+                println!("   └─ Low:      {}", res.low_count);
+                println!(" Reachable:     {}", res.reachable_count);
+                if let Some(ref s) = res.sarif_path {
+                    println!(" SARIF Report:  {s}");
+                    if opts.sanitize_locations {
+                        println!("   (Location sanitization active: call sites stripped, paths pseudonymized)");
+                    }
+                }
+                println!("───────────────────────────────────────────────────────────────────────");
+                if res.should_fail {
+                    println!(
+                        " Decision:      🛑 BLOCKED ({})",
+                        res.failure_reason
+                            .as_deref()
+                            .unwrap_or("Threshold exceeded")
+                    );
+                    println!(
+                        "═══════════════════════════════════════════════════════════════════════\n"
+                    );
+                    return false;
+                } else {
+                    println!(" Decision:      ✔ PASS");
+                    println!(
+                        "═══════════════════════════════════════════════════════════════════════\n"
+                    );
+                }
+            }
+            !res.should_fail
+        }
+        Err(e) => {
+            eprintln!("[Arc SCA] Audit failed: {e}");
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sca_fix_cmd(
+    path: &Path,
+    dry_run: bool,
+    open_pr: bool,
+    base: Option<String>,
+    branch: Option<String>,
+    repo: Option<String>,
+    force_remote_base: bool,
+    run_tests: bool,
+    token: Option<String>,
+    cleanup_stale: bool,
+    max_age_secs: u64,
+    json: bool,
+) -> bool {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[Arc SCA] Failed to initialize runtime: {e}");
+            return false;
+        }
+    };
+
+    if cleanup_stale {
+        match arc_firewall::remediation::prune_stale_remediation_worktrees(Some(path), max_age_secs)
+        {
+            Ok(rep) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+                } else {
+                    println!(
+                        "[Arc SCA] Cleaned up {} stale remediation worktrees (scanned: {}, skipped: {})",
+                        rep.pruned_directories, rep.scanned_directories, rep.skipped_directories
+                    );
+                }
+                return true;
+            }
+            Err(e) => {
+                eprintln!("[Arc SCA] Cleanup failed: {e}");
+                return false;
+            }
+        }
+    }
+
+    if open_pr {
+        let pr_opts = arc_firewall::remediation::WorktreePrOptions {
+            base_branch: base,
+            branch_name: branch,
+            target_repo: repo,
+            token,
+            force_remote_base,
+            run_tests,
+            dry_run,
+        };
+
+        match rt.block_on(arc_firewall::remediation::run_worktree_pr_creation(
+            path, &pr_opts,
+        )) {
+            Ok(res) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap_or_default());
+                } else {
+                    println!(
+                        "\n═══════════════════════════════════════════════════════════════════════"
+                    );
+                    println!(
+                        "            ARC SCA DISPOSABLE-WORKTREE REMEDIATION                    "
+                    );
+                    println!(
+                        "═══════════════════════════════════════════════════════════════════════"
+                    );
+                    println!(" Base Branch:   {}", res.base_branch);
+                    println!(" Branch:        {}", res.branch_name);
+                    println!(
+                        " Remediations:  {} package upgrade(s) applied",
+                        res.remediations_applied
+                    );
+                    println!(
+                        " Committed:     {}",
+                        if res.committed {
+                            "[✔] Committed"
+                        } else {
+                            "[ ] Dry run / skipped"
+                        }
+                    );
+                    println!(
+                        " Pushed:        {}",
+                        if res.pushed {
+                            "[✔] Pushed to origin"
+                        } else {
+                            "[ ] Skipped"
+                        }
+                    );
+                    if let Some(ref url) = res.pr_url {
+                        println!(" PR Opened:     {url}");
+                    }
+                    println!(" Status:        {}", res.message);
+                    println!(
+                        " Worktree:      Disposable detached worktree cleaned up successfully"
+                    );
+                    println!(
+                        "═══════════════════════════════════════════════════════════════════════\n"
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc SCA] Remediation PR creation failed: {e}");
+                false
+            }
+        }
+    } else {
+        // Default or --dry-run: execute scratch diff proposal
+        match rt.block_on(arc_firewall::remediation::run_scratch_diff(path)) {
+            Ok(res) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap_or_default());
+                } else {
+                    println!(
+                        "\n═══════════════════════════════════════════════════════════════════════"
+                    );
+                    println!(
+                        "              ARC SCA DRY-RUN SCRATCH PATCH PROPOSAL                   "
+                    );
+                    println!(
+                        "═══════════════════════════════════════════════════════════════════════"
+                    );
+                    println!(" Manifest:      {}", res.manifest_type);
+                    println!(
+                        " Remediations:  {} package update(s)",
+                        res.remediations_count
+                    );
+                    if !res.patched_files.is_empty() {
+                        println!(" Patched Files: {}", res.patched_files.join(", "));
+                    }
+                    println!(
+                        "───────────────────────────────────────────────────────────────────────"
+                    );
+                    println!(" PROPOSED PATCH (Scratch Diff - Active working tree UNTOUCHED):");
+                    println!("{}", res.diff);
+                    println!(
+                        "═══════════════════════════════════════════════════════════════════════\n"
+                    );
+                    println!("To create an isolated disposable worktree PR, run:");
+                    println!("  arc sca fix --open-pr\n");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc SCA] Scratch diff failed: {e}");
+                false
+            }
+        }
     }
 }
 
@@ -1052,11 +1589,31 @@ fn run_host_install(host: &str, workspace: Option<&Path>) -> bool {
     let root = workspace.unwrap_or(Path::new("."));
     match host.to_lowercase().as_str() {
         "claude-code" | "claude" => match ClaudeCodeAdapter::install_integration(root) {
-            Ok(_path) => {
+            Ok(summary) => {
                 println!(
-                    "[Arc Host] Claude Code integration installed at {}",
-                    root.display()
+                    "✔ Registered Claude Code hooks in {}:",
+                    summary.config_path.display()
                 );
+                println!(
+                    "  - Absolute Executable: \"{}\"",
+                    summary.executable_path.display()
+                );
+                println!(
+                    "  - Environment Validation: Path verified executable by current user (escaped for shell execution)"
+                );
+                println!(
+                    "  - Mediated PreToolUse: Bash, Read, NotebookRead, Write, Edit, MultiEdit, NotebookEdit, WebFetch, mcp__*"
+                );
+                println!("  - Mediated PostToolUse: WebFetch, WebSearch, mcp__*");
+                println!(
+                    "  - Unmediated: Direct editor writes, unhandled tool names, external terminal processes"
+                );
+                if let Some(bak) = &summary.backup_path {
+                    println!("  - Backup saved: {}", bak.display());
+                }
+                if let Some(warn) = &summary.volatile_warning {
+                    eprintln!("  [WARN] {}", warn);
+                }
                 true
             }
             Err(e) => {
@@ -1065,11 +1622,30 @@ fn run_host_install(host: &str, workspace: Option<&Path>) -> bool {
             }
         },
         "cursor" => match CursorAdapter::install_integration(root) {
-            Ok(_path) => {
+            Ok(summary) => {
                 println!(
-                    "[Arc Host] Cursor integration installed at {}",
-                    root.display()
+                    "✔ Registered Cursor hooks in {}:",
+                    summary.config_path.display()
                 );
+                println!(
+                    "  - Absolute Executable: \"{}\"",
+                    summary.executable_path.display()
+                );
+                println!(
+                    "  - Environment Validation: Path verified executable by current user (escaped for shell execution)"
+                );
+                println!(
+                    "  - Mediated Events: beforeShellExecution, beforeMCPExecution, beforeReadFile, afterMCPExecution"
+                );
+                println!(
+                    "  - Unmediated: Direct editor writes, unhandled tools, external terminal processes"
+                );
+                if let Some(bak) = &summary.backup_path {
+                    println!("  - Backup saved: {}", bak.display());
+                }
+                if let Some(warn) = &summary.volatile_warning {
+                    eprintln!("  [WARN] {}", warn);
+                }
                 true
             }
             Err(e) => {
@@ -2205,6 +2781,28 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
             .to_string();
             telemetry.emit(telemetry_event);
         }
+        // Record operational audit log for every evaluated action (Pillar 2)
+        let rule_id = verdict_rule(verdict);
+        let redactions_count = match verdict {
+            arc_core::verdict::Verdict::Allow { obligations } => obligations
+                .iter()
+                .filter_map(|o| match o {
+                    arc_core::verdict::Obligation::Redact { spans } => Some(spans.len()),
+                    _ => None,
+                })
+                .sum(),
+            _ => 0,
+        };
+        let audit_record = SessionAuditRecord::new(
+            event.event_id.to_string(),
+            target_class(event),
+            action_class(event),
+            verdict_decision(verdict),
+            rule_id,
+            redactions_count,
+        );
+        let _ = audit_record.append_to_dir(&storage_dir, &session);
+
         // Post-phase hooks only report results for taint tracking; they never block.
         if event.phase == Phase::Pre && !verdict.is_allowed() {
             response = adapter.encode(verdict);
@@ -2277,21 +2875,38 @@ fn check_session_dir_usable(dir: &Path) -> Result<(), String> {
     }
 }
 
-fn resolve_session_storage_dir(
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStorageResolution {
+    pub resolved_dir: PathBuf,
+    pub source: String,
+    pub is_writable: bool,
+}
+
+fn resolve_session_storage_dir_detailed(
     override_dir: Option<&Path>,
     project_local: bool,
-) -> Result<PathBuf, String> {
+) -> Result<SessionStorageResolution, String> {
     // 1. Explicit override passed via CLI argument
     if let Some(dir) = override_dir {
+        let is_writable = check_session_dir_usable(dir).is_ok();
         check_session_dir_usable(dir)?;
-        return Ok(dir.to_path_buf());
+        return Ok(SessionStorageResolution {
+            resolved_dir: dir.to_path_buf(),
+            source: "CLI argument override (--session-dir)".to_string(),
+            is_writable,
+        });
     }
 
     // 2. Explicit environment variable ARC_SESSION_DIR
     if let Ok(env_dir) = std::env::var("ARC_SESSION_DIR") {
         let pb = PathBuf::from(env_dir);
+        let is_writable = check_session_dir_usable(&pb).is_ok();
         check_session_dir_usable(&pb)?;
-        return Ok(pb);
+        return Ok(SessionStorageResolution {
+            resolved_dir: pb,
+            source: "Environment variable override (ARC_SESSION_DIR)".to_string(),
+            is_writable,
+        });
     }
 
     // 3. Opt-in project-local mode (via --project-local flag or ARC_PROJECT_LOCAL=1)
@@ -2301,26 +2916,46 @@ fn resolve_session_storage_dir(
 
     if project_local || env_local {
         let local_arc = Path::new(".arc").join("sessions");
+        let is_writable = check_session_dir_usable(&local_arc).is_ok();
         check_session_dir_usable(&local_arc)?;
-        return Ok(local_arc);
+        return Ok(SessionStorageResolution {
+            resolved_dir: local_arc,
+            source: "Opt-in project-local mode (--project-local or ARC_PROJECT_LOCAL=1)"
+                .to_string(),
+            is_writable,
+        });
     }
 
     // 4. If current working directory already contains .arc/sessions, preserve project-local continuity
     let cwd_local = Path::new(".arc").join("sessions");
     if cwd_local.is_dir() && check_session_dir_usable(&cwd_local).is_ok() {
-        return Ok(cwd_local);
+        return Ok(SessionStorageResolution {
+            resolved_dir: cwd_local,
+            source: "Existing CWD directory continuity (.arc/sessions)".to_string(),
+            is_writable: true,
+        });
     }
 
     // 5. OS-appropriate user data directory:
     #[cfg(windows)]
-    let base_user_dir = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("USERPROFILE").map(|p| PathBuf::from(p).join(".arc")));
+    let (base_user_dir, source_desc) = match std::env::var("LOCALAPPDATA") {
+        Ok(p) => (
+            Ok(PathBuf::from(p)),
+            "OS User Data Directory (%LOCALAPPDATA%\\vexa-arc\\sessions)",
+        ),
+        Err(_) => (
+            std::env::var("USERPROFILE").map(|p| PathBuf::from(p).join(".arc")),
+            "OS User Data Directory fallback (%USERPROFILE%\\.arc\\vexa-arc\\sessions)",
+        ),
+    };
 
     #[cfg(not(windows))]
-    let base_user_dir = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| {
+    let (base_user_dir, source_desc) = match std::env::var("XDG_DATA_HOME") {
+        Ok(p) => (
+            Ok(PathBuf::from(p)),
+            "OS User Data Directory ($XDG_DATA_HOME/vexa-arc/sessions)",
+        ),
+        Err(_) => (
             std::env::var("HOME").map(|h| {
                 #[cfg(target_os = "macos")]
                 {
@@ -2332,26 +2967,574 @@ fn resolve_session_storage_dir(
                 {
                     PathBuf::from(&h).join(".local").join("share")
                 }
-            })
-        });
+            }),
+            #[cfg(target_os = "macos")]
+            "OS User Data Directory (~/Library/Application Support/vexa-arc/sessions)",
+            #[cfg(not(target_os = "macos"))]
+            "OS User Data Directory (~/.local/share/vexa-arc/sessions)",
+        ),
+    };
 
     if let Ok(user_dir) = base_user_dir {
         let arc_dir = user_dir.join("vexa-arc").join("sessions");
         if check_session_dir_usable(&arc_dir).is_ok() {
-            return Ok(arc_dir);
+            return Ok(SessionStorageResolution {
+                resolved_dir: arc_dir,
+                source: source_desc.to_string(),
+                is_writable: true,
+            });
         }
     }
 
     // 6. Fallback: system temp directory
     let temp_arc = std::env::temp_dir().join("vexa-arc").join("sessions");
+    let is_writable = check_session_dir_usable(&temp_arc).is_ok();
     check_session_dir_usable(&temp_arc)?;
-    Ok(temp_arc)
+    Ok(SessionStorageResolution {
+        resolved_dir: temp_arc,
+        source:
+            "System temp directory fallback (%TEMP%\\vexa-arc\\sessions or /tmp/vexa-arc/sessions)"
+                .to_string(),
+        is_writable,
+    })
+}
+
+fn resolve_session_storage_dir(
+    override_dir: Option<&Path>,
+    project_local: bool,
+) -> Result<PathBuf, String> {
+    resolve_session_storage_dir_detailed(override_dir, project_local).map(|r| r.resolved_dir)
 }
 
 #[allow(dead_code)]
 fn get_session_storage_dir(override_dir: Option<&Path>, project_local: bool) -> PathBuf {
     resolve_session_storage_dir(override_dir, project_local)
         .unwrap_or_else(|_| std::env::temp_dir().join("vexa-arc").join("sessions"))
+}
+
+fn find_latest_session_in_dir(dir: &Path) -> Option<String> {
+    if !dir.exists() || !dir.is_dir() {
+        return None;
+    }
+    let mut latest: Option<(String, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let file_name = path.file_stem().and_then(|s| s.to_str())?;
+            if let Ok(meta) = path.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if let Some((_, prev_time)) = latest {
+                        if modified > prev_time {
+                            latest = Some((file_name.to_string(), modified));
+                        }
+                    } else {
+                        latest = Some((file_name.to_string(), modified));
+                    }
+                }
+            }
+        }
+    }
+    latest.map(|(name, _)| name)
+}
+
+fn find_latest_audit_session_in_dir(dir: &Path) -> Option<String> {
+    if !dir.exists() || !dir.is_dir() {
+        return None;
+    }
+    let mut latest: Option<(String, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let file_name = path.file_name().and_then(|s| s.to_str())?;
+        if let Some(stem) = file_name.strip_suffix(".audit.jsonl") {
+            if let Ok(meta) = path.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if let Some((_, prev_time)) = latest {
+                        if modified > prev_time {
+                            latest = Some((stem.to_string(), modified));
+                        }
+                    } else {
+                        latest = Some((stem.to_string(), modified));
+                    }
+                }
+            }
+        }
+    }
+    latest.map(|(name, _)| name)
+}
+
+fn run_session_dag(
+    session_id: Option<&str>,
+    _latest: bool,
+    session_dir: Option<&Path>,
+    project_local: bool,
+    json: bool,
+) -> bool {
+    let storage_dir = match resolve_session_storage_dir(session_dir, project_local) {
+        Ok(dir) => dir,
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({ "error": e, "success": false }));
+            } else {
+                eprintln!("[Arc Session] Storage directory resolution error: {e}");
+            }
+            return false;
+        }
+    };
+
+    let target_session = match session_id {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => {
+            if let Some(s) = find_latest_session_in_dir(&storage_dir) {
+                s
+            } else {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "error": "No sessions found in storage directory",
+                            "storage_dir": storage_dir.display().to_string(),
+                            "success": false
+                        })
+                    );
+                } else {
+                    eprintln!(
+                        "[Arc Session] No session records found in storage directory: {}",
+                        storage_dir.display()
+                    );
+                    eprintln!("Tip: Specify an explicit session ID with 'arc session dag <session_id>' or run an agent hook to record a session.");
+                }
+                return false;
+            }
+        }
+    };
+
+    let dag = match SessionTaintDag::load_from_dir(&storage_dir, &target_session) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": format!("Session '{target_session}' not found or expired"),
+                        "storage_dir": storage_dir.display().to_string(),
+                        "success": false
+                    })
+                );
+            } else {
+                eprintln!(
+                    "[Arc Session] Session '{target_session}' does not exist or has expired in {}",
+                    storage_dir.display()
+                );
+            }
+            return false;
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": format!("Tamper detected or unreadable session file: {e}"),
+                        "session_id": target_session,
+                        "storage_dir": storage_dir.display().to_string(),
+                        "success": false
+                    })
+                );
+            } else {
+                eprintln!("[Arc Session] Error loading session '{target_session}': {e}");
+            }
+            return false;
+        }
+    };
+
+    let integrity_verified = dag.verify_integrity();
+    let safe_name = SessionTaintDag::safe_file_name(&target_session);
+    let session_file = storage_dir.join(format!("{safe_name}.json"));
+
+    if json {
+        let mut out = serde_json::to_value(&dag).unwrap_or_default();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "integrity_verified".to_string(),
+                serde_json::json!(integrity_verified),
+            );
+            obj.insert(
+                "storage_path".to_string(),
+                serde_json::json!(session_file.display().to_string()),
+            );
+            obj.insert(
+                "causal_depth".to_string(),
+                serde_json::json!(dag.causal_nodes.len()),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return true;
+    }
+
+    println!("=======================================================");
+    println!("        VEXA ARC SESSION CAUSAL DAG INSPECTION         ");
+    println!("=======================================================");
+    println!("Session ID:       {}", dag.session_id);
+    println!(
+        "Integrity:        {}",
+        if integrity_verified {
+            "VERIFIED"
+        } else {
+            "TAMPER DETECTED / INVALID"
+        }
+    );
+    if let Some(ref h) = dag.integrity_hash {
+        println!("Integrity Hash:   {h}");
+    }
+    println!("Storage Path:     {}", session_file.display());
+    println!("Created At:       {} ms", dag.created_at_ms);
+    if let Some(exp) = dag.expires_at_ms {
+        println!("Expires At:       {} ms", exp);
+    }
+    let taints_str = taint_names(dag.current_taints);
+    let taints_display = if taints_str.is_empty() {
+        "None (Clean)".to_string()
+    } else {
+        taints_str.join(", ")
+    };
+    println!("Active Taints:    {taints_display}");
+    println!("Causal Depth:     {} node(s)", dag.causal_nodes.len());
+
+    if !dag.causal_nodes.is_empty() {
+        println!("\n-------------------------------------------------------");
+        println!("CAUSAL GRAPH NODES");
+        println!("-------------------------------------------------------");
+        for (i, node) in dag.causal_nodes.iter().enumerate() {
+            println!("[Node {i}] (ID: {})", node.node_id);
+            if let Some(eid) = node.event_id {
+                println!("  Event UUID: {eid}");
+            }
+            println!("  Action:     {}", node.action_summary);
+            let n_taints = taint_names(node.taints_introduced);
+            let n_taints_display = if n_taints.is_empty() {
+                "None".to_string()
+            } else {
+                n_taints.join(", ")
+            };
+            println!("  Taints:     {n_taints_display}");
+            if !node.parent_node_ids.is_empty() {
+                println!("  Parents:    {}", node.parent_node_ids.join(", "));
+            }
+        }
+    }
+
+    if !dag.field_taints.is_empty() {
+        println!("\n-------------------------------------------------------");
+        println!("TAINTED ARGUMENT FIELDS & ENVIRONMENT");
+        println!("-------------------------------------------------------");
+        for (field, taint) in &dag.field_taints {
+            println!("  • {field}: [{}]", taint_names(*taint).join(", "));
+        }
+    }
+
+    if !dag.path_taints.is_empty() {
+        println!("\n-------------------------------------------------------");
+        println!("TAINTED FILE PATHS");
+        println!("-------------------------------------------------------");
+        for (path, taint) in &dag.path_taints {
+            println!("  • {path}: [{}]", taint_names(*taint).join(", "));
+        }
+    }
+
+    if !dag.known_schemas.is_empty() {
+        println!("\n-------------------------------------------------------");
+        println!("KNOWN MCP SCHEMA PINS (RFC 8785 JCS)");
+        println!("-------------------------------------------------------");
+        for (server, hash) in &dag.known_schemas {
+            println!("  • {server}: {}", hex::encode(hash));
+        }
+    }
+    println!("=======================================================\n");
+    true
+}
+
+fn run_session_report(
+    session_id: Option<&str>,
+    _latest: bool,
+    all: bool,
+    session_dir: Option<&Path>,
+    project_local: bool,
+    json: bool,
+) -> bool {
+    let storage_dir = match resolve_session_storage_dir(session_dir, project_local) {
+        Ok(dir) => dir,
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({ "error": e, "success": false }));
+            } else {
+                eprintln!("[Arc Session] Storage directory resolution error: {e}");
+            }
+            return false;
+        }
+    };
+
+    if all {
+        let all_records = match SessionAuditRecord::read_all_sessions_from_dir(&storage_dir) {
+            Ok(map) => map,
+            Err(e) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": format!("{e}"), "success": false })
+                    );
+                } else {
+                    eprintln!("[Arc Session] Failed to read audit records: {e}");
+                }
+                return false;
+            }
+        };
+
+        if all_records.is_empty() {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "total_sessions": 0,
+                        "total_events": 0,
+                        "storage_dir": storage_dir.display().to_string(),
+                        "summaries": []
+                    })
+                );
+            } else {
+                println!(
+                    "[Arc Session] No audit log records found across sessions in {}",
+                    storage_dir.display()
+                );
+            }
+            return true;
+        }
+
+        let mut summaries = Vec::new();
+        let mut overall_records = Vec::new();
+        for (sess, recs) in &all_records {
+            let summary = SessionAuditSummary::from_records(sess, recs);
+            overall_records.extend(recs.clone());
+            summaries.push(summary);
+        }
+        let total_summary = SessionAuditSummary::from_records("ALL_SESSIONS", &overall_records);
+
+        if json {
+            let out = serde_json::json!({
+                "storage_dir": storage_dir.display().to_string(),
+                "total_sessions": all_records.len(),
+                "aggregate": total_summary,
+                "sessions": summaries,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            return true;
+        }
+
+        println!("=======================================================");
+        println!("      VEXA ARC OPERATIONAL AUDIT REPORT (ALL SESSIONS) ");
+        println!("=======================================================");
+        println!("Storage Dir:      {}", storage_dir.display());
+        println!("Sessions Scanned: {}", all_records.len());
+        println!("Total Events:     {}", total_summary.total_events);
+        println!("  • Allows:            {}", total_summary.allows);
+        println!("  • Denies:            {}", total_summary.denies);
+        println!("  • RequireApproval:   {}", total_summary.approvals);
+        println!("  • Quarantines:       {}", total_summary.quarantines);
+        println!("Total Redactions: {}", total_summary.total_redactions);
+
+        if !total_summary.rule_breakdown.is_empty() {
+            println!("\nRule Denials & Enforcements:");
+            for (rule, count) in &total_summary.rule_breakdown {
+                println!("  • {rule}: {count}");
+            }
+        }
+        if !total_summary.tool_breakdown.is_empty() {
+            println!("\nTool Invocations Breakdown:");
+            for (tool, count) in &total_summary.tool_breakdown {
+                println!("  • {tool}: {count}");
+            }
+        }
+        println!("=======================================================\n");
+        return true;
+    }
+
+    let target_session = match session_id {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => {
+            if let Some(s) = find_latest_audit_session_in_dir(&storage_dir) {
+                s
+            } else if let Some(s) = find_latest_session_in_dir(&storage_dir) {
+                s
+            } else {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "error": "No audit records found in storage directory",
+                            "storage_dir": storage_dir.display().to_string(),
+                            "success": false
+                        })
+                    );
+                } else {
+                    eprintln!(
+                        "[Arc Session] No audit log records found in storage directory: {}",
+                        storage_dir.display()
+                    );
+                }
+                return false;
+            }
+        }
+    };
+
+    let records = match SessionAuditRecord::read_all_from_dir(&storage_dir, &target_session) {
+        Ok(r) => r,
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": format!("{e}"), "session_id": target_session, "success": false })
+                );
+            } else {
+                eprintln!("[Arc Session] Failed to read audit records for '{target_session}': {e}");
+            }
+            return false;
+        }
+    };
+
+    let summary = SessionAuditSummary::from_records(&target_session, &records);
+    let safe_name = SessionTaintDag::safe_file_name(&target_session);
+    let audit_file = storage_dir.join(format!("{safe_name}.audit.jsonl"));
+
+    if json {
+        let mut val = serde_json::to_value(&summary).unwrap_or_default();
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "audit_file".to_string(),
+                serde_json::json!(audit_file.display().to_string()),
+            );
+            obj.insert(
+                "storage_dir".to_string(),
+                serde_json::json!(storage_dir.display().to_string()),
+            );
+            obj.insert(
+                "events".to_string(),
+                serde_json::to_value(&records).unwrap_or_default(),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+        return true;
+    }
+
+    println!("=======================================================");
+    println!("           VEXA ARC OPERATIONAL AUDIT REPORT           ");
+    println!("=======================================================");
+    println!("Session ID:       {}", target_session);
+    println!("Audit Log File:   {}", audit_file.display());
+    println!("Total Events:     {}", summary.total_events);
+    println!("  • Allows:            {}", summary.allows);
+    println!("  • Denies:            {}", summary.denies);
+    println!("  • RequireApproval:   {}", summary.approvals);
+    println!("  • Quarantines:       {}", summary.quarantines);
+    println!("Total Redactions: {}", summary.total_redactions);
+
+    if !summary.rule_breakdown.is_empty() {
+        println!("\nRule Denials & Enforcements:");
+        for (rule, count) in &summary.rule_breakdown {
+            println!("  • {rule}: {count}");
+        }
+    }
+    if !summary.tool_breakdown.is_empty() {
+        println!("\nTool Invocations Breakdown:");
+        for (tool, count) in &summary.tool_breakdown {
+            println!("  • {tool}: {count}");
+        }
+    }
+    println!("=======================================================\n");
+    true
+}
+
+fn run_session_clean(
+    max_age_hours: u64,
+    session_dir: Option<&Path>,
+    project_local: bool,
+    json: bool,
+) -> bool {
+    let storage_dir = match resolve_session_storage_dir(session_dir, project_local) {
+        Ok(dir) => dir,
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({ "error": e, "success": false }));
+            } else {
+                eprintln!("[Arc Session] Storage directory resolution error: {e}");
+            }
+            return false;
+        }
+    };
+
+    match SessionTaintDag::cleanup_expired_sessions(&storage_dir, max_age_hours) {
+        Ok(pruned) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "pruned_files": pruned,
+                        "max_age_hours": max_age_hours,
+                        "storage_dir": storage_dir.display().to_string(),
+                        "success": true
+                    })
+                );
+            } else {
+                println!(
+                    "✔ Cleaned up {pruned} expired session and audit files in {} (threshold: {max_age_hours}h)",
+                    storage_dir.display()
+                );
+            }
+            true
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": format!("{e}"), "success": false })
+                );
+            } else {
+                eprintln!("[Arc Session] Cleanup failed: {e}");
+            }
+            false
+        }
+    }
+}
+
+fn run_session_storage(session_dir: Option<&Path>, project_local: bool, json: bool) -> bool {
+    match resolve_session_storage_dir_detailed(session_dir, project_local) {
+        Ok(res) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res).unwrap_or_default());
+            } else {
+                println!("=======================================================");
+                println!("          VEXA ARC SESSION STORAGE RESOLUTION          ");
+                println!("=======================================================");
+                println!("Resolved Directory: {}", res.resolved_dir.display());
+                println!("Hierarchy Source:   {}", res.source);
+                println!(
+                    "Writable:           {}",
+                    if res.is_writable {
+                        "Yes (verified probe write)"
+                    } else {
+                        "No"
+                    }
+                );
+                println!("=======================================================");
+            }
+            true
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({ "error": e, "success": false }));
+            } else {
+                eprintln!("[Arc Session] Storage resolution failed: {e}");
+            }
+            false
+        }
+    }
 }
 
 fn parse_schema_fingerprint(schema_input: Option<&str>) -> Result<Option<[u8; 32]>, String> {
@@ -2970,6 +4153,28 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
     event = event.with_provenance(provenance);
 
     let verdict = evaluator.evaluate(&event);
+
+    // Record operational audit log for every evaluated action (Pillar 2)
+    let rule_id = verdict_rule(&verdict);
+    let redactions_count = match &verdict {
+        arc_core::verdict::Verdict::Allow { obligations } => obligations
+            .iter()
+            .filter_map(|o| match o {
+                arc_core::verdict::Obligation::Redact { spans } => Some(spans.len()),
+                _ => None,
+            })
+            .sum(),
+        _ => 0,
+    };
+    let audit_record = SessionAuditRecord::new(
+        event.event_id.to_string(),
+        target.clone(),
+        kind.clone(),
+        verdict_decision(&verdict),
+        rule_id,
+        redactions_count,
+    );
+    let _ = audit_record.append_to_dir(&storage_dir, session);
 
     // Persist session state to disk - must fail closed if persistence fails
     let session_file = match evaluator.save_session_state(&storage_dir, session) {

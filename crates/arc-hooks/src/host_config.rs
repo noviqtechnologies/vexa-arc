@@ -4,15 +4,146 @@
 //! All helpers are cross-platform (Windows/macOS/Linux) and never silently
 //! clobber a user's configuration file that exists but fails to parse.
 
+use arc_core::event::AgentHost;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Substring that identifies a hook command as belonging to Vexa Arc.
 pub const ARC_HOOK_MARKER: &str = "arc intercept hook";
 
+/// Summary of an installed host integration.
+#[derive(Debug, Clone)]
+pub struct HostInstallSummary {
+    pub host: AgentHost,
+    pub config_path: PathBuf,
+    pub backup_path: Option<PathBuf>,
+    pub executable_path: PathBuf,
+    pub hook_command: String,
+    pub volatile_warning: Option<String>,
+}
+
+impl HostInstallSummary {
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+}
+
+/// Cleans Windows UNC extended-length prefixes (`\\?\`) so paths remain
+/// compliant with standard shell execution and tools.
+pub fn clean_canonical_path(path: &Path) -> PathBuf {
+    let p_str = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = p_str.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Resolves the canonical absolute path of the running executable and runs preflight validation.
+///
+/// Returns `(canonical_path, optional_volatile_warning)`.
+pub fn resolve_canonical_arc_binary() -> std::io::Result<(PathBuf, Option<String>)> {
+    let current = std::env::current_exe()?;
+    let canonical = clean_canonical_path(&current.canonicalize().unwrap_or(current));
+
+    if !canonical.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Arc binary not found at {}", canonical.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = canonical.metadata()?.permissions().mode();
+        if mode & 0o111 == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Binary at {} is not executable (missing +x mode)",
+                    canonical.display()
+                ),
+            ));
+        }
+    }
+
+    // Check for transient / volatile directory locations
+    let mut warning = None;
+    let path_str = canonical.to_string_lossy();
+    let temp_dir_str = std::env::temp_dir().to_string_lossy().to_string();
+
+    if path_str.contains("target/debug")
+        || path_str.contains(r"target\debug")
+        || path_str.contains("target/release")
+        || path_str.contains(r"target\release")
+        || path_str.starts_with(&temp_dir_str)
+    {
+        warning = Some(format!(
+            "Binary at '{}' appears to be running from a build or temporary directory. Consider installing Arc permanently to ~/.cargo/bin or /usr/local/bin so IDE sessions can always locate it.",
+            canonical.display()
+        ));
+    }
+
+    Ok((canonical, warning))
+}
+
+/// Formats a hook command with proper shell quoting and argument escaping.
+pub fn format_hook_command(binary_path: &Path, host_arg: &str) -> String {
+    let clean = clean_canonical_path(binary_path);
+    format!("\"{}\" intercept hook --host {}", clean.display(), host_arg)
+}
+
 /// Returns true if the hook command string invokes the Arc hook entrypoint.
+///
+/// Handles bare invocations (`arc intercept hook`), quoted paths (`"/path/to/arc" intercept hook`),
+/// Windows `.exe` paths (`"C:\path\arc.exe" intercept hook`), and canonical paths with spaces.
 pub fn is_arc_command(cmd: &str) -> bool {
-    cmd.contains(ARC_HOOK_MARKER)
+    if !cmd.contains("intercept hook") {
+        return false;
+    }
+    if let Some((exe_part, _)) = cmd.split_once("intercept hook") {
+        let trimmed = exe_part.trim().trim_matches('"').trim_matches('\'');
+        let exe_name = Path::new(trimmed)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(trimmed);
+        exe_name == "arc" || exe_name == "arc.exe" || exe_name.starts_with("arc")
+    } else {
+        false
+    }
+}
+
+/// Creates a byte-for-byte backup of `config_path` at `<config_path>.arc.bak` if the file exists.
+pub fn backup_existing_config(config_path: &Path) -> std::io::Result<Option<PathBuf>> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let bak_path = PathBuf::from(format!("{}.arc.bak", config_path.display()));
+    std::fs::copy(config_path, &bak_path)?;
+    Ok(Some(bak_path))
+}
+
+/// Validates that if `hooks` exists in `root`, it is a valid JSON object.
+///
+/// Aborts with `InvalidData` if `hooks` is a non-object value (e.g. string or array),
+/// preventing accidental destruction of user configuration.
+pub fn validate_hooks_object(root: &Value, config_path: &Path) -> std::io::Result<()> {
+    if let Some(hooks_val) = root.get("hooks") {
+        if !hooks_val.is_object() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} contains a 'hooks' field that is not a JSON object ({}); refusing to overwrite to prevent configuration loss",
+                    config_path.display(),
+                    hooks_val
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reads a JSON object from `path`. A missing or empty file yields `{}`.
@@ -129,9 +260,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arc_marker_does_not_match_unrelated_commands() {
+    fn arc_marker_matches_all_supported_variants() {
         assert!(is_arc_command("arc intercept hook --host cursor"));
+        assert!(is_arc_command(
+            "\"/usr/local/bin/arc\" intercept hook --host claude-code"
+        ));
+        assert!(is_arc_command(
+            "\"/Users/jane doe/.cargo/bin/arc\" intercept hook --host claude-code"
+        ));
+        assert!(is_arc_command(
+            "\"C:\\Users\\Jane Doe\\.cargo\\bin\\arc.exe\" intercept hook --host cursor"
+        ));
+        assert!(is_arc_command(
+            "C:\\Tools\\arc.exe intercept hook --host cursor"
+        ));
+
         assert!(!is_arc_command("search-tool --flag"));
+        assert!(!is_arc_command("unrelated intercept hook --host cursor"));
+        assert!(!is_arc_command("arc status"));
+    }
+
+    #[test]
+    fn format_hook_command_quotes_paths_safely() {
+        let p = Path::new(r"C:\Users\Jane Doe\.cargo\bin\arc.exe");
+        let cmd = format_hook_command(p, "cursor");
+        assert!(cmd.starts_with('"'));
+        assert!(cmd.contains("intercept hook --host cursor"));
+        assert!(is_arc_command(&cmd));
+    }
+
+    #[test]
+    fn validate_hooks_object_rejects_malformed_hooks() {
+        let config_path = Path::new("dummy.json");
+
+        let valid = serde_json::json!({"hooks": {"PreToolUse": []}});
+        assert!(validate_hooks_object(&valid, config_path).is_ok());
+
+        let missing = serde_json::json!({"other": 123});
+        assert!(validate_hooks_object(&missing, config_path).is_ok());
+
+        let array_hooks = serde_json::json!({"hooks": ["not", "an", "object"]});
+        assert!(validate_hooks_object(&array_hooks, config_path).is_err());
+
+        let string_hooks = serde_json::json!({"hooks": "invalid"});
+        assert!(validate_hooks_object(&string_hooks, config_path).is_err());
     }
 
     #[test]

@@ -28,3 +28,6 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+uuid = { workspace = true }
+vexa-sca = { workspace = true }

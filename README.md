@@ -136,12 +136,16 @@ Arc lexically recognizes selected command and interpreter signatures. This is he
 
 ---
 
-### 2. Native IDE & Agent Runtime Hooks
+### 2. Hardened Host Onboarding & Runtime Hooks (`arc host install`)
 
-Vexa Arc offers selected host hooks. Installing a hook does not provide complete mediation or a universal fail-closed guarantee; inspect the installed status and documented event coverage:
+Vexa Arc provides hardened host onboarding for **Claude Code** and **Cursor IDE**. Hook installation is designed with defensive execution preflights:
+1. **Canonical Absolute Binary Path:** `arc host install` resolves `std::env::current_exe()?.canonicalize()` to ensure background hooks execute reliably even when the host IDE is launched from desktop shortcuts or GUI launchers with a minimal environment lacking shell `PATH` exports (e.g. missing `~/.cargo/bin`).
+2. **Safe Path Escaping & Quoting:** Binary paths containing spaces (e.g., `C:\Users\Jane Doe\...` or `/Users/jane doe/...`), quotes, or Unicode are properly shell-quoted so subprocess tokenization never splits the executable path.
+3. **Byte-for-Byte Backup:** Creates verified backups (`settings.json.arc.bak` or `hooks.json.arc.bak`) before modifying files.
+4. **Safe Structural JSON Merging:** Preserves all foreign hooks and user keys; aborts cleanly without clobbering if an existing `hooks` structure is non-object (e.g. malformed string or array).
 
 ```bash
-# Automatically install hooks into .claude/settings.json or .cursor/hooks.json
+# Automatically install hardened hooks into .claude/settings.json or .cursor/hooks.json:
 arc host install --host claude-code
 arc host install --host cursor
 
@@ -157,13 +161,13 @@ Vexa Arc hooks into Claude Code's native `PreToolUse` and `PostToolUse` lifecycl
     "PreToolUse": [
       {
         "matcher": "*",
-        "hooks": [{ "type": "command", "command": "arc intercept hook --host claude-code" }]
+        "hooks": [{ "type": "command", "command": "\"/Users/dev/.cargo/bin/arc\" intercept hook --host claude-code" }]
       }
     ],
     "PostToolUse": [
       {
         "matcher": "WebFetch|WebSearch|mcp__.*",
-        "hooks": [{ "type": "command", "command": "arc intercept hook --host claude-code" }]
+        "hooks": [{ "type": "command", "command": "\"/Users/dev/.cargo/bin/arc\" intercept hook --host claude-code" }]
       }
     ]
   }
@@ -176,10 +180,10 @@ Vexa Arc configures Cursor with `failClosed: true` across `beforeShellExecution`
 {
   "version": 1,
   "hooks": {
-    "beforeShellExecution": [{ "command": "arc intercept hook --host cursor", "failClosed": true }],
-    "beforeMCPExecution": [{ "command": "arc intercept hook --host cursor", "failClosed": true }],
-    "beforeReadFile": [{ "command": "arc intercept hook --host cursor", "failClosed": true }],
-    "afterMCPExecution": [{ "command": "arc intercept hook --host cursor", "failClosed": true }]
+    "beforeShellExecution": [{ "command": "\"C:\\Users\\dev\\.cargo\\bin\\arc.exe\" intercept hook --host cursor", "failClosed": true }],
+    "beforeMCPExecution": [{ "command": "\"C:\\Users\\dev\\.cargo\\bin\\arc.exe\" intercept hook --host cursor", "failClosed": true }],
+    "beforeReadFile": [{ "command": "\"C:\\Users\\dev\\.cargo\\bin\\arc.exe\" intercept hook --host cursor", "failClosed": true }],
+    "afterMCPExecution": [{ "command": "\"C:\\Users\\dev\\.cargo\\bin\\arc.exe\" intercept hook --host cursor" }]
   }
 }
 ```
@@ -215,7 +219,86 @@ arc protect stdio \
 
 ---
 
-### 4. Advisory Package Risk Checks (`arc shield`)
+### 4. Local Observability & Exact Session Storage Resolution (`arc session`)
+
+Vexa Arc provides local observability over agent causal data-flow DAGs, active taint states, and operational audit trails without requiring external services or cloud logging.
+
+#### Exact Storage Resolution Hierarchy
+
+Session state DAGs (`<session_id>.json`) and operational audit logs (`<session_id>.audit.jsonl`) are resolved across platforms in strict priority order:
+
+1. **CLI Flag Override:** `--session-dir <path>`
+2. **Environment Variable Override:** `ARC_SESSION_DIR`
+3. **Opt-in Project-Local Mode:** `--project-local` flag or `ARC_PROJECT_LOCAL=1` (resolves to `.arc/sessions` in the current working directory)
+4. **Existing CWD Continuity:** If `.arc/sessions` exists in CWD and is writable, reuse it.
+5. **OS User Data Directory (Standard Target):**
+   - **Windows:** `%LOCALAPPDATA%\vexa-arc\sessions` (fallback: `%USERPROFILE%\.arc\vexa-arc\sessions`)
+   - **macOS:** `$XDG_DATA_HOME/vexa-arc/sessions` (if set) or `~/Library/Application Support/vexa-arc/sessions`
+   - **Linux:** `$XDG_DATA_HOME/vexa-arc/sessions` (if set) or `~/.local/share/vexa-arc/sessions`
+6. **System Temp Directory Fallback:** `%TEMP%\vexa-arc\sessions` (Windows) or `/tmp/vexa-arc/sessions` (Linux/macOS)
+
+```bash
+# Verify resolved session directory, hierarchy source, and write permissions:
+arc session storage
+arc session storage --json
+```
+
+#### Causal DAG Inspection (`arc session dag`)
+
+Inspect causal data-flow ancestry, causal depth, tainted AST argument fields, file path taints, and pinned tool schemas:
+
+```bash
+# Inspect the active causal DAG for the most recently active session:
+arc session dag --latest
+
+# Inspect a specific host session:
+arc session dag default-session --json
+```
+
+#### Operational Audit Logging & Reporting (`arc session report`)
+
+On each mediated agent action, Arc appends a structured record to `<storage_dir>/<session_id>.audit.jsonl` recording event UUID, tool/action, verdict (`Allow`, `Deny`, `RequireApproval`), rule ID, and secret redaction count:
+
+```bash
+# Generate audit summary for the latest active session:
+arc session report --latest
+
+# Aggregate audit metrics across all stored sessions:
+arc session report --all --json
+```
+
+#### Pruning & Session TTL (`arc session clean`)
+
+Prunes session files and operational audit logs older than the expiration threshold (default: 24 hours):
+
+```bash
+# Prune expired sessions older than 24 hours:
+arc session clean
+
+# Prune sessions older than a custom threshold (e.g. 1 hour):
+arc session clean --max-age-hours 1 --json
+```
+
+---
+
+### 5. Threat-Modeled Human Approval (Host Delegation & OS Modals)
+
+Vexa Arc enforces a deterministic, threat-modeled human authorization framework for high-risk and heuristic agent actions (e.g. Lethal Trifecta triggers or unapproved MCP servers).
+
+#### Threat Model & Security Boundaries
+- **No TTY Heuristic Reliance:** Checking for a TTY does not prove a human is present; autonomous agents execute inside terminals and PTYs and can simulate user input.
+- **Primary Mechanism (Host IDE Delegation):** In Claude Code and Cursor IDEs, Arc maps `Verdict::RequireApproval` to native confirmation hooks (`permissionDecision: "ask"` / `permission: "ask"`). Under the assumption that the host IDE isolates dialog input streams from agent tool execution, the agent cannot self-approve.
+- **Secondary Mechanism (Out-of-Band OS Confirmation Modal):** For standalone stdio broker sessions (`arc protect stdio`):
+  - **Desktop Session Preflight:** Verifies active graphical desktop (`WinSta0` with GUI display on Windows, `DISPLAY`/`WAYLAND_DISPLAY` on Linux, WindowServer on macOS).
+  - **Headless Fail-Closed:** Headless environments (CI runners, Docker, SSH) without a configured webhook (`ARC_APPROVAL_WEBHOOK_URL`) **fail closed immediately** with `ARC-AUTH-HEADLESS-UNSUPPORTED`.
+  - **CSPRNG 6-Digit PIN Modal:** Spawns an isolated platform GUI modal completely detached from process stdin/stderr. Prompts the human to confirm with a random 6-digit numeric PIN (~20 bits entropy).
+  - **3-Attempt Rate Lockout:** Entering an incorrect PIN 3 times immediately denies the action with `ARC-AUTH-PIN-EXHAUSTED` and institutes an active **15-minute rate-lockout window** (`ARC-AUTH-LOCKED-OUT`).
+  - **Rolling Rate-Limiting:** Limits approval prompts to at most 3 requests per rolling 60-second window (`ARC-AUTH-RATE-LIMITED`).
+- **Canonical Action Binding & Single-Use:** Grants are bound to `SHA256(canonical_action_bytes || session_id || rule_id)` via RFC 8785 JSON Canonicalization Scheme (JCS). Grants are stored in memory and consumed atomically on first match; once consumed, they cannot be replayed.
+
+---
+
+### 6. Advisory Package Risk Checks (`arc shield`)
 
 AI agents can hallucinate package names, but the current `arc shield` CLI is **not an install firewall**. It parses package names or command text and applies heuristics using seeded popular-package baselines and caller-supplied simulation values; it does not retrieve live registry age, download, lifecycle-script, provenance, or 404 data. It does not execute or intercept package-manager commands. `arc shield check name@version` can separately query OSV for known vulnerabilities in that exact version; that query is not a malicious-package verdict.
 
@@ -236,7 +319,55 @@ arc shield check lodash@4.17.21 --ecosystem npm --json
 
 ---
 
-### 5. Linear-Time Secret Detection & Redaction
+### 7. Consensual, Disposable-Worktree SCA Remediation (`arc sca`)
+
+Vexa Arc provides non-contaminating Software Composition Analysis (SCA) auditing and patch remediation powered by `vexa-sca`. It scans dependencies across supported manifests (`Cargo.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `requirements.txt`, `go.sum`, `pom.xml`) and provides isolated remediation without ever polluting the active developer working tree.
+
+#### Scoped SCA Audit with SARIF (`arc sca audit`)
+
+```bash
+# Scan project dependencies for vulnerabilities:
+arc sca audit
+
+# Generate OASIS SARIF v2.1.0 with location sanitization and failure threshold:
+arc sca audit --sarif audit.sarif --sanitize-locations --fail-on high
+```
+
+- **Confidentiality Invariant (`--sanitize-locations`):** Eliminates internal source code snippets, suppresses physical line/column numbers, and pseudonymizes file paths into hashed URIs (`file:///arc-scrubbed-<sha256>`).
+- **Policy Failure Gating (`--fail-on <severity>`):** Returns an exit code of 1 if any vulnerability meets or exceeds the specified threshold (`critical`, `high`, `medium`, `low`).
+
+#### Dry-Run Scratch Diff Proposal (`arc sca fix --dry-run`)
+
+```bash
+# Inspect non-destructive proposed manifest patches in isolated OS temp storage:
+arc sca fix --dry-run
+```
+
+- Creates an isolated scratch copy in OS temp storage (`%TEMP%` or `/tmp`).
+- Applies patches strictly within the scratch directory.
+- Outputs unified diff proposals without mutating a single byte or timestamp in the working tree.
+
+#### Isolated Disposable Git Worktree (`arc sca fix --open-pr`)
+
+```bash
+# Open an automated security PR against origin/main using an isolated worktree:
+arc sca fix --open-pr --base main
+
+# Explicitly bypass local divergence and enforce base branch:
+arc sca fix --open-pr --base main --force-remote-base
+
+# Execute project tests inside the disposable worktree before opening the PR:
+arc sca fix --open-pr --base main --run-tests
+```
+
+- **Remote Base Validation & Divergence Fail-Closed:** Distinguishes Git refs (`refs/remotes/origin/<base>`) from GitHub PR base branch names (`<base>`). Evaluates local vs remote divergence and fails closed by default if unpushed commits exist, preventing unintentional commit leakage.
+- **Detached Disposable Worktree:** Spawns an isolated worktree (`git worktree add --detach`) in OS temp marked with `.arc-worktree-marker.json`.
+- **Single Branch Creation:** Delegates branch creation directly to `PrCreator`, avoiding Git duplicate branch conflicts.
+- **RAII Lifecycle & 5-Point Safety Pruning:** Cleans up automatically via RAII `Drop`. Stale or abandoned worktrees are strictly audited against a 5-point contract (canonical temp containment, UUID format, `.git`/marker validity, user ownership, and dead PID verification) before pruning.
+
+---
+
+### 8. Linear-Time Secret Detection & Redaction
 
 Provides targeted secret detection for explicitly scanned inputs and supported mediated payloads. No sub-millisecond latency or universal host/outbound coverage is claimed; actual coverage depends on the invoked command, adapter, and policy:
 - **Linear-Time Aho-Corasick Prefiltering**: Eliminates latency overhead on large source files.
@@ -255,7 +386,7 @@ Get-Content app.config | arc scan-secrets --redact
 
 ---
 
-### 6. Standardized CycloneDX v1.6 AI-BOM Export (`arc bom`)
+### 9. Standardized CycloneDX v1.6 AI-BOM Export (`arc bom`)
 
 Generates specification-compliant OWASP CycloneDX v1.6 AI-BOM manifests capturing AI models, datasets, declared MCP tool services, and agent instruction files (`.cursorrules`, `CLAUDE.md`, `.windsurfrules`):
 
@@ -279,7 +410,7 @@ flowchart TB
     subgraph ENGINE_SUBSYSTEMS["Core Security Subsystems (Pre-Execution Inversion)"]
         DAG["Stateful Taint DAG FSM\n(Lethal Trifecta Guard: ARC-LTT-001)"]
         DLP["arc-dlp\n(Secret Detection, Shannon Entropy & Vault)"]
-        FW["arc-firewall\n(Package-Name Heuristics + Exact-Version OSV)"]
+        FW["arc-firewall\n(Package-Name Heuristics + Exact-Version OSV + SCA Remediation)"]
         ATLAS["arc-discover\n(CycloneDX v1.6 AI-BOM & Asset Scanner)"]
     end
     
@@ -310,6 +441,7 @@ All commands support relative and absolute paths, cross-platform path separators
 | :--- | :--- | :--- | :--- |
 | `arc audit` | Scan project or workstation for AI assets, rules, and MCP configs | `--workstation`, `--json`, `--output-bom <PATH>` | `arc audit --output-bom ai-bom.json` |
 | `arc bom` | Export CycloneDX v1.6 AI-BOM | `-p, --path <PATH>`, `-o, --out <PATH>` | `arc bom --out ai-bom.json` |
+| `arc sca` | Consensual, disposable-worktree SCA scanning & PR remediation | `audit`, `fix [--dry-run | --open-pr]` | `arc sca audit --sarif audit.sarif --sanitize-locations` |
 | `arc shield` | Advisory package-name heuristics; exact-version OSV check (does not intercept or run installs) | `check <PKG>`, `run <CMD>`, `--show-recommendation`, `--fail-on-risk` | `arc shield run --fail-on-risk -- npm install package` |
 | `arc scan-secrets` | Scan files or stdin for secrets with entropy checks | `-p, --path <PATH>`, `--redact` | `arc scan-secrets --path . --redact` |
 | `arc host` | Manage host integrations (Claude Code, Cursor) | `install`, `status`, `uninstall`, `--host <HOST>` | `arc host install --host claude-code` |

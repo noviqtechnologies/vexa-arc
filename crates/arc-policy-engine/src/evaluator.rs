@@ -105,6 +105,12 @@ pub struct PolicyConfig {
     pub emergency_deny_servers: HashSet<String>,
     #[serde(default)]
     pub active_exceptions: Vec<PolicyException>,
+    #[serde(default)]
+    pub require_approval_rules: HashSet<String>,
+    #[serde(default)]
+    pub require_approval_servers: HashSet<String>,
+    #[serde(default)]
+    pub require_approval_for_trifecta: bool,
 }
 
 impl Default for PolicyConfig {
@@ -126,6 +132,9 @@ impl Default for PolicyConfig {
             redact_secrets: true,
             emergency_deny_servers: HashSet::new(),
             active_exceptions: Vec::new(),
+            require_approval_rules: HashSet::new(),
+            require_approval_servers: HashSet::new(),
+            require_approval_for_trifecta: false,
         }
     }
 }
@@ -416,6 +425,7 @@ pub struct PolicyEvaluator {
     pub taint_tracker: TaintTracker,
     pub dlp_engine: SecretScanEngine,
     pub ast_engine: arc_dlp::AstPatternEngine,
+    pub approval_manager: crate::approval::ApprovalManager,
     known_schemas: RwLock<HashMap<(String, String), [u8; 32]>>, // (session_id, server_name) -> canonical JCS sha256
 }
 
@@ -439,6 +449,7 @@ impl PolicyEvaluator {
             taint_tracker: TaintTracker::new(),
             dlp_engine: SecretScanEngine::new(),
             ast_engine: arc_dlp::AstPatternEngine::new(),
+            approval_manager: crate::approval::ApprovalManager::new(),
             known_schemas: RwLock::new(HashMap::new()),
         }
     }
@@ -514,6 +525,58 @@ impl PolicyEvaluator {
             _ => None,
         };
 
+        let canonical_bytes_res = match &event.action {
+            Action::McpToolCall {
+                tool, arguments, ..
+            } => crate::approval::compute_canonical_action_bytes(tool, arguments).ok(),
+            Action::Shell { command, .. } => crate::approval::compute_canonical_action_bytes(
+                "shell",
+                &serde_json::json!({ "command": command }),
+            )
+            .ok(),
+            Action::FileRead { path } => crate::approval::compute_canonical_action_bytes(
+                "read",
+                &serde_json::json!({ "path": path.to_string_lossy() }),
+            )
+            .ok(),
+            Action::FileWrite { path, .. } => crate::approval::compute_canonical_action_bytes(
+                "write",
+                &serde_json::json!({ "path": path.to_string_lossy() }),
+            )
+            .ok(),
+            Action::PromptSubmit { text, .. } => crate::approval::compute_canonical_action_bytes(
+                "prompt",
+                &serde_json::json!({ "text": text }),
+            )
+            .ok(),
+            _ => None,
+        };
+
+        let check_approval = |rule_id: &str| -> Option<Verdict> {
+            if let Some(ref bytes) = canonical_bytes_res {
+                if self
+                    .approval_manager
+                    .check_and_consume_grant(bytes, session_id, rule_id)
+                {
+                    return Some(Verdict::Allow {
+                        obligations: vec![Obligation::ExceptionGranted {
+                            id: format!(
+                                "approval-{}",
+                                hex::encode(
+                                    &crate::approval::compute_grant_key(bytes, session_id, rule_id)
+                                        [..8]
+                                )
+                            ),
+                            reason: format!(
+                                "Action approved by human operator under rule {rule_id}"
+                            ),
+                        }],
+                    });
+                }
+            }
+            None
+        };
+
         let check_exception = |rule_id: &str| -> Option<Verdict> {
             cfg.active_exceptions
                 .iter()
@@ -546,8 +609,34 @@ impl PolicyEvaluator {
             }
 
             if cfg.block_unapproved_mcp && !cfg.allowed_mcp_servers.contains(&server.config_name) {
-                if let Some(exc) = check_exception("ARC-MCP-001") {
+                if let Some(exc) =
+                    check_exception("ARC-MCP-001").or_else(|| check_approval("ARC-MCP-001"))
+                {
                     return exc;
+                }
+                if cfg.require_approval_servers.contains(&server.config_name)
+                    || cfg.require_approval_rules.contains("ARC-MCP-001")
+                {
+                    return Verdict::RequireApproval {
+                        rule: RuleId("ARC-MCP-001".to_string()),
+                        explanation: Explanation::new(
+                            format!(
+                                "Unapproved MCP server '{}'. Requires human authorization.",
+                                server.config_name
+                            ),
+                            vec![
+                                format!(
+                                    "Use an approved MCP server: {:?}",
+                                    cfg.allowed_mcp_servers.iter().cloned().collect::<Vec<_>>()
+                                ),
+                                "Enter the confirmation PIN displayed in the authorization dialog."
+                                    .to_string(),
+                            ],
+                            Some("https://docs.vexa.ai/arc/policies/ARC-MCP-001".to_string()),
+                        ),
+                        timeout_secs: 300,
+                        on_timeout: arc_core::verdict::TimeoutAction::Deny,
+                    };
                 }
                 return Verdict::Deny {
                     rule: RuleId("ARC-MCP-001".to_string()),
@@ -639,8 +728,20 @@ impl PolicyEvaluator {
                 .taint_tracker
                 .check_event_trifecta_with_target(event, target_str.as_deref())
             {
-                if let Some(exc) = check_exception("ARC-LTT-001") {
+                if let Some(exc) =
+                    check_exception("ARC-LTT-001").or_else(|| check_approval("ARC-LTT-001"))
+                {
                     return exc;
+                }
+                if cfg.require_approval_for_trifecta
+                    || cfg.require_approval_rules.contains("ARC-LTT-001")
+                {
+                    return Verdict::RequireApproval {
+                        rule: RuleId("ARC-LTT-001".to_string()),
+                        explanation,
+                        timeout_secs: 300,
+                        on_timeout: arc_core::verdict::TimeoutAction::Deny,
+                    };
                 }
                 return Verdict::Deny {
                     rule: RuleId("ARC-LTT-001".to_string()),

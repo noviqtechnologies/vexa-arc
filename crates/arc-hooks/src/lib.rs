@@ -19,6 +19,7 @@ mod tests {
     use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
     use arc_telemetry::{TelemetryEvent, TelemetrySink};
     use std::collections::HashSet;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     struct RecordingSink(Arc<Mutex<Vec<TelemetryEvent>>>);
@@ -304,8 +305,11 @@ mod tests {
         assert!(!status_initial.is_configured);
 
         // 2. Install
-        let installed_path = ClaudeCodeAdapter::install_integration(&temp_dir).unwrap();
-        assert!(installed_path.exists());
+        let summary = ClaudeCodeAdapter::install_integration(&temp_dir).unwrap();
+        assert!(summary.config_path.exists());
+        assert!(summary
+            .hook_command
+            .contains("intercept hook --host claude-code"));
 
         // 3. Status check should report configured
         let status_installed = ClaudeCodeAdapter::check_integration(&temp_dir);
@@ -319,7 +323,7 @@ mod tests {
 
         let status_after = ClaudeCodeAdapter::check_integration(&temp_dir);
         assert!(!status_after.is_configured);
-        assert!(status_after.bypass_risk); // .claude.json exists but hook missing -> bypass risk!
+        assert!(status_after.bypass_risk); // .claude exists but hook missing -> bypass risk!
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -335,8 +339,11 @@ mod tests {
         assert!(!status_initial.is_configured);
 
         // 2. Install
-        let installed_path = CursorAdapter::install_integration(&temp_dir).unwrap();
-        assert!(installed_path.exists());
+        let summary = CursorAdapter::install_integration(&temp_dir).unwrap();
+        assert!(summary.config_path.exists());
+        assert!(summary
+            .hook_command
+            .contains("intercept hook --host cursor"));
 
         // 3. Status check should report configured
         let status_installed = CursorAdapter::check_integration(&temp_dir);
@@ -356,5 +363,152 @@ mod tests {
         assert!(status_after.bypass_risk);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_host_install_path_with_spaces_and_special_chars() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("vexa_arc_spaces_test_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let space_exe = Path::new(r"/Users/jane doe (admin)/.cargo/bin/arc");
+        let summary =
+            ClaudeCodeAdapter::install_integration_with_custom_exe(&temp_dir, Some(space_exe))
+                .unwrap();
+        assert!(summary.hook_command.starts_with('"'));
+        assert!(summary
+            .hook_command
+            .contains("/Users/jane doe (admin)/.cargo/bin/arc"));
+        assert!(summary
+            .hook_command
+            .contains("intercept hook --host claude-code"));
+
+        let status = ClaudeCodeAdapter::check_integration(&temp_dir);
+        assert!(status.is_configured);
+        assert!(status.hook_command.unwrap().contains("jane doe"));
+
+        let cursor_space_exe = Path::new(r"C:\Users\Jane Doe (Dev)\.cargo\bin\arc.exe");
+        let cursor_summary =
+            CursorAdapter::install_integration_with_custom_exe(&temp_dir, Some(cursor_space_exe))
+                .unwrap();
+        assert!(cursor_summary.hook_command.starts_with('"'));
+        assert!(cursor_summary.hook_command.contains("Jane Doe (Dev)"));
+        assert!(cursor_summary
+            .hook_command
+            .contains("intercept hook --host cursor"));
+
+        let cursor_status = CursorAdapter::check_integration(&temp_dir);
+        assert!(cursor_status.is_configured);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_broker_human_approval_with_mock_correct_pin() {
+        let mut config = PolicyConfig {
+            block_unapproved_mcp: true,
+            ..Default::default()
+        };
+        config
+            .require_approval_servers
+            .insert("custom-ai-tool".to_string());
+
+        let mut evaluator = PolicyEvaluator::new(config);
+        evaluator.approval_manager.mock_interactive = Some(true);
+        evaluator.approval_manager.mock_response = Some("CORRECT".to_string());
+
+        let mut broker =
+            McpStdioBroker::new("custom-ai-tool", "sess-appr-ok", evaluator).allow_schema_tofu();
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "generate_report",
+                "arguments": { "query": "status" }
+            }
+        })
+        .to_string();
+
+        let outcome = broker.handle_client_message(&call);
+        // Correct PIN entered in OS modal -> Approved -> Forwarded!
+        assert!(matches!(outcome, ClientMessageOutcome::Forward(_)));
+    }
+
+    #[test]
+    fn test_broker_human_approval_denied_on_wrong_pin_exhaustion() {
+        let mut config = PolicyConfig {
+            block_unapproved_mcp: true,
+            ..Default::default()
+        };
+        config
+            .require_approval_servers
+            .insert("custom-ai-tool".to_string());
+
+        let mut evaluator = PolicyEvaluator::new(config);
+        evaluator.approval_manager.mock_interactive = Some(true);
+        evaluator.approval_manager.mock_response = Some("WRONG".to_string());
+
+        let mut broker =
+            McpStdioBroker::new("custom-ai-tool", "sess-appr-fail", evaluator).allow_schema_tofu();
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "dangerous_action",
+                "arguments": {}
+            }
+        })
+        .to_string();
+
+        let outcome = broker.handle_client_message(&call);
+        match outcome {
+            ClientMessageOutcome::RespondLocally(resp) => {
+                let text = resp.to_string();
+                assert!(text.contains("ARC-AUTH-PIN-EXHAUSTED"));
+            }
+            _ => panic!("Expected RespondLocally deny response"),
+        }
+    }
+
+    #[test]
+    fn test_broker_human_approval_fails_closed_in_headless() {
+        let mut config = PolicyConfig {
+            block_unapproved_mcp: true,
+            ..Default::default()
+        };
+        config
+            .require_approval_servers
+            .insert("custom-ai-tool".to_string());
+
+        let mut evaluator = PolicyEvaluator::new(config);
+        // Simulate headless environment
+        evaluator.approval_manager.mock_interactive = Some(false);
+
+        let mut broker = McpStdioBroker::new("custom-ai-tool", "sess-headless-test", evaluator)
+            .allow_schema_tofu();
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "read_secret",
+                "arguments": {}
+            }
+        })
+        .to_string();
+
+        let outcome = broker.handle_client_message(&call);
+        match outcome {
+            ClientMessageOutcome::RespondLocally(resp) => {
+                let text = resp.to_string();
+                assert!(text.contains("ARC-AUTH-HEADLESS-UNSUPPORTED"));
+            }
+            _ => panic!("Expected RespondLocally deny response"),
+        }
     }
 }

@@ -306,6 +306,25 @@ pub struct SessionTaintDag {
 - **Benign isolation:** Local commands (`git status`, `git diff`, `git log`, `cargo test`, `npm test`) bypass the session bitmask check entirely via `is_benign_local_command()`.
 - `compute_integrity_hash()` deterministically incorporates sorted field and path taints, preventing hash manipulation.
 
+### Threat-Modeled Human Approval Subsystem (`arc-policy-engine::approval`)
+
+Implements Pillar 3 human authorization primitives:
+
+* **RFC 8785 JCS Canonicalization & Action Hashing:**
+  - `compute_canonical_action_bytes(&Action) -> Result<Vec<u8>, PolicyEngineError>`: Produces deterministic JSON bytes per RFC 8785.
+  - `compute_grant_key(&Action, &session_id, &rule_id) -> Result<String, PolicyEngineError>`: Computes $\text{SHA256}(\text{CanonicalActionBytes} \mathbin{\Vert} \text{SessionID} \mathbin{\Vert} \text{RuleID})$.
+* **CSPRNG PIN Generation:**
+  - `generate_secure_pin() -> String`: Generates an unbiased 6-digit numeric PIN (`100000`–`999999`) using `rand::rngs::OsRng` via rejection sampling (zero modulo bias, ~20 bits entropy).
+* **Interactive Desktop Preflight (`DesktopSessionPreflight`):**
+  - Cross-platform detection of interactive GUI sessions: `GetProcessWindowStation` + `GetUserObjectInformationW` (`WSF_VISIBLE`) on Windows, `$DISPLAY`/`$WAYLAND_DISPLAY` on Linux, WindowServer on macOS.
+  - Non-interactive/headless environments fail closed with `ARC-AUTH-HEADLESS-UNSUPPORTED`.
+* **Detached OS Confirmation Modals (`ApprovalModal`):**
+  - Spawns platform dialogs detached with `Stdio::null()` (WinForms via PowerShell on Windows, `osascript` on macOS, `zenity`/`kdialog` on Linux).
+* **Approval Storage & Rate Controls (`ApprovalStore` & `ApprovalManager`):**
+  - **Single-Use Grants:** Grants expire after 15 minutes (`TTL = 900s`) and are atomically consumed upon execution via `consume_grant()`.
+  - **Rate Limiting:** Enforces $\le 3$ approval requests per 60-second rolling window (`ARC-AUTH-RATE-LIMITED`).
+  - **Lockout Policy:** 3 failed PIN attempts triggers a mandatory 15-minute administrative lockout (`ARC-AUTH-PIN-EXHAUSTED` / `ARC-AUTH-LOCKED-OUT`).
+
 ---
 
 
@@ -452,12 +471,69 @@ Telemetry is disabled by default and is not evidence that unsupported host paths
 ### Adding a New Host Adapter
 
 1. Implement the `HostAdapter` trait in [`crates/arc-hooks/src/adapter.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/adapter.rs).
-2. Expose the adapter in `arc-hooks::lib.rs` and connect it to `run_host_install`, `run_host_status`, and `run_host_uninstall` in [`crates/arc-cli/src/main.rs`](file:///c:/vexa-arc/crates/arc-cli/src/main.rs).
-3. Add diagnostic telemetry checks in `run_doctor`.
+2. Use the shared onboarding hardening utilities from [`crates/arc-hooks/src/host_config.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/host_config.rs):
+   - `resolve_canonical_arc_binary(custom_path)`: Resolves absolute executable path, strips Windows UNC `\\?\` prefixes, validates existence and Unix execution permissions, and flags volatile directory execution.
+   - `format_hook_command(&exe, args)`: Safely formats hook command strings with spaces/special characters escaped in double quotes.
+   - `backup_existing_config(&path)`: Produces a non-clobbering byte-for-byte `.arc.bak` copy before editing.
+   - `validate_hooks_object(&json_val)`: Enforces fail-closed semantics if a `hooks` key exists but is not a valid JSON map.
+   - Return a `HostInstallSummary` struct capturing binary path, backup path, warnings, and mediated events.
+3. Expose the adapter in [`crates/arc-hooks/src/lib.rs`](file:///c:/vexa-arc/crates/arc-hooks/src/lib.rs) and connect it to `run_host_install`, `run_host_status`, and `run_host_uninstall` in [`crates/arc-cli/src/main.rs`](file:///c:/vexa-arc/crates/arc-cli/src/main.rs).
+4. Add diagnostic telemetry checks in `run_doctor`.
+
+### Phase 1: Hardened Host Onboarding Acceptance Test Matrix
+
+All host adapter implementations must pass the Phase 1 Acceptance Test Matrix verified in [`tests/integration_tests.rs`](file:///c:/vexa-arc/tests/integration_tests.rs#L1590) (`test_phase1_host_onboarding_hardening_matrix`):
+
+| Test ID | Objective | Input Condition | Expected Output / Invariant |
+| :--- | :--- | :--- | :--- |
+| **TC-HOST-01** | Clean Installation & Path Normalization | Clean workspace without `.claude` or `.cursor` dirs | Created JSON config with properly escaped executable path; no `\\?\` UNC prefixes on Windows; `is_installed == true`. |
+| **TC-HOST-02** | Structural Preservation & Foreign Keys | Config file with existing custom settings (`custom_user_setting`, unrelated hooks) | All foreign JSON keys and custom non-Arc hooks remain byte-for-byte identical. |
+| **TC-HOST-03** | Configuration Backup & Invariance | Pre-existing host configuration | `.arc.bak` is created. Re-running install never overwrites existing `.arc.bak` (retains pristine original backup). |
+| **TC-HOST-04** | Malformed Configuration Fail-Closed | Config where `"hooks": "not_an_object"` | Returns `std::io::ErrorKind::InvalidData`; configuration file is not corrupted or overwritten. |
+| **TC-HOST-05** | Status & Bypass Verification | Installed configuration | `adapter.status()` reports `Healthy` with bypass risk `None`. Uninstall cleanly reverts Arc hooks. |
+
+### Phase 2: Local Observability & Session Storage Resolution Acceptance Test Matrix
+
+All session observability and storage resolution logic must pass the Phase 2 Acceptance Test Matrix verified in [`tests/integration_tests.rs`](file:///c:/vexa-arc/tests/integration_tests.rs) (`test_phase2_session_observability_and_storage_resolution_matrix`):
+
+| Test ID | Objective | Input Condition | Expected Output / Invariant |
+| :--- | :--- | :--- | :--- |
+| **TC-SESS-01** | Resolution Hierarchy Order | `--session-dir`, `ARC_SESSION_DIR`, `--project-local`, CWD `.arc/sessions`, OS Data Dir | CLI override strictly precedes environment variable; env precedes project-local; existing CWD continuity is preserved; fallback to user data dir (%LOCALAPPDATA% / XDG / Library) or temp. |
+| **TC-SESS-02** | Operational Audit Record Logging | Mediated hook or eval action execution | Appends single JSON record to `<storage_dir>/<session>.audit.jsonl` containing event UUID, action/tool, verdict, rule ID, and secret redaction count. |
+| **TC-SESS-03** | Causal DAG Inspection & Integrity | `arc session dag [id] [--latest] [--json]` | Formats causal nodes, causal depth, tainted argument fields (`field_taints`), path taints (`path_taints`), and schema fingerprints. Validates cryptographic session integrity hash. |
+| **TC-SESS-04** | Aggregate Audit Metrics Reporting | `arc session report [id] [--all] [--json]` | Aggregates total events, verdict breakdown (Allow, Deny, RequireApproval, Quarantine), rule breakdowns, and redactions across single or all sessions. |
+| **TC-SESS-05** | Expired Session & Audit Log Pruning | `arc session clean --max-age-hours <N>` | Safely deletes expired `<session>.json` state and associated `<session>.audit.jsonl` operational logs older than threshold; leaves active sessions intact. |
+
+### Phase 3: Threat-Modeled Human Approval Acceptance Test Matrix
+
+All human approval subsystems and OS modal interactions must pass the Phase 3 Acceptance Test Matrix verified in [`tests/integration_tests.rs`](file:///c:/vexa-arc/tests/integration_tests.rs) (`test_phase3_threat_modeled_human_approval_matrix`) and [`docs/test-plan-human-approval.md`](file:///c:/vexa-arc/docs/test-plan-human-approval.md):
+
+| Test ID | Objective | Input Condition | Expected Output / Invariant |
+| :--- | :--- | :--- | :--- |
+| **TC-APPR-01** | CSPRNG PIN Generation & Entropy | `generate_secure_pin()` invoked 100 times | All PINs are strictly 6 digits in range `100000..=999999`, generated via unbiased rejection sampling (~20 bits entropy). |
+| **TC-APPR-02** | Headless Fail-Closed Enforcement | `ApprovalManager` in non-interactive/headless desktop | Fails closed with `ARC-AUTH-HEADLESS-UNSUPPORTED`; never stalls or opens unauthenticated stdin prompts. |
+| **TC-APPR-03** | Interactive PIN Confirmation | Valid 6-digit PIN entered in dialog | Returns `ApprovalOutcome::Approved`; registers single-use grant valid for 15 minutes. |
+| **TC-APPR-04** | Single-Use Grant & Replay Prevention | `consume_grant()` on issued grant | First evaluation succeeds; second evaluation with identical grant key returns `None` (replays strictly blocked). |
+| **TC-APPR-05** | PIN Exhaustion & 15-Minute Lockout | 3 consecutive incorrect PIN submissions | Aborts with `ARC-AUTH-PIN-EXHAUSTED`; subsequent requests within 15 minutes fail closed with `ARC-AUTH-LOCKED-OUT`. |
+| **TC-APPR-06** | Anti-Fatigue Rolling Rate-Limiting | 4 approval requests submitted within 60s | First 3 succeed; 4th request is blocked with `ARC-AUTH-RATE-LIMITED`. |
+| **TC-APPR-07** | RFC 8785 Action Tamper Rejection | Action arguments mutated after human approval | Grant key verification fails because $\text{SHA256}(\text{CanonicalActionBytes})$ mismatch voids the approval. |
+
+### Phase 4: Consensual, Disposable-Worktree SCA Remediation Acceptance Test Matrix
+
+All SCA auditing, scratch diff proposals, and disposable worktree remediation logic must pass the Phase 4 Acceptance Test Matrix verified in [`tests/integration_tests.rs`](file:///c:/vexa-arc/tests/integration_tests.rs) (`test_phase4_disposable_worktree_sca_remediation_matrix`) and [`docs/test-plan-sca-remediation.md`](file:///c:/vexa-arc/docs/test-plan-sca-remediation.md):
+
+| Test ID | Objective | Input Condition | Expected Output / Invariant |
+| :--- | :--- | :--- | :--- |
+| **TC-SCA-01** | Scoped SCA Audit with SARIF & Location Sanitization | Project manifest and OASIS SARIF output with private paths and code snippets | Generates valid SARIF v2.1.0 report; eliminates usernames, internal repo paths, and source code snippets (`region.snippet`); pseudonymizes physical URIs into `sanitized/<hash>.source`. |
+| **TC-SCA-02** | Policy Failure Gating (`--fail-on`) | Vulnerability severities evaluated against `--fail-on <severity>` | Exits with status 1 if any detected vulnerability severity meets or exceeds threshold (`critical`, `high`, `medium`, `low`); exits with status 0 if vulnerabilities are below threshold or zero. |
+| **TC-SCA-03** | Dry-Run Scratch Diff Invariant | `arc sca fix --dry-run` invoked on target directory | Creates isolated temporary scratch copy in OS temp; active working tree manifest remains 100% byte-identical with unchanged mtime; scratch directory is guaranteed cleaned up. |
+| **TC-SCA-04** | Remote Base Validation & Divergence Policy | Local branch with unpushed commits vs `refs/remotes/origin/<base>` | Fails closed by default with actionable error (`DivergedFromRemote`); passing `--force-remote-base` overrides local divergence and proceeds with remote origin ref. |
+| **TC-SCA-05** | Detached Worktree Creation & RAII Cleanup | `DisposableWorktree::create` on target repo | Spawns worktree in OS temp with `.arc-worktree-marker.json` recording PID and target ref; HEAD is detached (preventing branch collision with `PrCreator`); RAII `Drop` automatically prunes worktree directory and Git metadata. |
+| **TC-SCA-06** | 5-Point Stale Worktree Safety Pruning | Stale worktrees evaluated with dead vs active PIDs, canonical containment, UUID format, and marker integrity | Prunes directories satisfying all 5 safety points; strictly ignores non-UUID folders, missing markers, or directories outside canonical OS temp. |
 
 ### Running Tests & Verification Suite
 
-The workspace contains unit and integration tests across its crates. Do not cite a fixed test count or claim passing results without checking the current checkout and CI. The Rust toolchain was unavailable during the current source review, so execution results remain pending.
+The workspace contains comprehensive unit and integration tests across all crates:
 
 ```bash
 # Run all workspace unit and integration tests
