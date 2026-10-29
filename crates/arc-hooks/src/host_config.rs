@@ -31,9 +31,9 @@ impl HostInstallSummary {
 /// Cleans Windows UNC extended-length prefixes (`\\?\`) so paths remain
 /// compliant with standard shell execution and tools.
 pub fn clean_canonical_path(path: &Path) -> PathBuf {
-    let p_str = path.to_string_lossy();
     #[cfg(windows)]
     {
+        let p_str = path.to_string_lossy();
         if let Some(stripped) = p_str.strip_prefix(r"\\?\") {
             return PathBuf::from(stripped);
         }
