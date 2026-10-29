@@ -239,18 +239,15 @@ impl DesktopSessionPreflight {
         #[cfg(target_os = "linux")]
         {
             // Linux requires active X11 or Wayland display server
-            let has_display = std::env::var_os("DISPLAY").is_some()
-                || std::env::var_os("WAYLAND_DISPLAY").is_some();
-            has_display
+            std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
         }
 
         #[cfg(target_os = "macos")]
         {
             // macOS GUI session check
-            let has_session = std::env::var_os("SECURITYSESSIONID").is_some()
+            std::env::var_os("SECURITYSESSIONID").is_some()
                 || std::env::var_os("TERM_PROGRAM").is_some()
-                || std::env::var_os("DISPLAY").is_some();
-            has_session
+                || std::env::var_os("DISPLAY").is_some()
         }
 
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
