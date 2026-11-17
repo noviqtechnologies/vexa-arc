@@ -1,0 +1,125 @@
+name: 'Vexa Arc Security Gate'
+description: 'Scan PRs for leaked secrets, hidden Unicode prompt injection, unpinned MCP servers, and vulnerable dependencies.'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  version:
+    description: 'Vexa Arc release tag to use (e.g. v1.0.2, latest, or source to build from checkout)'
+    required: false
+    default: 'latest'
+  path:
+    description: 'Target directory to scan'
+    required: false
+    default: '.'
+  fail-on:
+    description: 'Fail if SCA vulnerabilities meet or exceed severity (critical, high, medium, low). Empty disables SCA fail gating.'
+    required: false
+    default: ''
+  fail-on-secrets:
+    description: 'Fail the check if leaked secrets are detected (true/false)'
+    required: false
+    default: 'true'
+  run-sca:
+    description: 'Run dependency SCA check (true/false)'
+    required: false
+    default: 'true'
+  comment-pr:
+    description: 'Post or update a deduplicated security summary comment on pull requests (true/false)'
+    required: false
+    default: 'true'
+  github-token:
+    description: 'GitHub token for posting PR comments'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  passed:
+    description: 'Whether all enabled security gates passed (true/false)'
+    value: ${{ steps.scan.outputs.passed }}
+  secrets-count:
+    description: 'Number of leaked secrets detected'
+    value: ${{ steps.scan.outputs.secrets_count }}
+  sca-critical:
+    description: 'Number of critical SCA vulnerabilities'
+    value: ${{ steps.scan.outputs.sca_critical }}
+  sca-high:
+    description: 'Number of high SCA vulnerabilities'
+    value: ${{ steps.scan.outputs.sca_high }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Vexa Arc (Unix)
+      if: runner.os != 'Windows' && inputs.version != 'source'
+      shell: bash
+      env:
+        ARC_VERSION: ${{ inputs.version }}
+        ARC_INSTALL_DIR: ${{ runner.temp }}/vexa-arc-bin
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.sh | sh
+        echo "${{ runner.temp }}/vexa-arc-bin" >> "$GITHUB_PATH"
+
+    - name: Install Vexa Arc (Windows)
+      if: runner.os == 'Windows' && inputs.version != 'source'
+      shell: pwsh
+      env:
+        ARC_VERSION: ${{ inputs.version }}
+        ARC_INSTALL_DIR: ${{ runner.temp }}\vexa-arc-bin
+      run: |
+        irm https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.ps1 | iex
+        "${{ runner.temp }}\vexa-arc-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Build Vexa Arc from Source
+      if: inputs.version == 'source'
+      shell: bash
+      run: |
+        cargo build --release --locked
+        echo "${PWD}/target/release" >> "$GITHUB_PATH"
+
+    - name: Run Vexa Arc CI Report
+      id: scan
+      shell: bash
+      run: |
+        ARGS=(ci-report --path "${{ inputs.path }}" --markdown-out "${{ runner.temp }}/arc-pr-report.md" --json-out "${{ runner.temp }}/arc-pr-report.json" --fail-on-secrets "${{ inputs.fail-on-secrets }}")
+        if [ "${{ inputs.run-sca }}" = "true" ]; then
+          ARGS+=(--sca)
+        fi
+        if [ -n "${{ inputs.fail-on }}" ]; then
+          ARGS+=(--fail-on "${{ inputs.fail-on }}")
+        fi
+
+        set +e
+        arc "${ARGS[@]}"
+        EXIT_CODE=$?
+        set -e
+
+        node -e '
+          const fs = require("fs");
+          const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          const out = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(out, `passed=${r.passed}\n`);
+          fs.appendFileSync(out, `secrets_count=${r.secrets.length}\n`);
+          fs.appendFileSync(out, `sca_critical=${r.sca ? r.sca.critical_count : 0}\n`);
+          fs.appendFileSync(out, `sca_high=${r.sca ? r.sca.high_count : 0}\n`);
+        ' "${{ runner.temp }}/arc-pr-report.json"
+
+        echo "ARC_EXIT_CODE=$EXIT_CODE" >> "$GITHUB_ENV"
+
+    - name: Post or Update PR Comment
+      if: inputs.comment-pr == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ARC_REPORT_PATH: ${{ runner.temp }}/arc-pr-report.md
+      run: |
+        node "${{ github.action_path }}/.github/actions/comment-pr.js"
+
+    - name: Enforce Gate Status
+      shell: bash
+      run: |
+        if [ "${ARC_EXIT_CODE:-1}" -ne 0 ]; then
+          echo "::error::Vexa Arc Security Gate failed."
+          exit 1
+        fi

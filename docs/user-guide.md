@@ -122,6 +122,24 @@ For agents without native hook integrations (Codex CLI, Gemini CLI, Windsurf, Cl
 }
 ```
 
+### CI/CD & Pull Request Gate (`arc ci-report` & GitHub Action)
+
+Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON report covering leaked secrets, hidden Unicode/Trojan-Source characters in agent rule files (`CLAUDE.md`, `.cursorrules`, `.mdc`), unpinned MCP servers, and optional SCA vulnerability counts:
+
+```bash
+arc ci-report --sca --fail-on high --markdown-out arc-pr-report.md --json-out arc-pr-report.json
+```
+
+For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.0.2`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
+
+### Remote Streamable HTTP / SSE MCP Proxy (`arc protect http`)
+
+For remote hosted MCP servers (e.g., Linear, Notion, Sentry, GitHub remote MCP) that do not run over local stdio, start a loopback forward proxy enforcing the same JCS schema pinning, Lethal Trifecta taint tracking, and invisible-Unicode response sanitization:
+
+```bash
+arc protect http --server linear --target https://mcp.linear.app/sse --listen 127.0.0.1:8787 --allow-tofu
+```
+
 ### Windows (x64 / ARM64)
 
 #### Option 1: Download Pre-Compiled Binary (GitHub Releases)

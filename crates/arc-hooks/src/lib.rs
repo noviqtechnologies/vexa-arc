@@ -3,6 +3,7 @@ pub mod broker;
 pub mod claude_code;
 pub mod cursor;
 pub mod host_config;
+pub mod http_proxy;
 pub mod mcp_jsonrpc;
 pub mod principal;
 pub mod process_containment;

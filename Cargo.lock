@@ -181,10 +181,12 @@ dependencies = [
  "arc-telemetry",
  "hex",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "thiserror 1.0.69",
+ "tokio",
  "uuid",
 ]
 

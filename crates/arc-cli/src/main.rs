@@ -224,6 +224,37 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
     },
+
+    /// Generate a consolidated Markdown/JSON security report for CI & Pull Request comments
+    CiReport {
+        /// Target project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Include dependency SCA audit (requires supported manifest/lockfile)
+        #[arg(long)]
+        sca: bool,
+
+        /// Fail if SCA vulnerabilities meet or exceed threshold (critical, high, medium, low)
+        #[arg(long)]
+        fail_on: Option<String>,
+
+        /// Fail if any leaked secrets are detected (default: true)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        fail_on_secrets: bool,
+
+        /// Write rendered Markdown PR report to file
+        #[arg(long)]
+        markdown_out: Option<PathBuf>,
+
+        /// Write structured JSON report to file
+        #[arg(long)]
+        json_out: Option<PathBuf>,
+
+        /// Print structured JSON report to stdout
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -483,6 +514,37 @@ enum ProtectAction {
         /// Target MCP server command and arguments
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
+    },
+
+    /// Supervise a remote Streamable HTTP / SSE MCP server via local forward proxy
+    Http {
+        /// MCP server identifier (e.g. 'linear' or 'github')
+        #[arg(short, long)]
+        server: String,
+
+        /// Upstream remote MCP endpoint URL (e.g. https://mcp.linear.app/sse)
+        #[arg(short, long)]
+        target: String,
+
+        /// Local loopback listen address (default: 127.0.0.1:8787)
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: String,
+
+        /// Host session identifier
+        #[arg(long, default_value = "default-session")]
+        session: String,
+
+        /// Schema SHA-256 JCS fingerprint; a signed organization policy pin takes precedence
+        #[arg(long)]
+        pin_schema: Option<String>,
+
+        /// Explicitly allow trust-on-first-use for development/bootstrap only
+        #[arg(long)]
+        allow_tofu: bool,
+
+        /// Host agent client name (e.g. claude-code, cursor, windsurf, custom-mcp)
+        #[arg(long, default_value = "custom-mcp")]
+        host: String,
     },
 }
 
@@ -1021,6 +1083,27 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            ProtectAction::Http {
+                server,
+                target,
+                listen,
+                session,
+                pin_schema,
+                allow_tofu,
+                host,
+            } => {
+                if !run_protect_http(
+                    &server,
+                    &target,
+                    &listen,
+                    &session,
+                    pin_schema.as_deref(),
+                    allow_tofu,
+                    &host,
+                ) {
+                    std::process::exit(1);
+                }
+            }
         },
         Commands::Host { action } => match action {
             HostAction::Install { host, workspace } => {
@@ -1227,6 +1310,27 @@ fn main() {
         }
         Commands::McpServer { path } => {
             if !commands::mcp_server::run_mcp_server(&path) {
+                std::process::exit(1);
+            }
+        }
+        Commands::CiReport {
+            path,
+            sca,
+            fail_on,
+            fail_on_secrets,
+            markdown_out,
+            json_out,
+            json,
+        } => {
+            if !commands::ci_report::run_ci_report(
+                &path,
+                sca,
+                fail_on.as_deref(),
+                fail_on_secrets,
+                markdown_out.as_deref(),
+                json_out.as_deref(),
+                json,
+            ) {
                 std::process::exit(1);
             }
         }
@@ -1643,7 +1747,7 @@ fn parse_agent_host(host: &str) -> AgentHost {
     }
 }
 
-fn run_protect_stdio(
+fn build_protected_broker(
     server: &str,
     session: &str,
     pin_schema: Option<&str>,
@@ -1651,12 +1755,12 @@ fn run_protect_stdio(
     max_memory_mb: Option<u64>,
     host: &str,
     command: Vec<String>,
-) -> bool {
+) -> Option<McpStdioBroker> {
     let policy = match PolicyConfig::try_load_with_precedence(Some(Path::new("."))) {
         Ok(policy) => policy,
         Err(error) => {
             eprintln!("[Arc Protect] Policy load failed: {error}");
-            return false;
+            return None;
         }
     };
     let lockfile_path = PathBuf::from(".arc").join("mcp-pins.lock");
@@ -1670,7 +1774,7 @@ fn run_protect_stdio(
         Ok(pin) => pin,
         Err(error) => {
             eprintln!("[Arc Protect] Schema pin configuration rejected: {error}");
-            return false;
+            return None;
         }
     };
     let is_signed_org =
@@ -1706,6 +1810,29 @@ fn run_protect_stdio(
     if let Some(hash) = pinned {
         broker = broker.with_pinned_schema(hash);
     }
+    Some(broker)
+}
+
+fn run_protect_stdio(
+    server: &str,
+    session: &str,
+    pin_schema: Option<&str>,
+    allow_tofu: bool,
+    max_memory_mb: Option<u64>,
+    host: &str,
+    command: Vec<String>,
+) -> bool {
+    let Some(mut broker) = build_protected_broker(
+        server,
+        session,
+        pin_schema,
+        allow_tofu,
+        max_memory_mb,
+        host,
+        command,
+    ) else {
+        return false;
+    };
 
     if allow_tofu {
         eprintln!("[Arc Protect] WARNING: TOFU explicitly enabled for '{server}'; review the observed schema hash and pin it before managed use.");
@@ -1714,6 +1841,37 @@ fn run_protect_stdio(
     }
     if let Err(e) = broker.run_stdio() {
         eprintln!("[Arc Protect] Stdio broker error: {e}");
+        return false;
+    }
+    true
+}
+
+fn run_protect_http(
+    server: &str,
+    target: &str,
+    listen: &str,
+    session: &str,
+    pin_schema: Option<&str>,
+    allow_tofu: bool,
+    host: &str,
+) -> bool {
+    let Some(broker) = build_protected_broker(
+        server,
+        session,
+        pin_schema,
+        allow_tofu,
+        None,
+        host,
+        Vec::new(),
+    ) else {
+        return false;
+    };
+
+    if allow_tofu {
+        eprintln!("[Arc Protect HTTP] WARNING: TOFU explicitly enabled for '{server}'; schema hash will be saved to .arc/mcp-pins.lock.");
+    }
+    if let Err(e) = arc_hooks::http_proxy::run_http_proxy(listen, target, broker) {
+        eprintln!("[Arc Protect HTTP] Proxy error: {e}");
         return false;
     }
     true

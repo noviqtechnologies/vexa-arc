@@ -459,13 +459,14 @@ All commands support relative and absolute paths, cross-platform path separators
 | `arc init` | Initialize `.arc/policy.json`, install IDE hooks, and run quick discovery | `--host <auto\|claude-code\|cursor\|all\|none>`, `--audit-mode`, `--json` | `arc init --audit-mode` |
 | `arc allow` | Add a scoped allowlist exception to `.arc/policy.json` | `--rule <ID>`, `--target <STR>`, `--ttl-hours <N>` | `arc allow --rule ARC-PKG-001 --target my-pkg` |
 | `arc mcp-server` | Run stdio MCP server (`scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets`) | `-p, --path <PATH>` | `arc mcp-server` |
+| `arc ci-report` | Generate Markdown/JSON PR security report (secrets, hidden Unicode, MCP pins, SCA) | `--sca`, `--fail-on <SEV>`, `--markdown-out <PATH>`, `--json-out <PATH>` | `arc ci-report --sca --fail-on high` |
 | `arc audit` | Scan project or workstation for AI assets, rules, and MCP configs | `--workstation`, `--json`, `--output-bom <PATH>` | `arc audit --output-bom ai-bom.json` |
 | `arc bom` | Export CycloneDX v1.6 AI-BOM | `-p, --path <PATH>`, `-o, --out <PATH>` | `arc bom --out ai-bom.json` |
 | `arc sca` | Consensual, disposable-worktree SCA scanning & PR remediation | `audit`, `fix [--dry-run \| --open-pr]` | `arc sca audit --sarif audit.sarif --sanitize-locations` |
 | `arc shield` | Live cached registry checks (npm, PyPI, crates.io) + exact-version OSV check | `check <PKG>`, `run <CMD>`, `--show-recommendation`, `--fail-on-risk` | `arc shield run --fail-on-risk -- npm install package` |
 | `arc scan-secrets` | Scan files or stdin for secrets with entropy checks | `-p, --path <PATH>`, `--redact` | `arc scan-secrets --path . --redact` |
 | `arc host` | Manage host integrations (Claude Code, Cursor) | `install`, `status`, `uninstall`, `--host <HOST>` | `arc host install --host claude-code` |
-| `arc protect` | Supervise MCP servers with containment and schema pinning (`.arc/mcp-pins.lock` or signed policy) | `stdio --server <NAME>`, `--pin-schema <HASH>`, `--allow-tofu`, `--max-memory-mb <MB>` | `arc protect stdio --server fs -- npx server` |
+| `arc protect` | Supervise stdio or remote HTTP/SSE MCP servers with schema pinning (`.arc/mcp-pins.lock` or signed policy) | `stdio --server <NAME>`, `http --server <NAME> --target <URL> --listen 127.0.0.1:8787` | `arc protect http --server linear --target https://mcp.linear.app/sse` |
 | `arc intercept` | Intercept and evaluate agent actions against session Taint DAG | `eval`, `read`, `exec`, `mcp`, `prompt`, `hook`, `session` | `arc intercept hook --host claude-code` |
 | `arc trace` | Inspect event causality and export redacted audit evidence | `<EVENT_ID>`, `latest`, `--export <PATH>`, `--json` | `arc trace latest --export trace.json` |
 | `arc doctor` | Check host adapters, policy engine, and cumulative metrics | `--metrics`, `--json` | `arc doctor --metrics` |
@@ -505,39 +506,30 @@ If the collector is unavailable, Arc continues with its existing security behavi
 
 ---
 
-## CI/CD Quality Gate (GitHub Actions)
+## CI/CD Quality Gate (GitHub Actions & PR Commenter)
 
-Integrate Vexa Arc into your CI/CD pipelines to enforce security quality gates on every push and pull request:
+Add Vexa Arc to any repository in 6 lines to scan PRs for leaked secrets, hidden Unicode in agent rules, unpinned MCP servers, and vulnerable dependencies, posting a single deduplicated PR summary comment:
 
 ```yaml
 name: Vexa Arc Security Gate
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
-  arc-security-audit:
-    runs-on: ubuntu-latest
+  arc-security-gate:
+    runs-on: ubuntu-latest # also supports macos-latest and windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: noviqtechnologies/vexa-arc@v1.0.2
         with:
-          toolchain: stable
-
-      - name: Build Vexa Arc
-        run: cargo build --release --locked
-
-      - name: Run AI-SPM Audit & CycloneDX v1.6 AI-BOM Export
-        run: ./target/release/arc audit --output-bom cyclonedx-ai-bom.json
-
-      - name: Verify Zero Leaked Credentials
-        run: ./target/release/arc scan-secrets --path .
-
-      - name: Archive AI-BOM
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: cyclonedx-ai-bom
-          path: cyclonedx-ai-bom.json
+          fail-on: high
+          fail-on-secrets: 'true'
+          run-sca: 'true'
+          comment-pr: 'true'
 ```
 
 ---
