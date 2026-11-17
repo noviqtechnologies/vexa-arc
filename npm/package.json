@@ -1,6 +1,6 @@
 {
   "name": "@vexasec/arc",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Zero-friction CLI wrapper for Vexa Arc: local AI agent security engine & MCP policy broker",
   "bin": {
     "arc": "./bin/arc.js"
