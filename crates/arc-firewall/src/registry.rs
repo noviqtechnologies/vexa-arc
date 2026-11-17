@@ -328,7 +328,7 @@ pub fn fetch_live_registry_metadata(
     ecosystem: Ecosystem,
     name: &str,
 ) -> Option<(PackageRegistryMetadata, RegistryMetadataSource)> {
-    if std::env::var("ARC_OFFLINE").ok().as_deref() == Some("1") {
+    if cfg!(test) || std::env::var("ARC_OFFLINE").ok().as_deref() == Some("1") {
         let eco_str = match ecosystem {
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "pypi",

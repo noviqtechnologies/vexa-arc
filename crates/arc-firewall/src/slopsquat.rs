@@ -259,11 +259,9 @@ impl CompoundAntiSlopsquatEngine {
             };
         }
 
-        // Compound Block Gate: Newly registered package name (< 14 days AND < 500 downloads)
-        // AND triggers at least one high-risk compound indicator:
-        if metadata.age_days < 14 && metadata.monthly_downloads < 500 {
-            // Indicator 1: Hallucination / Typosquat Distance. Normalize case to avoid
-            // trivial case-only evasion, and compare only within the package ecosystem.
+        // Typosquat / Hallucination Gate: any non-established package with low adoption
+        // (< 1,000 monthly downloads) that closely mimics a popular package in the same ecosystem.
+        if metadata.monthly_downloads < 1_000 {
             let normalized_name = metadata.name.to_ascii_lowercase();
             for popular in self
                 .popular_packages
@@ -288,7 +286,11 @@ impl CompoundAntiSlopsquatEngine {
                     }
                 }
             }
+        }
 
+        // Compound Block Gate: Newly registered package name (< 14 days AND < 500 downloads)
+        // AND triggers at least one high-risk compound indicator:
+        if metadata.age_days < 14 && metadata.monthly_downloads < 500 {
             // Indicator 2: Missing or spoofed source repository signals.
             if !metadata.has_verified_repository_link
                 || (metadata.repository_stars == 0 && metadata.repository_commits == 0)

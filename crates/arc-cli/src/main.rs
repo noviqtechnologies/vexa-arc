@@ -4650,6 +4650,7 @@ mod tests {
 
     #[test]
     fn test_shield_check_blocked_and_permitted() {
+        std::env::set_var("ARC_OFFLINE", "1");
         assert!(!run_shield_check(
             "reactt",
             "npm",
