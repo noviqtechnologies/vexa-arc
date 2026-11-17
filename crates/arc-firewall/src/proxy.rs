@@ -1,6 +1,14 @@
 use arc_core::event::Ecosystem;
 
+use crate::registry::{fetch_live_registry_metadata, RegistryMetadataSource};
 use crate::slopsquat::{CompoundAntiSlopsquatEngine, PackageRegistryMetadata, SlopsquatVerdict};
+
+#[derive(Debug, Clone)]
+pub struct LivePackageInspection {
+    pub verdict: SlopsquatVerdict,
+    pub source: RegistryMetadataSource,
+    pub metadata: Option<PackageRegistryMetadata>,
+}
 
 fn normalize_ecosystem(ecosystem: &str) -> &str {
     match ecosystem.to_ascii_lowercase().as_str() {
@@ -179,6 +187,35 @@ impl PackageFirewall {
         }
     }
 
+    /// Evaluates a package using live cached registry metadata (npm, PyPI, crates.io),
+    /// falling back gracefully to the local heuristic baseline when offline or unreachable.
+    pub fn inspect_package_live(
+        &self,
+        ecosystem: Ecosystem,
+        package_name: &str,
+        has_dangerous_scripts: bool,
+    ) -> LivePackageInspection {
+        if let Some((mut meta, source)) = fetch_live_registry_metadata(ecosystem, package_name) {
+            if has_dangerous_scripts {
+                meta.has_dangerous_lifecycle_scripts = true;
+            }
+            let verdict = self.engine.evaluate(&meta);
+            LivePackageInspection {
+                verdict,
+                source,
+                metadata: Some(meta),
+            }
+        } else {
+            let verdict =
+                self.inspect_package_protected(ecosystem, package_name, has_dangerous_scripts);
+            LivePackageInspection {
+                verdict,
+                source: RegistryMetadataSource::HeuristicFallback,
+                metadata: None,
+            }
+        }
+    }
+
     /// Returns a suggested command variant for a caller to review; it does not execute or isolate it.
     pub fn suggest_safer_command(
         command: &str,
@@ -298,61 +335,42 @@ impl PackageFirewall {
         }
 
         let mut out = Vec::new();
+        let collect_args = |args: &[&str], eco: Ecosystem, out: &mut Vec<(Ecosystem, String)>| {
+            for &arg in args {
+                if !arg.starts_with('-') {
+                    let cleaned = Self::clean_package_name(arg, eco);
+                    if !cleaned.is_empty() {
+                        out.push((eco, cleaned));
+                    }
+                }
+            }
+        };
 
         if parts[0] == "npm" || parts[0] == "pnpm" || parts[0] == "yarn" {
             if parts.len() > 1 && (parts[1] == "install" || parts[1] == "i" || parts[1] == "add") {
-                for &arg in &parts[2..] {
-                    if !arg.starts_with('-') {
-                        let cleaned = Self::clean_package_name(arg, Ecosystem::Npm);
-                        if !cleaned.is_empty() {
-                            out.push((Ecosystem::Npm, cleaned));
-                        }
-                    }
-                }
+                collect_args(&parts[2..], Ecosystem::Npm, &mut out);
             }
-        } else if parts[0] == "pip" || parts[0] == "uv" {
+        } else if parts[0] == "pip" || parts[0] == "pip3" {
             if parts.len() > 1 && (parts[1] == "install" || parts[1] == "add") {
-                for &arg in &parts[2..] {
-                    if !arg.starts_with('-') {
-                        let cleaned = Self::clean_package_name(arg, Ecosystem::Pypi);
-                        if !cleaned.is_empty() {
-                            out.push((Ecosystem::Pypi, cleaned));
-                        }
-                    }
-                }
+                collect_args(&parts[2..], Ecosystem::Pypi, &mut out);
+            }
+        } else if parts[0] == "uv" {
+            if parts.len() > 1 && parts[1] == "add" {
+                collect_args(&parts[2..], Ecosystem::Pypi, &mut out);
+            } else if parts.len() > 2 && parts[1] == "pip" && parts[2] == "install" {
+                collect_args(&parts[3..], Ecosystem::Pypi, &mut out);
             }
         } else if parts[0] == "cargo" && parts.len() > 1 && parts[1] == "add" {
-            for &arg in &parts[2..] {
-                if !arg.starts_with('-') {
-                    let cleaned = Self::clean_package_name(arg, Ecosystem::Cargo);
-                    if !cleaned.is_empty() {
-                        out.push((Ecosystem::Cargo, cleaned));
-                    }
-                }
-            }
+            collect_args(&parts[2..], Ecosystem::Cargo, &mut out);
         } else if parts[0] == "go" && parts.len() > 1 && parts[1] == "get" {
-            for &arg in &parts[2..] {
-                if !arg.starts_with('-') {
-                    let cleaned = Self::clean_package_name(arg, Ecosystem::Go);
-                    if !cleaned.is_empty() {
-                        out.push((Ecosystem::Go, cleaned));
-                    }
-                }
-            }
+            collect_args(&parts[2..], Ecosystem::Go, &mut out);
         } else if (parts[0] == "python" || parts[0] == "python3")
             && parts.len() > 3
             && parts[1] == "-m"
             && parts[2] == "pip"
             && (parts[3] == "install" || parts[3] == "add")
         {
-            for &arg in &parts[4..] {
-                if !arg.starts_with('-') {
-                    let cleaned = Self::clean_package_name(arg, Ecosystem::Pypi);
-                    if !cleaned.is_empty() {
-                        out.push((Ecosystem::Pypi, cleaned));
-                    }
-                }
-            }
+            collect_args(&parts[4..], Ecosystem::Pypi, &mut out);
         }
 
         out

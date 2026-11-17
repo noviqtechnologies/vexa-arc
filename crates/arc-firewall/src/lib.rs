@@ -1,5 +1,6 @@
 pub mod osv_scanner;
 pub mod proxy;
+pub mod registry;
 pub mod remediation;
 pub mod slopsquat;
 

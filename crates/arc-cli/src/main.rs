@@ -1,3 +1,5 @@
+mod commands;
+
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -168,6 +170,59 @@ enum Commands {
     Sca {
         #[command(subcommand)]
         action: ScaAction,
+    },
+
+    /// Zero-friction project onboarding: create .arc/policy.json, install IDE hooks, and run quick audit
+    Init {
+        /// Target project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Target IDE host to configure (auto, claude-code, cursor, all, none)
+        #[arg(long, default_value = "auto")]
+        host: String,
+
+        /// Initialize in non-blocking audit mode ("mode": "audit")
+        #[arg(long)]
+        audit_mode: bool,
+
+        /// Output onboarding summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Add a scoped allowlist exception to .arc/policy.json
+    Allow {
+        /// Rule ID to allow (e.g. ARC-LTT-001, ARC-MCP-001, ARC-DLP-001, or '*')
+        #[arg(long)]
+        rule: String,
+
+        /// Optional target substring (file path, tool name, or MCP server)
+        #[arg(long)]
+        target: Option<String>,
+
+        /// Reason for granting this exception
+        #[arg(long, default_value = "Developer allowlist via arc allow")]
+        reason: String,
+
+        /// Exception lifetime in hours (default: 8760 = 1 year)
+        #[arg(long, default_value = "8760")]
+        ttl_hours: u64,
+
+        /// Project directory containing .arc/policy.json (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Output result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run a local stdio MCP server exposing scan_secrets, check_package, sca_audit, and audit_ai_assets
+    McpServer {
+        /// Default workspace root directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
     },
 }
 
@@ -1141,6 +1196,40 @@ fn main() {
                 }
             }
         },
+        Commands::Init {
+            path,
+            host,
+            audit_mode,
+            json,
+        } => {
+            if !commands::init::run_init(&path, &host, audit_mode, json) {
+                std::process::exit(1);
+            }
+        }
+        Commands::Allow {
+            rule,
+            target,
+            reason,
+            ttl_hours,
+            path,
+            json,
+        } => {
+            if !commands::allow::run_allow(
+                &path,
+                &rule,
+                target.as_deref(),
+                &reason,
+                ttl_hours,
+                json,
+            ) {
+                std::process::exit(1);
+            }
+        }
+        Commands::McpServer { path } => {
+            if !commands::mcp_server::run_mcp_server(&path) {
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -1570,14 +1659,27 @@ fn run_protect_stdio(
             return false;
         }
     };
-    let pinned = match resolve_schema_pin(&policy, server, pin_schema, allow_tofu) {
+    let lockfile_path = PathBuf::from(".arc").join("mcp-pins.lock");
+    let pinned = match resolve_schema_pin_with_lockfile(
+        &policy,
+        server,
+        pin_schema,
+        allow_tofu,
+        Some(&lockfile_path),
+    ) {
         Ok(pin) => pin,
         Err(error) => {
             eprintln!("[Arc Protect] Schema pin configuration rejected: {error}");
             return false;
         }
     };
+    let is_signed_org =
+        policy.source == Some(arc_policy_engine::evaluator::PolicySource::SignedOrganization);
     let evaluator = PolicyEvaluator::new(policy);
+    let session_dir = resolve_session_storage_dir(None, false).ok();
+    if let Some(ref dir) = session_dir {
+        let _ = evaluator.load_session_state(dir, session);
+    }
     let telemetry_client = arc_telemetry::TelemetryClient::from_environment();
     let telemetry_sink = if telemetry_client.enabled() {
         Some(std::sync::Arc::new(telemetry_client)
@@ -1592,8 +1694,14 @@ fn run_protect_stdio(
         .with_limits(arc_hooks::ContainmentLimits {
             max_memory_bytes: max_memory_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
         });
+    if let Some(dir) = session_dir {
+        broker = broker.with_session_storage_dir(dir);
+    }
     if allow_tofu {
         broker = broker.allow_schema_tofu();
+        if !is_signed_org {
+            broker = broker.with_pin_lockfile(lockfile_path);
+        }
     }
     if let Some(hash) = pinned {
         broker = broker.with_pinned_schema(hash);
@@ -1832,7 +1940,8 @@ fn run_shield_run(command: Vec<String>, show_recommendation: bool, fail_on_risk:
 
     println!("\n[Arc Shield Run] Advisory check (command not executed): {cmd_str}");
     for (eco, pkg_name) in &pkgs {
-        let verdict = firewall.inspect_package_protected(*eco, pkg_name, false);
+        let inspection = firewall.inspect_package_live(*eco, pkg_name, false);
+        let verdict = inspection.verdict;
         match &verdict {
             SlopsquatVerdict::Blocked { gate, reason } => {
                 println!("  🛑 BLOCKED  {pkg_name} ({eco:?}) — {gate}: {reason}");
@@ -2527,7 +2636,13 @@ fn run_shield_check(
     let eco = parse_ecosystem(ecosystem);
 
     let (osv_name, osv_version) = split_package_version(package);
-    let verdict = firewall.inspect_package(eco, osv_name, age_days, downloads, dangerous_scripts);
+    let verdict = if age_days.is_none() && downloads.is_none() {
+        firewall
+            .inspect_package_live(eco, osv_name, dangerous_scripts)
+            .verdict
+    } else {
+        firewall.inspect_package(eco, osv_name, age_days, downloads, dangerous_scripts)
+    };
     let suggestion = verdict.suggested_action(ecosystem);
 
     // FR-PKG-005: Run OSV/EPSS vulnerability scan via vexa-sca native integration.
@@ -3688,6 +3803,27 @@ fn resolve_schema_pin(
     }
 }
 
+fn resolve_schema_pin_with_lockfile(
+    policy: &PolicyConfig,
+    server: &str,
+    schema_input: Option<&str>,
+    allow_tofu: bool,
+    lockfile_path: Option<&Path>,
+) -> Result<Option<[u8; 32]>, String> {
+    if policy.source != Some(arc_policy_engine::evaluator::PolicySource::SignedOrganization)
+        && schema_input.is_none()
+        && !allow_tofu
+    {
+        if let Some(lock_path) = lockfile_path {
+            if let Some(hex_pin) = arc_hooks::broker::load_mcp_pin_from_lockfile(lock_path, server)
+            {
+                return parse_schema_fingerprint(Some(&hex_pin));
+            }
+        }
+    }
+    resolve_schema_pin(policy, server, schema_input, allow_tofu)
+}
+
 pub fn classify_cli_provenance(
     untrusted: bool,
     source: Option<&str>,
@@ -4639,6 +4775,77 @@ mod tests {
 
         // Cleanup: Reset session
         run_intercept_session(session, true, true);
+    }
+
+    #[test]
+    fn lockfile_pin_is_used_when_unsigned_and_ignored_when_signed_org() {
+        let dir = std::env::temp_dir().join(format!("arc_pin_lock_test_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("mcp-pins.lock");
+        let lock_hash = [0x42u8; 32];
+        arc_hooks::broker::save_mcp_pin_to_lockfile(&lock_path, "github", &hex::encode(lock_hash))
+            .unwrap();
+
+        let local_policy = PolicyConfig::default();
+        assert_eq!(
+            resolve_schema_pin_with_lockfile(
+                &local_policy,
+                "github",
+                None,
+                false,
+                Some(&lock_path)
+            )
+            .unwrap(),
+            Some(lock_hash)
+        );
+
+        let mut org_policy = PolicyConfig {
+            source: Some(arc_policy_engine::evaluator::PolicySource::SignedOrganization),
+            ..Default::default()
+        };
+        let org_hash = [0x99u8; 32];
+        org_policy
+            .mcp_schema_pins
+            .insert("github".to_string(), hex::encode(org_hash));
+        assert_eq!(
+            resolve_schema_pin_with_lockfile(&org_policy, "github", None, false, Some(&lock_path))
+                .unwrap(),
+            Some(org_hash)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_and_allow_create_and_update_project_policy() {
+        let dir =
+            std::env::temp_dir().join(format!("arc_init_allow_test_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(commands::init::run_init(&dir, "none", true, true));
+        let policy_path = dir.join(".arc").join("policy.json");
+        assert!(policy_path.exists());
+
+        let cfg = PolicyConfig::try_load_with_precedence(Some(&dir)).unwrap();
+        assert_eq!(cfg.mode, arc_policy_engine::evaluator::PolicyMode::Audit);
+        assert!(cfg.require_approval_for_trifecta);
+
+        assert!(commands::allow::run_allow(
+            &dir,
+            "ARC-LTT-001",
+            Some("slack"),
+            "approved integration",
+            24,
+            true
+        ));
+        let updated = PolicyConfig::try_load_with_precedence(Some(&dir)).unwrap();
+        assert!(updated
+            .active_exceptions
+            .iter()
+            .any(|e| e.rule_id.as_deref() == Some("ARC-LTT-001")
+                && e.target.as_deref() == Some("slack")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

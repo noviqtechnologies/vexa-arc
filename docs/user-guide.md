@@ -74,7 +74,53 @@ To ensure clarity across security, DevOps, and AI development teams, the table b
 
 ### Prerequisites
 
-* Rust 1.85+ toolchain installed via [rustup.rs](https://rustup.rs/) (if building from source).
+* **Prebuilt / `npx`:** Node.js 18+ (for `npx @vexasec/arc`) or `curl`/`sh` (Linux/macOS) or PowerShell (Windows).
+* **From source:** Rust 1.97.0+ toolchain installed via [rustup.rs](https://rustup.rs/).
+
+### Quick Install (All Platforms)
+
+* **Zero-install via `npx` (Windows, macOS, Linux):**
+  ```bash
+  npx @vexasec/arc init
+  ```
+* **macOS / Linux (`install.sh`):**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.sh | sh
+  ```
+* **Windows PowerShell (`install.ps1`):**
+  ```powershell
+  irm https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.ps1 | iex
+  ```
+
+### First-Run Onboarding (`arc init` & `arc allow`)
+
+Run `arc init` in your repository root to create `.arc/policy.json`, install Claude Code and/or Cursor hooks, and run an immediate AI asset + secret discovery scan:
+
+```bash
+# Standard enforcement (with IDE confirmation prompts for Lethal Trifecta)
+arc init
+
+# Or start in non-blocking audit mode ("mode": "audit" in .arc/policy.json)
+arc init --audit-mode
+
+# Allowlist a specific rule/target if needed
+arc allow --rule ARC-LTT-001 --target slack --reason "Approved workspace webhook"
+```
+
+### Local Stdio MCP Server (`arc mcp-server`)
+
+For agents without native hook integrations (Codex CLI, Gemini CLI, Windsurf, Cline, VS Code Copilot), register `arc mcp-server` as a stdio MCP server in your client config to expose `scan_secrets`, `check_package`, `sca_audit`, and `audit_ai_assets`:
+
+```json
+{
+  "mcpServers": {
+    "vexa-arc": {
+      "command": "arc",
+      "args": ["mcp-server"]
+    }
+  }
+}
+```
 
 ### Windows (x64 / ARM64)
 
@@ -318,9 +364,9 @@ Vault Tokens Registered (1):
 
 ---
 
-### `arc shield`: Advisory Package Risk Checks (Not an Install Firewall)
+### `arc shield`: Live Registry & OSV Package Risk Checks (`ARC-PKG-001`)
 
-Arc evaluates a package name or parsed package-manager command against a seeded popular-package heuristic. It does **not** intercept, execute, or prevent the install command. Age, download, and lifecycle-script values supplied as flags are simulation inputs, not live registry observations. An exact `name@version` passed to `arc shield check` may additionally be queried against OSV; that vulnerability query is not a malware verdict or proof that a package is safe. Treat these commands as advisory checks only and retain your existing registry, lockfile, and endpoint controls.
+`arc shield` evaluates package names and install commands using **live cached registry lookups** (npm, PyPI, crates.io; 24-hour cache in `.sca-cache/registry/`, 3-second timeout, `ARC_OFFLINE=1` for offline fallback) combined with exact-version OSV vulnerability checks when `name@version` or `name==version` is provided. When Claude Code or Cursor hooks are installed, `Bash` / `beforeShellExecution` package-install commands (`npm`, `pnpm`, `yarn`, `pip`, `pip3`, `uv`, `cargo`, `go`) are automatically evaluated under rule `ARC-PKG-001`. Age, download, and `--dangerous-scripts` flags remain available as explicit simulation overrides.
 
 #### Windows (PowerShell):
 ```powershell

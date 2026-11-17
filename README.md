@@ -60,9 +60,10 @@ Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; 
 | Security Dimension | Threat Vector Addressed | Vexa Arc Mechanism | CLI Command |
 | :--- | :--- | :--- | :--- |
 | **Observed Taint Checks** | Some mediated private-data + untrusted-context flows | Session Taint DAG and heuristic classification of selected sinks; not general egress interception | `arc intercept eval --session s1` |
-| **Selected Agent Hooks** | Configured Claude Code/Cursor lifecycle events | Host hooks mediate supported events only; ordinary Cursor editor writes and unwrapped actions bypass Arc | `arc host install --host claude-code` |
-| **Package Risk Check** | Package-name lookalikes and known vulnerabilities for exact versions | Advisory name heuristic; exact-version OSV check where requested; not an install control | `arc shield check lodash@4.17.21` |
-| **Wrapped MCP Schema Pinning** | Schema changes on an MCP server launched through the Arc stdio broker | RFC 8785 JCS hashing; local reviewed pin or explicit development-only TOFU | `arc protect stdio --pin-schema <hash>` |
+| **Selected Agent Hooks** | Configured Claude Code/Cursor lifecycle events & package-install shell commands | Host hooks mediate supported events + `ARC-PKG-001` install checks; ordinary Cursor editor writes bypass Arc | `arc init` / `arc host install --host claude-code` |
+| **Package Risk Check** | Slopsquatting, malicious install scripts, 404s, and known vulnerabilities | Live cached npm/PyPI/crates.io registry lookups (`ARC_OFFLINE=1` fallback) + exact-version OSV check | `arc shield check lodash@4.17.21` |
+| **Wrapped MCP Schema Pinning** | Schema changes on an MCP server launched through the Arc stdio broker | RFC 8785 JCS hashing; local `.arc/mcp-pins.lock`, signed org policy pin, or `--allow-tofu` | `arc protect stdio --server github -- npx ...` |
+| **Local MCP Security Server** | Agents without native hooks (Codex, Gemini CLI, Windsurf, Cline) | Stdio MCP server exposing `scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets` | `arc mcp-server` |
 | **Process Lifecycle Controls** | Some child-process lifetime/resource risks in the wrapped broker | OS-specific lifecycle/resource controls; not sandboxing or network isolation | `arc protect stdio --max-memory-mb 512` |
 | **Secret Scanning** | Supported secret patterns in explicitly scanned inputs | Pattern/entropy detector; redaction applies only where the path can apply it | `arc scan-secrets --path . --redact` |
 | **Targeted Code-Pattern Scan** | Selected risky code patterns on a mediated file-write event | Aho-Corasick prefilter + targeted regex; not AST analysis or universal file-write DLP | `arc intercept eval --kind file_write` |
@@ -72,23 +73,34 @@ Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; 
 
 ## Quick Start (30 Seconds)
 
-### 1. Build and Run from Source
+### 1. Install Prebuilt Binary or Run via `npx`
 ```bash
-# Clone and build from source with the Rust toolchain
+# macOS / Linux (one-liner):
+curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.sh | sh
+
+# Zero-install via Node.js (macOS / Linux / Windows):
+npx @vexasec/arc init
+```
+```powershell
+# Windows (PowerShell):
+irm https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.ps1 | iex
+```
+
+Or build from source with the Rust toolchain (`>= 1.97.0`):
+```bash
 git clone https://github.com/noviqtechnologies/vexa-arc.git
 cd vexa-arc
 cargo build --release
-
-# On Linux/macOS:
-./target/release/arc --help
-
-# On Windows (PowerShell):
-.\target\release\arc.exe --help
 ```
 
-### 2. Immediate Diagnostic Checks
+### 2. Initialize & Run Immediate Diagnostic Checks
 ```bash
-# Advisory package-name check only; this does not run or prevent npm install:
+# 🚀 One-command onboarding: creates .arc/policy.json, installs IDE hooks, and runs discovery:
+arc init
+# Or start in non-blocking audit mode first:
+arc init --audit-mode
+
+# 📦 Live registry + OSV package check (npm, PyPI, crates.io; set ARC_OFFLINE=1 for offline cache):
 arc shield check reactt --ecosystem npm
 
 # 🔍 Discover AI assets, MCP configs, and agent rule files across your project:
@@ -97,9 +109,11 @@ arc audit
 # 🔒 Detect secrets with local pseudonymization token replacement:
 arc scan-secrets --path .env --redact
 
-# 🛡️ Install native runtime hooks for Claude Code or Cursor:
-arc host install --host claude-code
-arc host install --host cursor
+# 🔓 Allowlist a specific rule/target in .arc/policy.json:
+arc allow --rule ARC-LTT-001 --target slack --reason "Approved workspace webhook"
+
+# 🔌 Expose Arc security tools to any MCP-capable agent (Codex, Gemini CLI, Windsurf, Cline):
+arc mcp-server
 ```
 
 *(If versioned binaries are published, use the checksums and provenance attached to that specific [GitHub Release](https://github.com/noviqtechnologies/vexa-arc/releases); do not assume unreleased artifacts are available or validated.)*
@@ -442,13 +456,16 @@ All commands support relative and absolute paths, cross-platform path separators
 
 | Command | Purpose | Key Flags | Example |
 | :--- | :--- | :--- | :--- |
+| `arc init` | Initialize `.arc/policy.json`, install IDE hooks, and run quick discovery | `--host <auto\|claude-code\|cursor\|all\|none>`, `--audit-mode`, `--json` | `arc init --audit-mode` |
+| `arc allow` | Add a scoped allowlist exception to `.arc/policy.json` | `--rule <ID>`, `--target <STR>`, `--ttl-hours <N>` | `arc allow --rule ARC-PKG-001 --target my-pkg` |
+| `arc mcp-server` | Run stdio MCP server (`scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets`) | `-p, --path <PATH>` | `arc mcp-server` |
 | `arc audit` | Scan project or workstation for AI assets, rules, and MCP configs | `--workstation`, `--json`, `--output-bom <PATH>` | `arc audit --output-bom ai-bom.json` |
 | `arc bom` | Export CycloneDX v1.6 AI-BOM | `-p, --path <PATH>`, `-o, --out <PATH>` | `arc bom --out ai-bom.json` |
-| `arc sca` | Consensual, disposable-worktree SCA scanning & PR remediation | `audit`, `fix [--dry-run | --open-pr]` | `arc sca audit --sarif audit.sarif --sanitize-locations` |
-| `arc shield` | Advisory package-name heuristics; exact-version OSV check (does not intercept or run installs) | `check <PKG>`, `run <CMD>`, `--show-recommendation`, `--fail-on-risk` | `arc shield run --fail-on-risk -- npm install package` |
+| `arc sca` | Consensual, disposable-worktree SCA scanning & PR remediation | `audit`, `fix [--dry-run \| --open-pr]` | `arc sca audit --sarif audit.sarif --sanitize-locations` |
+| `arc shield` | Live cached registry checks (npm, PyPI, crates.io) + exact-version OSV check | `check <PKG>`, `run <CMD>`, `--show-recommendation`, `--fail-on-risk` | `arc shield run --fail-on-risk -- npm install package` |
 | `arc scan-secrets` | Scan files or stdin for secrets with entropy checks | `-p, --path <PATH>`, `--redact` | `arc scan-secrets --path . --redact` |
 | `arc host` | Manage host integrations (Claude Code, Cursor) | `install`, `status`, `uninstall`, `--host <HOST>` | `arc host install --host claude-code` |
-| `arc protect` | Supervise MCP servers with containment and required schema pinning | `stdio --server <NAME>`, `--pin-schema <HASH>` (or dev-only `--allow-tofu`), `--max-memory-mb <MB>` | `arc protect stdio --server fs --pin-schema "$MCP_SCHEMA_SHA256" -- npx server` |
+| `arc protect` | Supervise MCP servers with containment and schema pinning (`.arc/mcp-pins.lock` or signed policy) | `stdio --server <NAME>`, `--pin-schema <HASH>`, `--allow-tofu`, `--max-memory-mb <MB>` | `arc protect stdio --server fs -- npx server` |
 | `arc intercept` | Intercept and evaluate agent actions against session Taint DAG | `eval`, `read`, `exec`, `mcp`, `prompt`, `hook`, `session` | `arc intercept hook --host claude-code` |
 | `arc trace` | Inspect event causality and export redacted audit evidence | `<EVENT_ID>`, `latest`, `--export <PATH>`, `--json` | `arc trace latest --export trace.json` |
 | `arc doctor` | Check host adapters, policy engine, and cumulative metrics | `--metrics`, `--json` | `arc doctor --metrics` |

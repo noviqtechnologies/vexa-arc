@@ -242,13 +242,15 @@ The policy engine tracks chronological agent interactions as a **Directed Acycli
 Projects can customize runtime governance by placing `.arc/policy.json` or `.arc.json` in their repository root:
 ```json
 {
+  "mode": "enforce",
   "allowed_mcp_servers": ["github", "local-filesystem", "git", "sqlite"],
   "block_unapproved_mcp": false,
   "enforce_taint_dag": true,
-  "redact_secrets": true
+  "redact_secrets": true,
+  "require_approval_for_trifecta": true
 }
 ```
-`PolicyConfig::try_load_with_precedence(Some(&path))` applies BuiltIn < UserGlobal < ProjectLocal < SignedOrganization precedence and returns an error for unreadable/malformed files. Security-sensitive CLI paths abort rather than silently using defaults. The compatibility `load_with_precedence` wrapper uses a restrictive MCP-deny fallback on errors.
+Setting `"mode": "audit"` runs all policy checks and records taints/audit logs without blocking (`Obligation::AddContext`). `PolicyConfig::try_load_with_precedence(Some(&path))` applies BuiltIn < UserGlobal < ProjectLocal < SignedOrganization precedence (preserving `require_approval_*` settings across layers) and returns an error for unreadable/malformed files. Security-sensitive CLI paths abort rather than silently using defaults. The compatibility `load_with_precedence` wrapper uses a restrictive MCP-deny fallback on errors.
 
 ### Signed Organization Policy (Ed25519)
 
@@ -335,7 +337,9 @@ Implements Pillar 3 human authorization primitives:
 
 ---
 
-## 7. Package Heuristics & OSV Scanner (`arc-firewall`)
+## 7. Live Registry Checks, Package Heuristics & OSV Scanner (`arc-firewall`)
+
+`arc-firewall::registry` (`fetch_live_registry_metadata`, `PackageFirewall::inspect_package_live`) queries npm, PyPI, and crates.io with a 3-second timeout and 24-hour local cache (`.sca-cache/registry/`), falling back to `inspect_package_protected` when `ARC_OFFLINE=1` or the network is unavailable. `PolicyEvaluator` also evaluates `Action::Shell` package-install commands under rule `ARC-PKG-001`.
 
 `CompoundAntiSlopsquatEngine` evaluates a `PackageRegistryMetadata` value supplied by its caller. The current CLI does not obtain authoritative lifecycle, registry age/download, repository provenance, or recent-404 observations from a registry proxy. Its default popular-package baseline is seeded/heuristic data, not proof of package identity or safety. The implementation now scopes built-in names to ecosystems, case-normalizes typo comparisons, blocks caller-reported dangerous lifecycle signals before any fast path, and returns REVIEW for low-history packages lacking SLSA provenance. These are still only as trustworthy as caller-supplied metadata; they must not be described as live registry enforcement.
 
@@ -416,7 +420,7 @@ let mut child = supervisor.spawn(&mut cmd)?;
 
 ## 9. CLI Binary (`arc-cli`)
 
-The root binary tying the subsystems together with `clap`.
+The root binary tying the subsystems together with `clap`, with modularized subcommand handlers under `crates/arc-cli/src/commands/` (`init.rs`, `allow.rs`, `mcp_server.rs`). `McpStdioBroker` (`arc-hooks::broker`) sanitizes `tools/call` text responses with `arc_dlp::sanitize_inbound_text`, persists shared `SessionTaintDag` state when `with_session_storage_dir` is configured, and supports `.arc/mcp-pins.lock` for local non-org schema pinning.
 
 ### Local Pilot Telemetry (`arc-telemetry`)
 

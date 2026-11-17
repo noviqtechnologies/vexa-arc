@@ -399,13 +399,9 @@ impl ApprovalModal {
         explanation: &str,
         expected_pin: &str,
     ) -> Result<String, ApprovalPromptError> {
-        let safe_action = action_summary.replace('\'', "''").replace('"', "`\"");
-        let safe_rule = rule_id.replace('\'', "''");
-        let safe_exp = explanation.replace('\'', "''").replace('"', "`\"");
-
-        // Detached PowerShell GUI modal form
-        let ps_script = format!(
-            r#"
+        // Detached PowerShell GUI modal form; untrusted strings are passed via env vars
+        // so PowerShell never evaluates $() or variable expansions inside action/rule text.
+        let ps_script = r#"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -424,12 +420,12 @@ $label.Size = New-Object System.Drawing.Size(510, 160)
 $label.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $label.Text = @"
 VEXA ARC - HIGH-RISK ACTION SECURITY MEDIATION
-Rule Triggered: {safe_rule}
-Action: {safe_action}
-Explanation: {safe_exp}
+Rule Triggered: $($env:ARC_MODAL_RULE)
+Action: $($env:ARC_MODAL_ACTION)
+Explanation: $($env:ARC_MODAL_EXPLANATION)
 
 To authorize this action, enter the 6-digit confirmation PIN below:
-CONFIRMATION PIN: {expected_pin}
+CONFIRMATION PIN: $($env:ARC_MODAL_PIN)
 "@
 
 $txt = New-Object System.Windows.Forms.TextBox
@@ -458,13 +454,12 @@ $form.Controls.Add($btnOk)
 $form.Controls.Add($btnCancel)
 
 $result = $form.ShowDialog()
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) {{
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     Write-Output $txt.Text.Trim()
-}} else {{
+} else {
     Write-Output "CANCEL"
-}}
-"#
-        );
+}
+"#;
 
         let output = Command::new("powershell")
             .args([
@@ -473,8 +468,12 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {{
                 "-WindowStyle",
                 "Hidden",
                 "-Command",
-                &ps_script,
+                ps_script,
             ])
+            .env("ARC_MODAL_RULE", rule_id)
+            .env("ARC_MODAL_ACTION", action_summary)
+            .env("ARC_MODAL_EXPLANATION", explanation)
+            .env("ARC_MODAL_PIN", expected_pin)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -496,8 +495,8 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {{
         _explanation: &str,
         expected_pin: &str,
     ) -> Result<String, ApprovalPromptError> {
-        let safe_action = action_summary.replace('"', "\\\"");
-        let safe_rule = rule_id.replace('"', "\\\"");
+        let safe_action = action_summary.replace('\\', "\\\\").replace('"', "\\\"");
+        let safe_rule = rule_id.replace('\\', "\\\\").replace('"', "\\\"");
 
         let script = format!(
             "display dialog \"VEXA ARC SECURITY AUTHORIZATION\\n\\nRule: {safe_rule}\\nAction: {safe_action}\\n\\nTo approve, enter verification PIN {expected_pin}:\" default answer \"\" with title \"Vexa Arc Security Authorization\" buttons {{\"Deny\", \"Approve\"}} default button \"Approve\" with icon caution"
@@ -692,20 +691,23 @@ impl ApprovalManager {
 
         // 3. Desktop Session Preflight (Fail-Closed Invariant for Headless)
         if !DesktopSessionPreflight::is_interactive_desktop_with_override(self.mock_interactive) {
-            // Check optional webhook configuration
-            if let Ok(webhook_url) = std::env::var("ARC_APPROVAL_WEBHOOK_URL") {
-                if !webhook_url.trim().is_empty() {
-                    // Webhook dispatch logic (Future extension / external security channel)
-                }
-            }
+            let webhook_configured = std::env::var("ARC_APPROVAL_WEBHOOK_URL")
+                .map(|u| !u.trim().is_empty())
+                .unwrap_or(false);
+
+            let summary = if webhook_configured {
+                "Interactive desktop session required for out-of-band authorization modal. ARC_APPROVAL_WEBHOOK_URL is set, but remote webhook dispatch is not yet implemented in the local core; failing closed."
+            } else {
+                "Interactive desktop session required for out-of-band authorization modal. Headless or remote environment detected without interactive display; failing closed."
+            };
 
             return Err(Verdict::Deny {
                 rule: RuleId("ARC-AUTH-HEADLESS-UNSUPPORTED".to_string()),
                 explanation: Explanation::new(
-                    "Interactive desktop session required for out-of-band authorization modal. Headless or remote environment detected without configured approval webhook; failing closed.",
+                    summary,
                     vec![
                         "Run in an interactive desktop session with GUI display capabilities (WinSta0 on Windows, DISPLAY/WAYLAND on Linux, WindowServer on macOS).".to_string(),
-                        "Configure ARC_APPROVAL_WEBHOOK_URL for automated headless approval routing.".to_string(),
+                        "Use host IDE delegation (Claude Code / Cursor) for interactive approval in remote sessions.".to_string(),
                     ],
                     Some("https://docs.vexa.ai/arc/policies/ARC-AUTH-HEADLESS-UNSUPPORTED".to_string()),
                 ),

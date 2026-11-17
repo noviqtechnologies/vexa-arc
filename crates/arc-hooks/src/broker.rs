@@ -11,6 +11,7 @@ use arc_telemetry::{
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -91,6 +92,10 @@ pub struct McpStdioBroker {
     pub telemetry: Option<Arc<dyn TelemetrySink>>,
     pub host: AgentHost,
     pub principal: OsPrincipal,
+    /// Optional directory for persisting/sharing SessionTaintDag across hook and broker runs.
+    pub session_storage_dir: Option<PathBuf>,
+    /// Optional local `.arc/mcp-pins.lock` path for saving TOFU pins on bootstrap.
+    pub pin_lockfile: Option<PathBuf>,
     /// In-flight `tools/call` request id (JSON text) -> tool name, for result taint attribution.
     pending_calls: HashMap<String, String>,
 }
@@ -118,6 +123,8 @@ impl McpStdioBroker {
             telemetry: None,
             host: AgentHost::CustomMcpClient,
             principal: crate::current_os_principal(),
+            session_storage_dir: None,
+            pin_lockfile: None,
             pending_calls: HashMap::new(),
         }
     }
@@ -168,6 +175,16 @@ impl McpStdioBroker {
 
     pub fn with_telemetry(mut self, telemetry: Option<Arc<dyn TelemetrySink>>) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    pub fn with_session_storage_dir(mut self, dir: PathBuf) -> Self {
+        self.session_storage_dir = Some(dir);
+        self
+    }
+
+    pub fn with_pin_lockfile(mut self, path: PathBuf) -> Self {
+        self.pin_lockfile = Some(path);
         self
     }
 
@@ -328,8 +345,15 @@ impl McpStdioBroker {
                 .with_capabilities(caps)
                 .with_transport("stdio");
 
+                if let Some(ref dir) = self.session_storage_dir {
+                    let _ = self.evaluator.load_session_state(dir, &self.session_id);
+                }
+
                 let started = std::time::Instant::now();
                 let observation = self.evaluator.evaluate_with_observation(&event);
+                if let Some(ref dir) = self.session_storage_dir {
+                    let _ = self.evaluator.save_session_state(dir, &self.session_id);
+                }
                 let verdict = &observation.verdict;
                 self.emit_observation(
                     &event,
@@ -456,7 +480,7 @@ impl McpStdioBroker {
             return ServerMessageOutcome::Forward(line.to_string());
         }
 
-        let Ok(parsed) = serde_json::from_str::<Value>(trimmed) else {
+        let Ok(mut parsed) = serde_json::from_str::<Value>(trimmed) else {
             return ServerMessageOutcome::Forward(line.to_string());
         };
 
@@ -538,6 +562,21 @@ impl McpStdioBroker {
                         .taint_tracker
                         .record_event_and_update_taints(&event);
 
+                    if self.pinned_schema_hash.is_none() {
+                        if let Some(ref lock_path) = self.pin_lockfile {
+                            let hex_hash = hex::encode(hash);
+                            if save_mcp_pin_to_lockfile(lock_path, &self.server_name, &hex_hash)
+                                .is_ok()
+                            {
+                                eprintln!(
+                                    "[Arc Protect] Saved schema pin for '{}' to {}",
+                                    self.server_name,
+                                    lock_path.display()
+                                );
+                            }
+                        }
+                    }
+
                     return ServerMessageOutcome::CapturedSchema {
                         fingerprint: hash,
                         forward_line: line.to_string(),
@@ -574,12 +613,38 @@ impl McpStdioBroker {
                     self.evaluator
                         .taint_tracker
                         .record_event_and_update_taints(&event);
+                    if let Some(ref dir) = self.session_storage_dir {
+                        let _ = self.evaluator.save_session_state(dir, &self.session_id);
+                    }
                     self.emit_protocol_event("mcp_result", "observed", None, None);
                 }
             }
         }
 
-        ServerMessageOutcome::Forward(line.to_string())
+        // Strip invisible Unicode tags, zero-width chars, and Trojan Source bidi overrides
+        // from tool result text before returning to the host agent.
+        let mut sanitized_any = false;
+        if let Some(items) = parsed
+            .get_mut("result")
+            .and_then(|r| r.get_mut("content"))
+            .and_then(|c| c.as_array_mut())
+        {
+            for item in items {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    let clean = arc_dlp::sanitize_inbound_text(text);
+                    if clean != text {
+                        item["text"] = Value::String(clean);
+                        sanitized_any = true;
+                    }
+                }
+            }
+        }
+
+        if sanitized_any {
+            ServerMessageOutcome::Forward(parsed.to_string())
+        } else {
+            ServerMessageOutcome::Forward(line.to_string())
+        }
     }
 
     /// Runs mediation between client stdio and child process streams with OS-level containment (FR-MCP-001 / FR-HOOKS-003)
@@ -707,6 +772,35 @@ impl McpStdioBroker {
     }
 }
 
+pub fn load_mcp_pin_from_lockfile(lock_path: &std::path::Path, server: &str) -> Option<String> {
+    let root = crate::host_config::read_json_object(lock_path).ok()?;
+    root.get("pins")
+        .and_then(|p| p.get(server))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+pub fn save_mcp_pin_to_lockfile(
+    lock_path: &std::path::Path,
+    server: &str,
+    hash_hex: &str,
+) -> std::io::Result<()> {
+    let mut root = crate::host_config::read_json_object(lock_path)?;
+    let obj = root.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "lockfile root must be JSON object",
+        )
+    })?;
+    let pins = obj
+        .entry("pins".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(pins_obj) = pins.as_object_mut() {
+        pins_obj.insert(server.to_string(), Value::String(hash_hex.to_string()));
+    }
+    crate::host_config::write_json_atomic(lock_path, &root)
+}
+
 #[cfg(test)]
 mod fingerprint_tests {
     use super::command_fingerprint;
@@ -721,5 +815,23 @@ mod fingerprint_tests {
             command_fingerprint(&[]),
             command_fingerprint(&[String::new()])
         );
+    }
+
+    #[test]
+    fn handle_server_message_sanitizes_invisible_unicode_in_tool_results() {
+        let mut broker = super::McpStdioBroker::new(
+            "github",
+            "sess-sanitize",
+            arc_policy_engine::evaluator::PolicyEvaluator::default(),
+        );
+        let msg = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Issue\u{200B} body\u{202E} here\"}]}}";
+        match broker.handle_server_message(msg) {
+            super::ServerMessageOutcome::Forward(out) => {
+                assert!(!out.contains('\u{200B}'));
+                assert!(!out.contains('\u{202E}'));
+                assert!(out.contains("Issue body here"));
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
     }
 }

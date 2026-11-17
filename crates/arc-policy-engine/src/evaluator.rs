@@ -11,6 +11,14 @@ fn default_policy_version() -> String {
     "1.0.0".to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    #[default]
+    Enforce,
+    Audit,
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -92,6 +100,8 @@ pub struct PolicyConfig {
     #[serde(default = "default_policy_version")]
     pub version: String,
     #[serde(default)]
+    pub mode: PolicyMode,
+    #[serde(default)]
     pub source: Option<PolicySource>,
     pub allowed_mcp_servers: HashSet<String>,
     #[serde(default)]
@@ -123,6 +133,7 @@ impl Default for PolicyConfig {
 
         Self {
             version: default_policy_version(),
+            mode: PolicyMode::Enforce,
             source: Some(PolicySource::BuiltInDefault),
             allowed_mcp_servers: allowed,
             allowed_mcp_identities: Vec::new(),
@@ -353,6 +364,7 @@ impl PolicyConfig {
     /// Merges higher precedence config over current config, preserving emergency deny rules
     pub fn merge_lower_precedence(&mut self, higher: PolicyConfig) {
         self.version = higher.version;
+        self.mode = higher.mode;
         self.source = higher.source;
         self.block_unapproved_mcp = higher.block_unapproved_mcp;
         self.enforce_taint_dag = higher.enforce_taint_dag;
@@ -390,6 +402,15 @@ impl PolicyConfig {
                 self.active_exceptions.push(exc);
             }
         }
+
+        // Merge approval requirements
+        for rule in higher.require_approval_rules {
+            self.require_approval_rules.insert(rule);
+        }
+        for srv in higher.require_approval_servers {
+            self.require_approval_servers.insert(srv);
+        }
+        self.require_approval_for_trifecta |= higher.require_approval_for_trifecta;
     }
 
     /// Loads policy from the project directory; absent files use defaults, invalid files use the
@@ -511,6 +532,29 @@ impl PolicyEvaluator {
     /// Evaluates an ActionEvent against enterprise policies and the session Taint DAG.
     pub fn evaluate(&self, event: &ActionEvent) -> Verdict {
         let cfg = self.config.read().unwrap().clone();
+        let verdict = self.evaluate_enforced(event, &cfg);
+        if cfg.mode == PolicyMode::Audit {
+            match verdict {
+                Verdict::Allow { .. } => verdict,
+                Verdict::Deny { rule, explanation }
+                | Verdict::Quarantine { rule, explanation }
+                | Verdict::RequireApproval {
+                    rule, explanation, ..
+                } => Verdict::Allow {
+                    obligations: vec![Obligation::AddContext {
+                        text: format!(
+                            "[ARC AUDIT MODE] Would have blocked ({}): {}",
+                            rule.0, explanation.summary
+                        ),
+                    }],
+                },
+            }
+        } else {
+            verdict
+        }
+    }
+
+    fn evaluate_enforced(&self, event: &ActionEvent, cfg: &PolicyConfig) -> Verdict {
         let session_id = &event.host_session_id;
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
@@ -800,12 +844,85 @@ impl PolicyEvaluator {
             }
         }
 
+        // 2.6 Package-Install Slopsquatting / Lifecycle Check on Shell Commands (ARC-PKG-001)
+        if let Action::Shell { ref command, .. } = event.action {
+            let pkgs = arc_firewall::proxy::PackageFirewall::parse_command(command);
+            if !pkgs.is_empty() && check_exception("ARC-PKG-001").is_none() {
+                let fw = arc_firewall::proxy::PackageFirewall::new();
+                for (eco, pkg_name) in pkgs {
+                    let verdict = if cfg!(test) {
+                        fw.inspect_package_protected(eco, &pkg_name, false)
+                    } else {
+                        fw.inspect_package_live(eco, &pkg_name, false).verdict
+                    };
+                    match verdict {
+                        arc_firewall::slopsquat::SlopsquatVerdict::Blocked { gate, reason } => {
+                            if let Some(approval) = check_approval("ARC-PKG-001") {
+                                return approval;
+                            }
+                            let mut options = vec![
+                                "Verify package spelling and registry provenance before installing."
+                                    .to_string(),
+                                format!(
+                                    "If verified safe, allowlist with: arc allow --rule ARC-PKG-001 --target {pkg_name}"
+                                ),
+                            ];
+                            let blocked = arc_firewall::slopsquat::SlopsquatVerdict::Blocked {
+                                gate,
+                                reason: reason.clone(),
+                            };
+                            if let Some(act) = blocked.suggested_action(&format!("{eco:?}")) {
+                                options.insert(0, act);
+                            }
+                            return Verdict::Deny {
+                                rule: RuleId("ARC-PKG-001".to_string()),
+                                explanation: Explanation::new(
+                                    format!("Package install blocked by {gate}: {reason}"),
+                                    options,
+                                    Some(
+                                        "https://docs.vexa.ai/arc/policies/ARC-PKG-001".to_string(),
+                                    ),
+                                ),
+                            };
+                        }
+                        arc_firewall::slopsquat::SlopsquatVerdict::Review {
+                            gate,
+                            reason,
+                            containment_recommendation,
+                        } => {
+                            if let Some(approval) = check_approval("ARC-PKG-001") {
+                                return approval;
+                            }
+                            return Verdict::RequireApproval {
+                                rule: RuleId("ARC-PKG-001".to_string()),
+                                explanation: Explanation::new(
+                                    format!("Package install requires review ({gate}): {reason}"),
+                                    vec![
+                                        containment_recommendation,
+                                        format!(
+                                            "Allow future installs with: arc allow --rule ARC-PKG-001 --target {pkg_name}"
+                                        ),
+                                    ],
+                                    Some(
+                                        "https://docs.vexa.ai/arc/policies/ARC-PKG-001".to_string(),
+                                    ),
+                                ),
+                                timeout_secs: 300,
+                                on_timeout: arc_core::verdict::TimeoutAction::Deny,
+                            };
+                        }
+                        arc_firewall::slopsquat::SlopsquatVerdict::Permitted { .. } => {}
+                    }
+                }
+            }
+        }
+
         // 3. Update session taints with this action and explicit event provenance
         self.taint_tracker.record_event_and_update_taints(event);
 
         // 4. Secret DLP Check on outbound arguments / prompt text
         let mut obligations = Vec::new();
-        if cfg.redact_secrets {
+        if cfg.redact_secrets && check_exception("ARC-DLP-001").is_none() {
             let bytes_to_scan = match &event.action {
                 Action::McpToolCall { arguments, .. } => arguments.to_string().into_bytes(),
                 Action::PromptSubmit { text, .. } => text.as_bytes().to_vec(),
@@ -1497,5 +1614,102 @@ mod tests {
         let mut tampered = envelope;
         tampered["payload"]["allowed_mcp_servers"] = serde_json::json!(["attacker-mcp"]);
         assert!(parse_signed_policy(&tampered.to_string(), &trusted_keys, 7, now_unix_ms).is_err());
+    }
+
+    #[test]
+    fn merge_lower_precedence_preserves_approval_settings() {
+        let mut base = PolicyConfig::default();
+        let mut project = PolicyConfig::default();
+        project
+            .require_approval_rules
+            .insert("ARC-MCP-001".to_string());
+        project.require_approval_servers.insert("slack".to_string());
+        project.require_approval_for_trifecta = true;
+
+        base.merge_lower_precedence(project);
+        assert!(base.require_approval_rules.contains("ARC-MCP-001"));
+        assert!(base.require_approval_servers.contains("slack"));
+        assert!(base.require_approval_for_trifecta);
+
+        // A higher-precedence layer omitting require_approval_for_trifecta must not reset it
+        let mut higher = PolicyConfig::default();
+        higher
+            .require_approval_rules
+            .insert("ARC-LTT-001".to_string());
+        base.merge_lower_precedence(higher);
+        assert!(base.require_approval_rules.contains("ARC-MCP-001"));
+        assert!(base.require_approval_rules.contains("ARC-LTT-001"));
+        assert!(base.require_approval_servers.contains("slack"));
+        assert!(base.require_approval_for_trifecta);
+    }
+
+    #[test]
+    fn audit_mode_allows_with_context_instead_of_blocking() {
+        let policy = PolicyConfig {
+            mode: PolicyMode::Audit,
+            block_unapproved_mcp: true,
+            ..Default::default()
+        };
+        let evaluator = PolicyEvaluator::new(policy);
+        let event = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "audit-mode-test",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "unapproved-server".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: None,
+                },
+                tool: "do_thing".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let verdict = evaluator.evaluate(&event);
+        assert!(verdict.is_allowed());
+        match verdict {
+            Verdict::Allow { obligations } => {
+                assert!(obligations.iter().any(|o| matches!(
+                    o,
+                    Obligation::AddContext { text } if text.contains("ARC AUDIT MODE") && text.contains("ARC-MCP-001")
+                )));
+            }
+            other => panic!("expected Allow with AddContext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_package_install_catches_slopsquat_and_allows_established_packages() {
+        let evaluator = PolicyEvaluator::default();
+
+        let safe_install = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "pkg-hook-test",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::Shell {
+                command: "npm install react".to_string(),
+                cwd: PathBuf::from("."),
+            },
+        );
+        assert!(evaluator.evaluate(&safe_install).is_allowed());
+
+        let typo_install = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "pkg-hook-test",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::Shell {
+                command: "npm install reactt".to_string(),
+                cwd: PathBuf::from("."),
+            },
+        );
+        let verdict = evaluator.evaluate(&typo_install);
+        assert!(verdict.is_denied());
+        match verdict {
+            Verdict::Deny { rule, .. } => assert_eq!(rule.0, "ARC-PKG-001"),
+            other => panic!("expected Deny(ARC-PKG-001), got {other:?}"),
+        }
     }
 }

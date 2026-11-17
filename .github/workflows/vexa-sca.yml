@@ -33,10 +33,10 @@ jobs:
         run: |
           vexa-sca scan . \
             --fail-on high \
-            --html-file vexa-report.html \
-            --sarif-file vexa-report.sarif \
+            --html-file vexa-sca-report.html \
+            --sarif-file vexa-sca-report.sarif \
             --sbom cyclonedx \
-            --sbom-file vexa-sbom.cdx.json
+            --sbom-file vexa-sca-sbom.cdx.json
 
       - name: Archive Scan Reports
         if: always()
