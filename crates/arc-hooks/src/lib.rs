@@ -4,6 +4,7 @@ pub mod claude_code;
 pub mod cursor;
 pub mod host_config;
 pub mod mcp_jsonrpc;
+pub mod principal;
 pub mod process_containment;
 
 pub use adapter::{AdapterError, HostAdapter, HostIntegrationStatus, HostResponse};
@@ -11,6 +12,7 @@ pub use broker::{BrokerError, ClientMessageOutcome, McpStdioBroker, ServerMessag
 pub use claude_code::ClaudeCodeAdapter;
 pub use cursor::CursorAdapter;
 pub use mcp_jsonrpc::McpJsonRpcInterceptor;
+pub use principal::current_os_principal;
 pub use process_containment::{ContainmentLimits, OsProcessSupervisor};
 
 #[cfg(test)]

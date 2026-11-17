@@ -89,6 +89,8 @@ pub struct McpStdioBroker {
     pub schema_pin_violated: bool,
     pub limits: ContainmentLimits,
     pub telemetry: Option<Arc<dyn TelemetrySink>>,
+    pub host: AgentHost,
+    pub principal: OsPrincipal,
     /// In-flight `tools/call` request id (JSON text) -> tool name, for result taint attribution.
     pending_calls: HashMap<String, String>,
 }
@@ -114,8 +116,20 @@ impl McpStdioBroker {
             schema_pin_violated: false,
             limits: ContainmentLimits::default(),
             telemetry: None,
+            host: AgentHost::CustomMcpClient,
+            principal: crate::current_os_principal(),
             pending_calls: HashMap::new(),
         }
+    }
+
+    pub fn with_host(mut self, host: AgentHost) -> Self {
+        self.host = host;
+        self
+    }
+
+    pub fn with_principal(mut self, principal: OsPrincipal) -> Self {
+        self.principal = principal;
+        self
     }
 
     pub fn with_command(mut self, command: Vec<String>) -> Self {
@@ -305,9 +319,9 @@ impl McpStdioBroker {
                 };
 
                 let event = ActionEvent::new(
-                    AgentHost::ClaudeCode,
+                    self.host,
                     &self.session_id,
-                    OsPrincipal::Uid(1000),
+                    self.principal.clone(),
                     Phase::Pre,
                     action,
                 )
@@ -505,9 +519,9 @@ impl McpStdioBroker {
                     self.emit_protocol_event("mcp_schema", "allow", None, Some("pinned"));
                     // Register in session
                     let event = ActionEvent::new(
-                        AgentHost::ClaudeCode,
+                        self.host,
                         &self.session_id,
-                        OsPrincipal::Uid(1000),
+                        self.principal.clone(),
                         Phase::Post,
                         Action::McpToolsList {
                             server: ServerIdentity {
@@ -541,9 +555,9 @@ impl McpStdioBroker {
                         .and_then(|b| b.as_bool())
                         .unwrap_or(false);
                     let event = ActionEvent::new(
-                        AgentHost::ClaudeCode,
+                        self.host,
                         &self.session_id,
-                        OsPrincipal::Uid(1000),
+                        self.principal.clone(),
                         Phase::Post,
                         Action::McpToolResult {
                             server: ServerIdentity {

@@ -95,8 +95,14 @@ impl HostAdapter for ClaudeCodeAdapter {
             .and_then(|s| s.as_str())
             .unwrap_or("PreToolUse");
         let is_post = event_name.eq_ignore_ascii_case("PostToolUse");
+        let is_mediated_event = is_post || event_name.eq_ignore_ascii_case("PreToolUse");
 
         let Some(tool_name) = val.get("tool_name").and_then(|t| t.as_str()) else {
+            if is_mediated_event {
+                return Err(AdapterError::Malformed(format!(
+                    "missing tool_name in Claude Code {event_name} hook payload"
+                )));
+            }
             return Ok(Vec::new());
         };
 
@@ -142,7 +148,9 @@ impl HostAdapter for ClaudeCodeAdapter {
             let action = match tool_name {
                 "Bash" => {
                     let Some(cmd) = str_field(&input, &["command"]) else {
-                        return Ok(Vec::new());
+                        return Err(AdapterError::Malformed(
+                            "missing command in Claude Code Bash hook payload".to_string(),
+                        ));
                     };
                     Action::Shell {
                         command: cmd.to_string(),
@@ -151,7 +159,9 @@ impl HostAdapter for ClaudeCodeAdapter {
                 }
                 "Read" | "NotebookRead" => {
                     let Some(p) = str_field(&input, &["file_path", "notebook_path", "path"]) else {
-                        return Ok(Vec::new());
+                        return Err(AdapterError::Malformed(format!(
+                            "missing file path in Claude Code {tool_name} hook payload"
+                        )));
                     };
                     Action::FileRead {
                         path: PathBuf::from(p),
@@ -159,7 +169,9 @@ impl HostAdapter for ClaudeCodeAdapter {
                 }
                 "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
                     let Some(p) = str_field(&input, &["file_path", "notebook_path", "path"]) else {
-                        return Ok(Vec::new());
+                        return Err(AdapterError::Malformed(format!(
+                            "missing file path in Claude Code {tool_name} hook payload"
+                        )));
                     };
                     let content = match tool_name {
                         "Write" => str_field(&input, &["content"]).map(|s| s.to_string()),
@@ -556,6 +568,34 @@ mod tests {
     fn unmediated_builtin_tools_produce_no_events() {
         let e = decode(serde_json::json!({"tool_name":"TodoWrite","tool_input":{}}));
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn malformed_mediated_payloads_fail_closed() {
+        assert!(ClaudeCodeAdapter
+            .decode(
+                br#"{"hook_event_name":"PreToolUse","tool_input":{"command":"ls"}}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        assert!(ClaudeCodeAdapter
+            .decode(
+                br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"cmd":"ls"}}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        assert!(ClaudeCodeAdapter
+            .decode(
+                br#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{}}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        assert!(ClaudeCodeAdapter
+            .decode(
+                br#"{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{}}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
     }
 
     #[test]

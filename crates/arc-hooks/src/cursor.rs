@@ -95,7 +95,9 @@ impl HostAdapter for CursorAdapter {
 
         let (phase, action) = if event_name == "afterMCPExecution" {
             let Some(tool) = tool else {
-                return Ok(Vec::new());
+                return Err(AdapterError::Malformed(
+                    "missing tool_name in Cursor afterMCPExecution payload".to_string(),
+                ));
             };
             let result = parse_maybe_json(val.get("result_json").or_else(|| val.get("result")));
             let content = match &result {
@@ -165,6 +167,18 @@ impl HostAdapter for CursorAdapter {
                     arguments: args,
                 },
             )
+        } else if matches!(
+            event_name,
+            "" | "beforeShellExecution" | "beforeMCPExecution" | "beforeReadFile"
+        ) {
+            return Err(AdapterError::Malformed(format!(
+                "missing expected action fields in Cursor '{}' payload",
+                if event_name.is_empty() {
+                    "default"
+                } else {
+                    event_name
+                }
+            )));
         } else {
             return Ok(Vec::new());
         };
@@ -524,5 +538,27 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_mediated_cursor_payloads_fail_closed() {
+        assert!(CursorAdapter
+            .decode(
+                br#"{"hook_event_name":"beforeShellExecution","cwd":"/w"}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        assert!(CursorAdapter
+            .decode(
+                br#"{"hook_event_name":"beforeMCPExecution","tool_input":"{}"}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        assert!(CursorAdapter
+            .decode(
+                br#"{"hook_event_name":"afterMCPExecution","result_json":"{}"}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
     }
 }

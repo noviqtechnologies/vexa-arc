@@ -421,6 +421,10 @@ enum ProtectAction {
         #[arg(long)]
         max_memory_mb: Option<u64>,
 
+        /// Host agent client name (e.g. claude-code, cursor, windsurf, custom-mcp)
+        #[arg(long, default_value = "custom-mcp")]
+        host: String,
+
         /// Target MCP server command and arguments
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -947,6 +951,7 @@ fn main() {
                 pin_schema,
                 allow_tofu,
                 max_memory_mb,
+                host,
                 command,
             } => {
                 if !run_protect_stdio(
@@ -955,6 +960,7 @@ fn main() {
                     pin_schema.as_deref(),
                     allow_tofu,
                     max_memory_mb,
+                    &host,
                     command,
                 ) {
                     std::process::exit(1);
@@ -1529,12 +1535,26 @@ fn run_doctor(json: bool, metrics: bool) -> bool {
     true
 }
 
+fn parse_agent_host(host: &str) -> AgentHost {
+    match host.to_lowercase().as_str() {
+        "claude-code" | "claude" => AgentHost::ClaudeCode,
+        "cursor" => AgentHost::Cursor,
+        "vscode" | "vscode-copilot" | "copilot" => AgentHost::VsCodeCopilot,
+        "windsurf" => AgentHost::Windsurf,
+        "codex" | "codex-cli" => AgentHost::CodexCli,
+        "gemini" | "gemini-cli" => AgentHost::GeminiCli,
+        "ci" => AgentHost::Ci,
+        _ => AgentHost::CustomMcpClient,
+    }
+}
+
 fn run_protect_stdio(
     server: &str,
     session: &str,
     pin_schema: Option<&str>,
     allow_tofu: bool,
     max_memory_mb: Option<u64>,
+    host: &str,
     command: Vec<String>,
 ) -> bool {
     let policy = match PolicyConfig::try_load_with_precedence(Some(Path::new("."))) {
@@ -1560,6 +1580,7 @@ fn run_protect_stdio(
         None
     };
     let mut broker = McpStdioBroker::new(server, session, evaluator)
+        .with_host(parse_agent_host(host))
         .with_command(command)
         .with_telemetry(telemetry_sink)
         .with_limits(arc_hooks::ContainmentLimits {
@@ -1672,6 +1693,35 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
         }
     };
 
+    let principal = arc_hooks::current_os_principal();
+    let (mediated_paths, unmediated_paths): (&[&str], &[&str]) = match host.to_lowercase().as_str() {
+        "claude-code" | "claude" => (
+            &[
+                "PreToolUse (Bash, Read, NotebookRead, Write, Edit, MultiEdit, NotebookEdit, WebFetch, mcp__*)",
+                "PostToolUse (WebFetch, WebSearch, mcp__*)",
+            ],
+            &[
+                "Direct editor writes outside agent tools",
+                "Unwrapped MCP stdio/HTTP servers",
+                "External terminal commands and direct network egress",
+            ],
+        ),
+        "cursor" => (
+            &[
+                "beforeShellExecution",
+                "beforeMCPExecution",
+                "beforeReadFile",
+                "afterMCPExecution",
+            ],
+            &[
+                "Ordinary Cursor editor file writes (no pre-write hook)",
+                "Unwrapped MCP servers",
+                "External terminal commands and direct network egress",
+            ],
+        ),
+        _ => (&[], &[]),
+    };
+
     if json {
         println!(
             "{}",
@@ -1680,6 +1730,9 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
                 "installed": status.is_configured,
                 "bypass_risk": status.bypass_risk,
                 "message": status.message,
+                "os_principal": principal,
+                "mediated_paths": mediated_paths,
+                "unmediated_paths": unmediated_paths,
             })
         );
     } else {
@@ -1696,6 +1749,7 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
                 "No"
             }
         );
+        println!("  OS Principal: {:?}", principal);
         println!("  Status:       {}", status.message);
         if let Some(ref path) = status.hook_path {
             println!("  Config File:  {}", path.display());
@@ -1703,6 +1757,8 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
         if let Some(ref cmd) = status.hook_command {
             println!("  Hook Cmd:     {cmd}");
         }
+        println!("  Mediated:     {}", mediated_paths.join("; "));
+        println!("  Unmediated:   {}", unmediated_paths.join("; "));
     }
     true
 }
@@ -2708,13 +2764,20 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
         return 2;
     }
 
-    let events = match adapter.decode(&raw, OsPrincipal::Uid(1000)) {
+    let principal = arc_hooks::current_os_principal();
+    let events = match adapter.decode(&raw, principal) {
         Ok(ev) => ev,
         Err(e) => {
             eprintln!("[Arc Hook] Malformed {host} hook payload: {e} (failing closed)");
             return 2;
         }
     };
+
+    let project_dir = serde_json::from_slice::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let emit = |resp: arc_hooks::HostResponse| -> i32 {
         use std::io::Write;
@@ -2740,7 +2803,7 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
         }
     };
 
-    let policy = match PolicyConfig::try_load_with_precedence(Some(Path::new("."))) {
+    let policy = match PolicyConfig::try_load_with_precedence(Some(&project_dir)) {
         Ok(policy) => policy,
         Err(error) => {
             eprintln!("[Arc Hook] Policy load failed: {error} (failing closed)");
@@ -4144,7 +4207,7 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
     let mut event = ActionEvent::new(
         AgentHost::ClaudeCode,
         session,
-        OsPrincipal::Uid(1000),
+        arc_hooks::current_os_principal(),
         Phase::Pre,
         action,
     );

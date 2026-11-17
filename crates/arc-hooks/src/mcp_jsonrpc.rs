@@ -1,6 +1,4 @@
-use arc_core::event::{
-    Action, ActionEvent, AgentHost, Artifact, OsPrincipal, Phase, ServerIdentity,
-};
+use arc_core::event::{Action, ActionEvent, AgentHost, Artifact, Phase, ServerIdentity};
 use arc_core::verdict::Verdict;
 use serde::{Deserialize, Serialize};
 
@@ -85,7 +83,7 @@ impl McpJsonRpcInterceptor {
         let event = ActionEvent::new(
             AgentHost::CustomMcpClient,
             session_id,
-            OsPrincipal::Uid(1000),
+            crate::current_os_principal(),
             Phase::Pre,
             action,
         );
