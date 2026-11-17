@@ -43,14 +43,21 @@ fn server_identity(name: String) -> ServerIdentity {
     }
 }
 
-/// Cursor passes `tool_input` as a JSON-encoded string; accept both string and object forms.
-fn parse_maybe_json(v: Option<&Value>) -> Value {
+/// Cursor passes `tool_input` and `result_json` as JSON-encoded strings; accept both string and
+/// object forms, and fail closed on malformed JSON strings.
+fn parse_maybe_json(v: Option<&Value>, field: &str) -> Result<Value, AdapterError> {
     match v {
         Some(Value::String(s)) => {
-            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+            if s.trim().is_empty() {
+                Ok(Value::Null)
+            } else {
+                serde_json::from_str(s).map_err(|e| {
+                    AdapterError::Malformed(format!("malformed JSON in Cursor '{field}': {e}"))
+                })
+            }
         }
-        Some(other) => other.clone(),
-        None => Value::Null,
+        Some(other) => Ok(other.clone()),
+        None => Ok(Value::Null),
     }
 }
 
@@ -99,7 +106,10 @@ impl HostAdapter for CursorAdapter {
                     "missing tool_name in Cursor afterMCPExecution payload".to_string(),
                 ));
             };
-            let result = parse_maybe_json(val.get("result_json").or_else(|| val.get("result")));
+            let result = parse_maybe_json(
+                val.get("result_json").or_else(|| val.get("result")),
+                "result_json",
+            )?;
             let content = match &result {
                 Value::String(s) => s.clone(),
                 Value::Null => String::new(),
@@ -129,7 +139,10 @@ impl HostAdapter for CursorAdapter {
         } else if let Some(cmd) = val.get("command").and_then(|c| c.as_str()) {
             // A bare `command` with a tool name is an stdio MCP server launch descriptor, not a shell.
             if tool.is_some() && event_name == "beforeMCPExecution" {
-                let args = parse_maybe_json(val.get("tool_input").or_else(|| val.get("args")));
+                let args = parse_maybe_json(
+                    val.get("tool_input").or_else(|| val.get("args")),
+                    "tool_input",
+                )?;
                 (
                     Phase::Pre,
                     Action::McpToolCall {
@@ -158,7 +171,10 @@ impl HostAdapter for CursorAdapter {
                 )
             }
         } else if let Some(tool) = tool {
-            let args = parse_maybe_json(val.get("tool_input").or_else(|| val.get("args")));
+            let args = parse_maybe_json(
+                val.get("tool_input").or_else(|| val.get("args")),
+                "tool_input",
+            )?;
             (
                 Phase::Pre,
                 Action::McpToolCall {
@@ -557,6 +573,18 @@ mod tests {
         assert!(CursorAdapter
             .decode(
                 br#"{"hook_event_name":"afterMCPExecution","result_json":"{}"}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        assert!(CursorAdapter
+            .decode(
+                br#"{"hook_event_name":"beforeMCPExecution","tool_name":"get_issue","tool_input":"{not-json"}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        assert!(CursorAdapter
+            .decode(
+                br#"{"hook_event_name":"afterMCPExecution","tool_name":"get_issue","result_json":"{not-json"}"#,
                 OsPrincipal::Uid(1000)
             )
             .is_err());

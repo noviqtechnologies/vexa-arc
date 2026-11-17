@@ -1326,7 +1326,7 @@ fn test_cli_doctor_and_adversarial_test_commands() {
     let json_doc: serde_json::Value =
         serde_json::from_str(&stdout_doc).expect("arc doctor --json must be valid JSON");
     assert_eq!(json_doc["status"], "healthy");
-    assert_eq!(json_doc["version"], "1.0.0");
+    assert_eq!(json_doc["version"], env!("CARGO_PKG_VERSION"));
     assert!(json_doc["supported_adapters"].as_array().unwrap().len() >= 4);
 
     // 2. arc test --json runs adversarial test suite

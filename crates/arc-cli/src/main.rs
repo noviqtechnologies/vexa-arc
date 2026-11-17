@@ -29,7 +29,7 @@ use arc_telemetry::{
 #[derive(Parser)]
 #[command(
     name = "arc",
-    version = "1.0.0",
+    version,
     about = "Vexa Arc (Agentic Runtime Control): Native Rust Pre-Execution Endpoint & Agent Firewall",
     long_about = "Vexa Arc provides ultra-low latency, zero-dependency pre-execution security for autonomous AI coding agents and MCP interactions."
 )]
@@ -1018,7 +1018,10 @@ fn main() {
             }
         }
         Commands::Version => {
-            println!("Vexa Arc CLI v1.0.0 (Agentic Runtime Control)");
+            println!(
+                "Vexa Arc CLI v{} (Agentic Runtime Control)",
+                env!("CARGO_PKG_VERSION")
+            );
             println!("Target Architecture: Pure Rust Pre-Execution Endpoint & Agent Firewall");
             println!("License: Apache-2.0");
         }
@@ -1465,7 +1468,7 @@ fn run_doctor(json: bool, metrics: bool) -> bool {
     if json {
         let mut output = serde_json::json!({
             "status": "healthy",
-            "version": "1.0.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "os": os,
             "arch": arch,
             "policy_version": policy.version,
@@ -1489,7 +1492,10 @@ fn run_doctor(json: bool, metrics: bool) -> bool {
     println!("             VEXA ARC SYSTEM DIAGNOSTIC (DOCTOR)       ");
     println!("=======================================================");
     println!("Operational Status: HEALTHY");
-    println!("Engine Version:     v1.0.0 (Rust 2021 Edition)");
+    println!(
+        "Engine Version:     v{} (Rust 2021 Edition)",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("Platform:           {os} ({arch})");
     println!(
         "Effective Policy:   v{} (Source: {:?})",

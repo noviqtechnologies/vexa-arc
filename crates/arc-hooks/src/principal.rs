@@ -14,18 +14,9 @@ pub fn current_os_principal() -> OsPrincipal {
         if let Some(sid) = windows_current_user_sid() {
             return OsPrincipal::Sid(sid);
         }
-        let user = std::env::var("USERNAME")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        let domain = std::env::var("USERDOMAIN")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        let fallback = match (domain, user) {
-            (Some(d), Some(u)) => format!("{d}\\{u}"),
-            (None, Some(u)) => u,
-            _ => "windows-unknown".to_string(),
-        };
-        OsPrincipal::Sid(fallback)
+        // Do not fall back to environment variables (USERNAME/USERDOMAIN), which are
+        // user-modifiable and not a verified OS identity.
+        OsPrincipal::Sid("windows-sid-unavailable".to_string())
     }
 
     #[cfg(not(any(unix, windows)))]
