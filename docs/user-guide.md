@@ -92,9 +92,9 @@ To ensure clarity across security, DevOps, and AI development teams, the table b
   irm https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.ps1 | iex
   ```
 
-### First-Run Onboarding (`arc init` & `arc allow`)
+### First-Run Onboarding (`arc init`, `arc auth`, & `arc allow`)
 
-Run `arc init` in your repository root to create `.arc/policy.json`, install hooks for detected hosts (`claude-code`, `cursor`, `codex-cli`, `gemini-cli`, `windsurf`, or `--host all`), and run an immediate AI asset + secret discovery scan:
+Run `arc init` in your repository root to create `.arc/policy.json`, install hooks for detected hosts (`claude-code`, `cursor`, `codex-cli`, `gemini-cli`, `windsurf`, or `--host all`), auto-register `arc mcp-server` in `.cursor/mcp.json` / `.mcp.json`, install Secure-at-Inception directives (`.cursor/rules/vexa-arc-security.mdc` / `CLAUDE.md` / `.windsurfrules`), and run an immediate AI asset + secret discovery scan:
 
 ```bash
 # Standard enforcement (with IDE confirmation prompts for Lethal Trifecta)
@@ -105,6 +105,29 @@ arc init --audit-mode
 
 # Allowlist a specific rule/target if needed
 arc allow --rule ARC-LTT-001 --target slack --reason "Approved workspace webhook"
+```
+
+#### Connecting to Vexa Cloud (`arc auth` — Linux, macOS & Windows)
+Authenticate once to share `~/.vexa/credentials.json` (`%USERPROFILE%\.vexa\credentials.json` on Windows) across `arc` and `vexa-sca`. Once authenticated, blocked hook actions, package shield checks, and `arc ci-report --upload` automatically stream zero-code telemetry to the Vexa Cloud dashboard:
+
+```bash
+# Linux / macOS:
+arc auth login --token vexa_pat_live_...
+arc auth status
+
+# Or via environment variable in CI:
+export VEXA_TOKEN="vexa_pat_live_..."
+arc ci-report --sca --upload
+```
+
+```powershell
+# Windows PowerShell:
+arc auth login --token vexa_pat_live_...
+arc auth status
+
+# Or via environment variable in PowerShell:
+$env:VEXA_TOKEN = "vexa_pat_live_..."
+arc ci-report --sca --upload
 ```
 
 ### Local Stdio MCP Server (`arc mcp-server`)
@@ -130,7 +153,7 @@ Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON 
 arc ci-report --sca --fail-on high --markdown-out arc-pr-report.md --json-out arc-pr-report.json
 ```
 
-For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.0.4`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
+For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.0.5`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
 
 ### Remote Streamable HTTP / SSE MCP Proxy (`arc protect http`)
 

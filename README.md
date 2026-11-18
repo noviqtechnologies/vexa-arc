@@ -95,10 +95,14 @@ cargo build --release
 
 ### 2. Initialize & Run Immediate Diagnostic Checks
 ```bash
-# 🚀 One-command onboarding: creates .arc/policy.json, installs IDE hooks, and runs discovery:
+# 🚀 One-command onboarding: creates .arc/policy.json, installs IDE hooks, registers MCP server & directives:
 arc init
 # Or start in non-blocking audit mode first:
 arc init --audit-mode
+
+# ☁️ (Optional) Connect to Vexa Cloud to stream blocked events & CI scan facts (Linux / macOS / Windows):
+arc auth login --token vexa_pat_...
+arc auth status
 
 # 📦 Live registry + OSV package check (npm, PyPI, crates.io; set ARC_OFFLINE=1 for offline cache):
 arc shield check reactt --ecosystem npm
@@ -114,6 +118,9 @@ arc allow --rule ARC-LTT-001 --target slack --reason "Approved workspace webhook
 
 # 🔌 Expose Arc security tools to any MCP-capable agent (Codex, Gemini CLI, Windsurf, Cline):
 arc mcp-server
+
+# 📊 Run CI security report & optionally sync zero-code facts to Vexa Cloud:
+arc ci-report --sca --upload
 ```
 
 *(If versioned binaries are published, use the checksums and provenance attached to that specific [GitHub Release](https://github.com/noviqtechnologies/vexa-arc/releases); do not assume unreleased artifacts are available or validated.)*
@@ -456,10 +463,11 @@ All commands support relative and absolute paths, cross-platform path separators
 
 | Command | Purpose | Key Flags | Example |
 | :--- | :--- | :--- | :--- |
-| `arc init` | Initialize `.arc/policy.json`, install IDE hooks, and run quick discovery | `--host <auto\|claude-code\|cursor\|all\|none>`, `--audit-mode`, `--json` | `arc init --audit-mode` |
+| `arc init` | Initialize `.arc/policy.json`, install IDE hooks, register MCP server, and install Secure-at-Inception directives | `--host <auto\|claude-code\|cursor\|codex-cli\|gemini-cli\|windsurf\|all\|none>`, `--audit-mode`, `--json` | `arc init --audit-mode` |
+| `arc auth` | Authenticate with Vexa Cloud (`~/.vexa/credentials.json` shared store) | `login --token <PAT>`, `status`, `logout`, `--api-url <URL>`, `--json` | `arc auth login --token vexa_pat_...` |
 | `arc allow` | Add a scoped allowlist exception to `.arc/policy.json` | `--rule <ID>`, `--target <STR>`, `--ttl-hours <N>` | `arc allow --rule ARC-PKG-001 --target my-pkg` |
 | `arc mcp-server` | Run stdio MCP server (`scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets`) | `-p, --path <PATH>` | `arc mcp-server` |
-| `arc ci-report` | Generate Markdown/JSON PR security report (secrets, hidden Unicode, MCP pins, SCA) | `--sca`, `--fail-on <SEV>`, `--markdown-out <PATH>`, `--json-out <PATH>` | `arc ci-report --sca --fail-on high` |
+| `arc ci-report` | Generate Markdown/JSON PR security report and optionally sync to Vexa Cloud | `--sca`, `--fail-on <SEV>`, `--upload`, `--api-url <URL>`, `--markdown-out <PATH>`, `--json-out <PATH>` | `arc ci-report --sca --fail-on high --upload` |
 | `arc audit` | Scan project or workstation for AI assets, rules, and MCP configs | `--workstation`, `--json`, `--output-bom <PATH>` | `arc audit --output-bom ai-bom.json` |
 | `arc bom` | Export CycloneDX v1.6 AI-BOM | `-p, --path <PATH>`, `-o, --out <PATH>` | `arc bom --out ai-bom.json` |
 | `arc sca` | Consensual, disposable-worktree SCA scanning & PR remediation | `audit`, `fix [--dry-run \| --open-pr]` | `arc sca audit --sarif audit.sarif --sanitize-locations` |
@@ -524,7 +532,7 @@ jobs:
     runs-on: ubuntu-latest # also supports macos-latest and windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: noviqtechnologies/vexa-arc@v1.0.4
+      - uses: noviqtechnologies/vexa-arc@v1.0.5
         with:
           fail-on: high
           fail-on-secrets: 'true'

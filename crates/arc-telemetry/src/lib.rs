@@ -1,9 +1,14 @@
 mod client;
+pub mod cloud;
 mod model;
 mod privacy;
 
 pub use client::{
     default_spool_dir, export_aggregate, run_collector, TelemetryClient, TelemetrySink,
+};
+pub use cloud::{
+    emit_cloud_firewall_event, sanitize_cloud_reason, CloudFirewallEvent, StoredVexaCredentials,
+    VexaCloudAuth, DEFAULT_VEXA_API_BASE_URL,
 };
 pub use model::{TelemetryEvent, TelemetryEventBuilder};
 pub use privacy::{hash_identifier, install_id};

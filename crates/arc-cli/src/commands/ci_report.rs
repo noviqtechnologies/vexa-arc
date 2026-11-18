@@ -3,15 +3,17 @@ use arc_dlp::detector::SecretScanEngine;
 use arc_dlp::sanitizer::sanitize_inbound_text;
 use arc_firewall::remediation::{run_sca_audit, ScaAuditOptions, ScaAuditResult};
 use arc_hooks::broker::load_mcp_pin_from_lockfile;
-use serde::Serialize;
+use arc_telemetry::VexaCloudAuth;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnicodeAnomaly {
     pub file_path: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretSummary {
     pub file_path: String,
     pub detector: String,
@@ -63,7 +65,13 @@ fn is_agent_instruction_file(path: &Path) -> bool {
         .to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "claude.md" | ".cursorrules" | ".windsurfrules" | "copilot-instructions.md" | "agent.md"
+        "claude.md"
+            | ".cursorrules"
+            | ".windsurfrules"
+            | "copilot-instructions.md"
+            | "agent.md"
+            | "agents.md"
+            | "skill.md"
     ) || lower.ends_with(".mdc")
         || lower.ends_with(".prompt.md")
 }
@@ -186,6 +194,172 @@ pub fn generate_ci_report(
     })
 }
 
+/// Builds a Zero-Code-Retention `VexaFactsPayload` JSON object compatible with `vexa-sca-cloud` (`POST /v1/facts/sync`).
+pub fn build_vexa_facts_payload(path: &Path, report: &CiReport) -> serde_json::Value {
+    let project_name = std::env::var("VEXA_PROJECT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("GITHUB_REPOSITORY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            path.canonicalize()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        })
+        .unwrap_or_else(|| "workspace".to_string());
+
+    let mut code_findings = Vec::new();
+
+    for s in &report.secrets {
+        let masked_sink: String = s.snippet.chars().take(64).collect();
+        code_findings.push(serde_json::json!({
+            "rule_id": s.detector,
+            "category": "SECRET",
+            "severity": "CRITICAL",
+            "title": format!("Exposed credential detected ({})", s.detector),
+            "cwe": "CWE-798",
+            "file_path": s.file_path,
+            "line": 1,
+            "matched_sink": masked_sink,
+            "remediation": "Revoke this credential immediately and load secrets from environment variables or a secret manager."
+        }));
+    }
+
+    for u in &report.unicode_anomalies {
+        code_findings.push(serde_json::json!({
+            "rule_id": "ARC-UNI-001",
+            "category": "SUPPLY_CHAIN",
+            "severity": "CRITICAL",
+            "title": "Hidden Trojan-Source / Prompt-Injection Unicode in Agent Instruction File",
+            "cwe": "CWE-1036",
+            "file_path": u.file_path,
+            "line": 1,
+            "matched_sink": "hidden_bidi_or_zero_width_unicode",
+            "remediation": "Strip invisible zero-width and bidirectional override characters from agent rule and skill files."
+        }));
+    }
+
+    for srv in &report.unpinned_mcp_servers {
+        let sink: String = srv.chars().take(64).collect();
+        code_findings.push(serde_json::json!({
+            "rule_id": "ARC-MCP-001",
+            "category": "SUPPLY_CHAIN",
+            "severity": "HIGH",
+            "title": format!("Unpinned MCP Server '{}' (missing .arc/mcp-pins.lock entry)", srv),
+            "cwe": "CWE-829",
+            "file_path": ".arc/mcp-pins.lock",
+            "line": 1,
+            "matched_sink": sink,
+            "remediation": "Pin the MCP server schema hash in .arc/mcp-pins.lock via `arc protect`."
+        }));
+    }
+
+    let (total_vulns, reachable_vulns, ecosystem) = match &report.sca {
+        Some(sca) => (
+            sca.total_vulnerabilities,
+            sca.reachable_count,
+            sca.manifest_type.clone(),
+        ),
+        None => (0, 0, "AI-Workspace".to_string()),
+    };
+
+    let branch = std::env::var("GITHUB_HEAD_REF")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("GITHUB_REF_NAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "main".to_string());
+
+    let commit_sha = std::env::var("GITHUB_SHA")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    serde_json::json!({
+        "version": 2,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "project_name": project_name,
+        "project_version": "1.0.0",
+        "ecosystem": ecosystem,
+        "total_packages": 0,
+        "direct_dependencies": 0,
+        "transitive_dependencies": 0,
+        "packages": [],
+        "reachable_vulnerabilities": reachable_vulns,
+        "unreachable_vulnerabilities": 0,
+        "unknown_reachability_vulnerabilities": total_vulns.saturating_sub(reachable_vulns),
+        "total_vulnerabilities": total_vulns,
+        "findings": [],
+        "code_findings": code_findings,
+        "components": [
+            {
+                "id": "vexa-arc-engine",
+                "name": "Vexa Arc AI & Secret Security Engine",
+                "status": "COMPLETED",
+                "findings_count": code_findings.len()
+            }
+        ],
+        "branch": branch,
+        "commit_sha": commit_sha,
+    })
+}
+
+pub fn upload_ci_report_to_cloud(
+    path: &Path,
+    report: &CiReport,
+    api_url: Option<&str>,
+) -> Result<String, String> {
+    if VexaCloudAuth::is_offline() {
+        return Err("Cloud upload skipped: offline mode is active".to_string());
+    }
+    let token = VexaCloudAuth::get_token().ok_or_else(|| {
+        "Authentication required for `--upload`. Run `arc auth login --token <vexa_pat_...>` or set `VEXA_TOKEN`.".to_string()
+    })?;
+    let base_url = VexaCloudAuth::resolve_api_base_url(api_url);
+    let sync_url = format!("{}/facts/sync", base_url.trim_end_matches('/'));
+    let org_slug = VexaCloudAuth::get_org_slug();
+    let payload = build_vexa_facts_payload(path, report);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to initialize async runtime: {e}"))?;
+
+    rt.block_on(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        let mut req = client
+            .post(&sync_url)
+            .header("Authorization", format!("Bearer {}", token.trim()));
+        if let Some(org) = org_slug {
+            req = req.header("X-Vexa-Org", org);
+        }
+        let resp = req
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to connect to Vexa Cloud ({sync_url}): {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Cloud upload failed ({status}): {text}"));
+        }
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let dash = body
+            .get("dashboard_url")
+            .and_then(|d| d.as_str())
+            .unwrap_or(&base_url);
+        Ok(dash.to_string())
+    })
+}
+
 pub fn render_markdown_report(report: &CiReport) -> String {
     let status_badge = if report.passed {
         "✅ **PASSED**"
@@ -265,6 +439,7 @@ pub fn render_markdown_report(report: &CiReport) -> String {
     md
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_ci_report(
     path: &Path,
     run_sca: bool,
@@ -273,6 +448,8 @@ pub fn run_ci_report(
     markdown_out: Option<&Path>,
     json_out: Option<&Path>,
     json: bool,
+    upload: bool,
+    api_url: Option<&str>,
 ) -> bool {
     let report = match generate_ci_report(path, run_sca, fail_on, fail_on_secrets) {
         Ok(r) => r,
@@ -301,6 +478,17 @@ pub fn run_ci_report(
         if let Err(e) = std::fs::write(j_path, body.as_bytes()) {
             eprintln!("[Arc CI] Failed to write {}: {e}", j_path.display());
             return false;
+        }
+    }
+
+    if upload {
+        match upload_ci_report_to_cloud(path, &report, api_url) {
+            Ok(dash_url) => {
+                eprintln!("[Arc CI] Synced scan facts to Vexa Cloud: {dash_url}");
+            }
+            Err(e) => {
+                eprintln!("[Arc CI] Warning: Cloud upload failed: {e}");
+            }
         }
     }
 
@@ -353,6 +541,13 @@ mod tests {
         assert!(md.contains("<!-- vexa-arc-pr-report -->"));
         assert!(md.contains("SEC-AWS-001"));
         assert!(md.contains(".cursorrules"));
+
+        let facts = build_vexa_facts_payload(&dir, &dirty);
+        let code_findings = facts["code_findings"].as_array().unwrap();
+        assert_eq!(code_findings.len(), 3);
+        assert!(code_findings.iter().any(|f| f["category"] == "SECRET"));
+        assert!(code_findings.iter().any(|f| f["rule_id"] == "ARC-UNI-001"));
+        assert!(code_findings.iter().any(|f| f["rule_id"] == "ARC-MCP-001"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

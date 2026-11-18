@@ -257,6 +257,54 @@ enum Commands {
         /// Print structured JSON report to stdout
         #[arg(long)]
         json: bool,
+
+        /// Upload zero-code scan facts to Vexa Cloud (`POST /v1/facts/sync`)
+        #[arg(long)]
+        upload: bool,
+
+        /// Optional Vexa Cloud API base URL override
+        #[arg(long)]
+        api_url: Option<String>,
+    },
+
+    /// Authenticate with Vexa Cloud (shared `~/.vexa/credentials.json` token store)
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Save and verify a Vexa Personal Access Token (`vexa_pat_...` or `vexasec_...`)
+    Login {
+        /// Vexa API token (or set `VEXA_TOKEN`)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Optional Vexa Cloud API base URL override
+        #[arg(long)]
+        api_url: Option<String>,
+
+        /// Output status as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check current authentication status and linked organization
+    Status {
+        /// Optional Vexa Cloud API base URL override
+        #[arg(long)]
+        api_url: Option<String>,
+
+        /// Output status as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove stored Vexa Cloud credentials from `~/.vexa/credentials.json`
+    Logout {
+        /// Output status as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1324,6 +1372,8 @@ fn main() {
             markdown_out,
             json_out,
             json,
+            upload,
+            api_url,
         } => {
             if !commands::ci_report::run_ci_report(
                 &path,
@@ -1333,10 +1383,33 @@ fn main() {
                 markdown_out.as_deref(),
                 json_out.as_deref(),
                 json,
+                upload,
+                api_url.as_deref(),
             ) {
                 std::process::exit(1);
             }
         }
+        Commands::Auth { action } => match action {
+            AuthAction::Login {
+                token,
+                api_url,
+                json,
+            } => {
+                if !commands::auth::run_auth_login(token.as_deref(), api_url.as_deref(), json) {
+                    std::process::exit(1);
+                }
+            }
+            AuthAction::Status { api_url, json } => {
+                if !commands::auth::run_auth_status(api_url.as_deref(), json) {
+                    std::process::exit(1);
+                }
+            }
+            AuthAction::Logout { json } => {
+                if !commands::auth::run_auth_logout(json) {
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 
@@ -2882,6 +2955,44 @@ fn run_shield_check(
         _ => None,
     };
 
+    let allowed = !verdict.is_blocked() && !osv_outcome.blocks();
+    let (rule_triggered, reason_text) = match &verdict {
+        arc_firewall::slopsquat::SlopsquatVerdict::Blocked { gate, reason } => {
+            (gate.to_string(), reason.clone())
+        }
+        arc_firewall::slopsquat::SlopsquatVerdict::Review { gate, reason, .. } => {
+            (gate.to_string(), reason.clone())
+        }
+        arc_firewall::slopsquat::SlopsquatVerdict::Permitted { reason } => {
+            if osv_outcome.blocks() {
+                (
+                    "ARC-SCA-001".to_string(),
+                    "Blocked by OSV vulnerability check".to_string(),
+                )
+            } else {
+                ("PREFLIGHT_PASS".to_string(), (*reason).to_string())
+            }
+        }
+    };
+    let _ = arc_telemetry::emit_cloud_firewall_event(
+        &arc_telemetry::CloudFirewallEvent {
+            package: osv_name.to_string(),
+            version: osv_version.unwrap_or("latest").to_string(),
+            ecosystem: osv_eco.to_string(),
+            action: if allowed {
+                "ALLOWED".to_string()
+            } else {
+                "BLOCKED".to_string()
+            },
+            rule_triggered,
+            reason: reason_text,
+            actor: arc_telemetry::VexaCloudAuth::current_actor(),
+            os: std::env::consts::OS.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+        None,
+    );
+
     if json {
         let osv_status = match &osv_outcome {
             OsvOutcome::Scanned(_) => "scanned",
@@ -3207,6 +3318,31 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
 
         // Post-phase hooks only report results for taint tracking; they never block.
         if event.phase == Phase::Pre && !verdict.is_allowed() {
+            let rule_str = verdict_rule(verdict).unwrap_or_else(|| "ARC-POLICY-BLOCK".to_string());
+            let reason_str = match verdict {
+                arc_core::verdict::Verdict::Deny { explanation, .. }
+                | arc_core::verdict::Verdict::Quarantine { explanation, .. }
+                | arc_core::verdict::Verdict::RequireApproval { explanation, .. } => {
+                    explanation.summary.clone()
+                }
+                arc_core::verdict::Verdict::Allow { .. } => {
+                    "Unapplied DLP redaction blocked".to_string()
+                }
+            };
+            let _ = arc_telemetry::emit_cloud_firewall_event(
+                &arc_telemetry::CloudFirewallEvent {
+                    package: format!("{}:{}", action_class(event), target_class(event)),
+                    version: "pre-hook".to_string(),
+                    ecosystem: format!("arc-hook:{host}"),
+                    action: "BLOCKED".to_string(),
+                    rule_triggered: rule_str,
+                    reason: reason_str,
+                    actor: arc_telemetry::VexaCloudAuth::current_actor(),
+                    os: std::env::consts::OS.to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+                None,
+            );
             response = adapter.encode(verdict);
             break;
         }
