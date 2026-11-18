@@ -37,7 +37,7 @@ pub fn run_auth_login(token_opt: Option<&str>, api_url: Option<&str>, json: bool
             let tok_c = token.clone();
             rt.block_on(async {
                 if let Ok(client) = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_secs(10))
                     .build()
                 {
                     if let Ok(resp) = client
@@ -138,7 +138,7 @@ pub fn run_auth_status(api_url: Option<&str>, json: bool) -> bool {
             let status_url = format!("{}/auth/status", base_url.trim_end_matches('/'));
             rt.block_on(async {
                 if let Ok(client) = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_secs(10))
                     .build()
                 {
                     if let Ok(resp) = client
@@ -148,15 +148,23 @@ pub fn run_auth_status(api_url: Option<&str>, json: bool) -> bool {
                         .await
                     {
                         if resp.status().is_success() {
-                            cloud_verified = true;
                             if let Ok(info) = resp.json::<serde_json::Value>().await {
-                                if let Some(o) = info.get("org_slug").and_then(|v| v.as_str()) {
-                                    org_slug = Some(o.to_string());
-                                }
-                                if let Some(e) = info.get("user_email").and_then(|v| v.as_str()) {
-                                    user_email = Some(e.to_string());
-                                }
-                                if let Some(t) = info.get("tier").and_then(|v| v.as_str()) {
+                                let is_auth = info
+                                    .get("authenticated")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(true);
+                                if is_auth {
+                                    cloud_verified = true;
+                                    if let Some(o) = info.get("org_slug").and_then(|v| v.as_str()) {
+                                        org_slug = Some(o.to_string());
+                                    }
+                                    if let Some(e) = info.get("user_email").and_then(|v| v.as_str()) {
+                                        user_email = Some(e.to_string());
+                                    }
+                                    if let Some(t) = info.get("tier").and_then(|v| v.as_str()) {
+                                        tier = Some(t.to_string());
+                                    }
+                                } else if let Some(t) = info.get("tier").and_then(|v| v.as_str()) {
                                     tier = Some(t.to_string());
                                 }
                             }
