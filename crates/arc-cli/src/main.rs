@@ -19,7 +19,10 @@ use arc_firewall::proxy::PackageFirewall;
 use arc_firewall::slopsquat::SlopsquatVerdict;
 use arc_hooks::broker::McpStdioBroker;
 use arc_hooks::claude_code::ClaudeCodeAdapter;
+use arc_hooks::codex_cli::CodexCliAdapter;
 use arc_hooks::cursor::CursorAdapter;
+use arc_hooks::gemini_cli::GeminiCliAdapter;
+use arc_hooks::windsurf::WindsurfAdapter;
 use arc_hooks::HostAdapter;
 use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
 use arc_policy_engine::taint_dag::{SessionAuditRecord, SessionAuditSummary, SessionTaintDag};
@@ -1946,8 +1949,56 @@ fn run_host_install(host: &str, workspace: Option<&Path>) -> bool {
                 false
             }
         },
+        "codex-cli" | "codex" => match CodexCliAdapter::install_integration(root) {
+            Ok(summary) => {
+                println!(
+                    "✔ Registered Codex CLI hooks in {}",
+                    summary.config_path.display()
+                );
+                if let Some(warn) = &summary.volatile_warning {
+                    eprintln!("  [WARN] {warn}");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to install Codex CLI integration: {e}");
+                false
+            }
+        },
+        "gemini-cli" | "gemini" => match GeminiCliAdapter::install_integration(root) {
+            Ok(summary) => {
+                println!(
+                    "✔ Registered Gemini CLI hooks in {}",
+                    summary.config_path.display()
+                );
+                if let Some(warn) = &summary.volatile_warning {
+                    eprintln!("  [WARN] {warn}");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to install Gemini CLI integration: {e}");
+                false
+            }
+        },
+        "windsurf" => match WindsurfAdapter::install_integration(root) {
+            Ok(summary) => {
+                println!(
+                    "✔ Registered Windsurf hooks in {}",
+                    summary.config_path.display()
+                );
+                if let Some(warn) = &summary.volatile_warning {
+                    eprintln!("  [WARN] {warn}");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to install Windsurf integration: {e}");
+                false
+            }
+        },
         _ => {
-            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor");
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
             false
         }
     }
@@ -1959,8 +2010,11 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
     let status = match host.to_lowercase().as_str() {
         "claude-code" | "claude" => ClaudeCodeAdapter::check_integration(root),
         "cursor" => CursorAdapter::check_integration(root),
+        "codex-cli" | "codex" => CodexCliAdapter::check_integration(root),
+        "gemini-cli" | "gemini" => GeminiCliAdapter::check_integration(root),
+        "windsurf" => WindsurfAdapter::check_integration(root),
         _ => {
-            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor");
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
             return false;
         }
     };
@@ -2075,8 +2129,11 @@ fn run_host_uninstall(host: &str, workspace: Option<&Path>) -> bool {
                 false
             }
         },
+        "codex-cli" | "codex" => CodexCliAdapter::uninstall_integration(root).is_ok(),
+        "gemini-cli" | "gemini" => GeminiCliAdapter::uninstall_integration(root).is_ok(),
+        "windsurf" => WindsurfAdapter::uninstall_integration(root).is_ok(),
         _ => {
-            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor");
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
             false
         }
     }
@@ -3030,8 +3087,11 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
     let adapter: Box<dyn HostAdapter> = match host.to_lowercase().as_str() {
         "claude-code" | "claude" => Box::new(ClaudeCodeAdapter),
         "cursor" => Box::new(CursorAdapter),
+        "codex-cli" | "codex" => Box::new(CodexCliAdapter),
+        "gemini-cli" | "gemini" => Box::new(GeminiCliAdapter),
+        "windsurf" => Box::new(WindsurfAdapter),
         other => {
-            eprintln!("[Arc Hook] Unknown host '{other}'. Supported: claude-code, cursor");
+            eprintln!("[Arc Hook] Unknown host '{other}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
             return 2;
         }
     };

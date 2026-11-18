@@ -795,35 +795,46 @@ impl PolicyEvaluator {
         }
 
         // 2.5 Inception-Time AST Pattern Check on FileWrite diff buffer (FR-CORE-006)
-        let file_content_to_check: Option<&str> = match &event.action {
-            Action::FileWrite {
-                new_content: Some(c),
-                ..
-            } => Some(c.as_str()),
-            Action::McpToolCall {
-                tool, arguments, ..
-            } => {
-                let tool_lower = tool.to_lowercase();
-                if tool_lower.contains("write")
-                    || tool_lower.contains("edit")
-                    || tool_lower.contains("create_file")
-                {
-                    arguments
-                        .get("content")
-                        .or_else(|| arguments.get("new_content"))
-                        .or_else(|| arguments.get("replacementContent"))
-                        .or_else(|| arguments.get("code"))
-                        .or_else(|| arguments.get("file_text"))
-                        .and_then(|v| v.as_str())
-                } else {
-                    None
+        let (file_path_opt, file_content_to_check): (Option<&std::path::Path>, Option<&str>) =
+            match &event.action {
+                Action::FileWrite {
+                    path,
+                    new_content: Some(c),
+                } => (Some(path.as_path()), Some(c.as_str())),
+                Action::McpToolCall {
+                    tool, arguments, ..
+                } => {
+                    let tool_lower = tool.to_lowercase();
+                    if tool_lower.contains("write")
+                        || tool_lower.contains("edit")
+                        || tool_lower.contains("create_file")
+                    {
+                        let path_opt = arguments
+                            .get("file_path")
+                            .or_else(|| arguments.get("path"))
+                            .or_else(|| arguments.get("TargetFile"))
+                            .and_then(|v| v.as_str())
+                            .map(std::path::Path::new);
+                        let content_opt = arguments
+                            .get("content")
+                            .or_else(|| arguments.get("new_content"))
+                            .or_else(|| arguments.get("replacementContent"))
+                            .or_else(|| arguments.get("code"))
+                            .or_else(|| arguments.get("file_text"))
+                            .and_then(|v| v.as_str());
+                        (path_opt, content_opt)
+                    } else {
+                        (None, None)
+                    }
                 }
-            }
-            _ => None,
-        };
+                _ => (None, None),
+            };
 
         if let Some(content) = file_content_to_check {
-            if let Some(finding) = self.ast_engine.check_fatal_injection(content) {
+            if let Some(finding) = self
+                .ast_engine
+                .check_fatal_injection_for_path(file_path_opt, content)
+            {
                 if let Some(exc) = check_exception("ARC-AST-001") {
                     return exc;
                 }

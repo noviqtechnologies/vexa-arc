@@ -215,6 +215,12 @@ Provides the `LocalPseudonymizationVault`:
 
 ### Code Injection Pattern Hook (`ARC-AST-001`) — FR-CORE-006
 
+`AstPatternEngine` (`arc-dlp::ast_pattern`) uses an Aho-Corasick prefilter followed by Tree-sitter AST verification (`tree-sitter-javascript`, `tree-sitter-typescript`, `tree-sitter-python`) to detect raw SQL interpolation, `eval`/`exec`, `innerHTML`, and plaintext credentials while skipping comments and non-executable string literals.
+
+## 8. Host Adapters & MCP JSON-RPC Interceptors (`arc-hooks`)
+
+`arc-hooks` implements native `HostAdapter` integrations for **Claude Code** (`.claude/settings.json`), **Cursor** (`.cursor/hooks.json`), **Codex CLI** (`.codex/hooks.json`), **Gemini CLI** (`.gemini/settings.json`), and **Windsurf** (`.windsurf/hooks.json`), alongside `McpStdioBroker` and `http_proxy`.
+
 `AstPatternEngine` in [`crates/arc-dlp/src/ast_pattern.rs`](file:///c:/vexa-arc/crates/arc-dlp/src/ast_pattern.rs) runs as a first-class step in `PolicyEvaluator::evaluate` for `Action::FileWrite`:
 
 ```rust

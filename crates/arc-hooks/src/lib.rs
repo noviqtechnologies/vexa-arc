@@ -1,20 +1,26 @@
 pub mod adapter;
 pub mod broker;
 pub mod claude_code;
+pub mod codex_cli;
 pub mod cursor;
+pub mod gemini_cli;
 pub mod host_config;
 pub mod http_proxy;
 pub mod mcp_jsonrpc;
 pub mod principal;
 pub mod process_containment;
+pub mod windsurf;
 
 pub use adapter::{AdapterError, HostAdapter, HostIntegrationStatus, HostResponse};
 pub use broker::{BrokerError, ClientMessageOutcome, McpStdioBroker, ServerMessageOutcome};
 pub use claude_code::ClaudeCodeAdapter;
+pub use codex_cli::CodexCliAdapter;
 pub use cursor::CursorAdapter;
+pub use gemini_cli::GeminiCliAdapter;
 pub use mcp_jsonrpc::McpJsonRpcInterceptor;
 pub use principal::current_os_principal;
 pub use process_containment::{ContainmentLimits, OsProcessSupervisor};
+pub use windsurf::WindsurfAdapter;
 
 #[cfg(test)]
 mod tests {

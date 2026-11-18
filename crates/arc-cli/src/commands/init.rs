@@ -1,6 +1,9 @@
 use arc_discover::scanner::DiscoveryScanner;
 use arc_hooks::claude_code::ClaudeCodeAdapter;
+use arc_hooks::codex_cli::CodexCliAdapter;
 use arc_hooks::cursor::CursorAdapter;
+use arc_hooks::gemini_cli::GeminiCliAdapter;
+use arc_hooks::windsurf::WindsurfAdapter;
 use arc_policy_engine::evaluator::{PolicyConfig, PolicyMode};
 use std::path::Path;
 
@@ -34,21 +37,28 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     let host_lower = host.to_lowercase();
     let has_claude = path.join(".claude").exists();
     let has_cursor = path.join(".cursor").exists();
+    let has_codex = path.join(".codex").exists();
+    let has_gemini = path.join(".gemini").exists();
+    let has_windsurf = path.join(".windsurf").exists();
 
-    let (install_claude, install_cursor) = match host_lower.as_str() {
-        "none" => (false, false),
-        "claude-code" | "claude" => (true, false),
-        "cursor" => (false, true),
-        "all" => (true, true),
-        _ => {
-            // auto: install for detected hosts, or both if neither exists yet
-            if !has_claude && !has_cursor {
-                (true, true)
-            } else {
-                (has_claude, has_cursor)
+    let (install_claude, install_cursor, install_codex, install_gemini, install_windsurf) =
+        match host_lower.as_str() {
+            "none" => (false, false, false, false, false),
+            "claude-code" | "claude" => (true, false, false, false, false),
+            "cursor" => (false, true, false, false, false),
+            "codex-cli" | "codex" => (false, false, true, false, false),
+            "gemini-cli" | "gemini" => (false, false, false, true, false),
+            "windsurf" => (false, false, false, false, true),
+            "all" => (true, true, true, true, true),
+            _ => {
+                // auto: install for detected hosts, or Claude + Cursor if none exist yet
+                if !has_claude && !has_cursor && !has_codex && !has_gemini && !has_windsurf {
+                    (true, true, false, false, false)
+                } else {
+                    (has_claude, has_cursor, has_codex, has_gemini, has_windsurf)
+                }
             }
-        }
-    };
+        };
 
     let mut installed_hosts = Vec::new();
     let mut hook_warnings = Vec::new();
@@ -76,6 +86,45 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
             }
             Err(e) => {
                 eprintln!("[Arc Init] Warning: Cursor hook install failed: {e}");
+            }
+        }
+    }
+    if install_codex {
+        match CodexCliAdapter::install_integration(path) {
+            Ok(summary) => {
+                installed_hosts.push("codex-cli");
+                if let Some(w) = summary.volatile_warning {
+                    hook_warnings.push(w);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Arc Init] Warning: Codex CLI hook install failed: {e}");
+            }
+        }
+    }
+    if install_gemini {
+        match GeminiCliAdapter::install_integration(path) {
+            Ok(summary) => {
+                installed_hosts.push("gemini-cli");
+                if let Some(w) = summary.volatile_warning {
+                    hook_warnings.push(w);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Arc Init] Warning: Gemini CLI hook install failed: {e}");
+            }
+        }
+    }
+    if install_windsurf {
+        match WindsurfAdapter::install_integration(path) {
+            Ok(summary) => {
+                installed_hosts.push("windsurf");
+                if let Some(w) = summary.volatile_warning {
+                    hook_warnings.push(w);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Arc Init] Warning: Windsurf hook install failed: {e}");
             }
         }
     }

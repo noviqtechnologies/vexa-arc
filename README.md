@@ -60,13 +60,13 @@ Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; 
 | Security Dimension | Threat Vector Addressed | Vexa Arc Mechanism | CLI Command |
 | :--- | :--- | :--- | :--- |
 | **Observed Taint Checks** | Some mediated private-data + untrusted-context flows | Session Taint DAG and heuristic classification of selected sinks; not general egress interception | `arc intercept eval --session s1` |
-| **Selected Agent Hooks** | Configured Claude Code/Cursor lifecycle events & package-install shell commands | Host hooks mediate supported events + `ARC-PKG-001` install checks; ordinary Cursor editor writes bypass Arc | `arc init` / `arc host install --host claude-code` |
+| **Selected Agent Hooks** | Configured Claude Code, Cursor, Codex CLI, Gemini CLI, and Windsurf lifecycle events & package-install commands | Host hooks mediate supported events + `ARC-PKG-001` install checks; ordinary editor writes bypass Arc | `arc init` / `arc host install --host claude-code` |
 | **Package Risk Check** | Slopsquatting, malicious install scripts, 404s, and known vulnerabilities | Live cached npm/PyPI/crates.io registry lookups (`ARC_OFFLINE=1` fallback) + exact-version OSV check | `arc shield check lodash@4.17.21` |
 | **Wrapped MCP Schema Pinning** | Schema changes on an MCP server launched through the Arc stdio broker | RFC 8785 JCS hashing; local `.arc/mcp-pins.lock`, signed org policy pin, or `--allow-tofu` | `arc protect stdio --server github -- npx ...` |
 | **Local MCP Security Server** | Agents without native hooks (Codex, Gemini CLI, Windsurf, Cline) | Stdio MCP server exposing `scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets` | `arc mcp-server` |
 | **Process Lifecycle Controls** | Some child-process lifetime/resource risks in the wrapped broker | OS-specific lifecycle/resource controls; not sandboxing or network isolation | `arc protect stdio --max-memory-mb 512` |
 | **Secret Scanning** | Supported secret patterns in explicitly scanned inputs | Pattern/entropy detector; redaction applies only where the path can apply it | `arc scan-secrets --path . --redact` |
-| **Targeted Code-Pattern Scan** | Selected risky code patterns on a mediated file-write event | Aho-Corasick prefilter + targeted regex; not AST analysis or universal file-write DLP | `arc intercept eval --kind file_write` |
+| **Targeted Code-Pattern Scan** | Selected risky code patterns on a mediated file-write event | Aho-Corasick prefilter + Tree-sitter AST verification (JS/TS/Python) skipping comments/doc strings | `arc intercept eval --kind file_write` |
 | **AI Asset Discovery** | Inventory of discovered AI assets/configuration | Repository/workstation scanner with CycloneDX v1.6 export; validate inventory completeness | `arc audit --output-bom ai-bom.json` |
 
 ---
@@ -465,7 +465,7 @@ All commands support relative and absolute paths, cross-platform path separators
 | `arc sca` | Consensual, disposable-worktree SCA scanning & PR remediation | `audit`, `fix [--dry-run \| --open-pr]` | `arc sca audit --sarif audit.sarif --sanitize-locations` |
 | `arc shield` | Live cached registry checks (npm, PyPI, crates.io) + exact-version OSV check | `check <PKG>`, `run <CMD>`, `--show-recommendation`, `--fail-on-risk` | `arc shield run --fail-on-risk -- npm install package` |
 | `arc scan-secrets` | Scan files or stdin for secrets with entropy checks | `-p, --path <PATH>`, `--redact` | `arc scan-secrets --path . --redact` |
-| `arc host` | Manage host integrations (Claude Code, Cursor) | `install`, `status`, `uninstall`, `--host <HOST>` | `arc host install --host claude-code` |
+| `arc host` | Manage host integrations (Claude Code, Cursor, Codex CLI, Gemini CLI, Windsurf) | `install`, `status`, `uninstall`, `--host <HOST>` | `arc host install --host claude-code` |
 | `arc protect` | Supervise stdio or remote HTTP/SSE MCP servers with schema pinning (`.arc/mcp-pins.lock` or signed policy) | `stdio --server <NAME>`, `http --server <NAME> --target <URL> --listen 127.0.0.1:8787` | `arc protect http --server linear --target https://mcp.linear.app/sse` |
 | `arc intercept` | Intercept and evaluate agent actions against session Taint DAG | `eval`, `read`, `exec`, `mcp`, `prompt`, `hook`, `session` | `arc intercept hook --host claude-code` |
 | `arc trace` | Inspect event causality and export redacted audit evidence | `<EVENT_ID>`, `latest`, `--export <PATH>`, `--json` | `arc trace latest --export trace.json` |
@@ -524,7 +524,7 @@ jobs:
     runs-on: ubuntu-latest # also supports macos-latest and windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: noviqtechnologies/vexa-arc@v1.0.3
+      - uses: noviqtechnologies/vexa-arc@v1.0.4
         with:
           fail-on: high
           fail-on-secrets: 'true'

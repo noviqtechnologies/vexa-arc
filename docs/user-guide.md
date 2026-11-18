@@ -94,7 +94,7 @@ To ensure clarity across security, DevOps, and AI development teams, the table b
 
 ### First-Run Onboarding (`arc init` & `arc allow`)
 
-Run `arc init` in your repository root to create `.arc/policy.json`, install Claude Code and/or Cursor hooks, and run an immediate AI asset + secret discovery scan:
+Run `arc init` in your repository root to create `.arc/policy.json`, install hooks for detected hosts (`claude-code`, `cursor`, `codex-cli`, `gemini-cli`, `windsurf`, or `--host all`), and run an immediate AI asset + secret discovery scan:
 
 ```bash
 # Standard enforcement (with IDE confirmation prompts for Lethal Trifecta)
@@ -130,7 +130,7 @@ Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON 
 arc ci-report --sca --fail-on high --markdown-out arc-pr-report.md --json-out arc-pr-report.json
 ```
 
-For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.0.3`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
+For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.0.4`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
 
 ### Remote Streamable HTTP / SSE MCP Proxy (`arc protect http`)
 
