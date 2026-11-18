@@ -1,0 +1,31 @@
+name: Vexa Arc PR Gate (Dogfood)
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  arc-pr-gate:
+    name: Vexa Arc Security Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Vexa Arc Action (from PR source)
+        uses: ./
+        with:
+          version: 'source'
+          path: '.'
+          fail-on: 'high'
+          fail-on-secrets: 'false' # Repo contains synthetic secret fixtures in arc-dlp/tests
+          run-sca: 'true'
+          comment-pr: 'true'
