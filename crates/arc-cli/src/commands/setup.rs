@@ -7,19 +7,18 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn is_headless_session() -> bool {
-    if std::env::var("CI").is_ok()
+    let ci_or_ssh = std::env::var("CI").is_ok()
         || std::env::var("SSH_CONNECTION").is_ok()
-        || std::env::var("SSH_TTY").is_ok()
-    {
-        return true;
-    }
+        || std::env::var("SSH_TTY").is_ok();
     #[cfg(target_os = "linux")]
     {
-        if std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err() {
-            return true;
-        }
+        ci_or_ssh
+            || (std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err())
     }
-    false
+    #[cfg(not(target_os = "linux"))]
+    {
+        ci_or_ssh
+    }
 }
 
 fn try_open_browser(url: &str) -> bool {
