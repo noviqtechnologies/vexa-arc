@@ -303,12 +303,19 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     // 3. Instant discovery + secret check (workstation-scoped if run in $HOME / root,
     //    bounded quick-scan if run in a project repository so `arc init` never hangs)
     let is_workstation_scope = vexa_core::fs_guard::is_unsafe_recursive_scan_root(path);
+    let display_path = std::fs::canonicalize(path)
+        .ok()
+        .map(|p| {
+            let s = p.display().to_string();
+            s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+        })
+        .unwrap_or_else(|| path.display().to_string());
     let scanner = DiscoveryScanner::new();
     let audit_report = if is_workstation_scope {
         if !json {
             eprintln!(
                 "[Arc Init] Home/root directory detected ({}) — using workstation scope (known IDE/AI config roots only).",
-                path.display()
+                display_path
             );
             eprintln!(
                 "[Arc Init] Tip: Run `arc init` inside a project repository for project-scoped policy & repo audit."
@@ -425,7 +432,7 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     println!("\nNext steps:");
     println!("  • Run `arc audit` for full AI asset & MCP risk details");
     println!("  • Run `arc sca audit` to check dependencies for vulnerabilities");
-    println!("  • Run `arc auth login --token <vexa_pat_...>` to stream events to Vexa Cloud");
+    println!("  • Run `arc setup` to connect to Vexa Cloud via browser approval (pass `--api-url <URL>` for dev/self-hosted, or `--token <PAT>` for CI/headless)");
     println!("=======================================================\n");
 
     true

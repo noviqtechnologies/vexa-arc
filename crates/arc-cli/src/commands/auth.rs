@@ -118,7 +118,7 @@ pub fn run_auth_status(api_url: Option<&str>, json: bool) -> bool {
             );
         } else {
             println!("Vexa Cloud Status: Unauthenticated (Local Mode)");
-            println!("  Run `arc auth login --token <vexa_pat_...>` to connect to Vexa Cloud.");
+            println!("  Run `arc setup` to connect to Vexa Cloud via browser approval (or `arc auth login --token <vexa_pat_...>` for CI/headless).");
         }
         return true;
     };
