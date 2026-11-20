@@ -73,21 +73,27 @@ Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; 
 
 ## Quick Start (30 Seconds)
 
-### 1. Install Prebuilt Binary or Run via `npx`
+### 1. Install Prebuilt Binary or Run via `npm` / `npx`
 
-**Windows (PowerShell):**
+**Zero-install quickstart via `npx` (Windows / macOS / Linux):**
+```bash
+npx @vexasec/arc@latest init
+```
+
+**Global install & upgrade via `npm` (recommended for daily use & IDE hooks):**
+```bash
+npm install -g @vexasec/arc@latest
+arc init
+```
+
+**Standalone binary — Windows (PowerShell, no Node.js required):**
 ```powershell
 irm https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.ps1 | iex
 ```
 
-**macOS / Linux:**
+**Standalone binary — macOS / Linux (no Node.js required):**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.sh | sh
-```
-
-**Zero-install via Node.js (macOS / Linux / Windows):**
-```bash
-npx @vexasec/arc init
 ```
 
 > [!NOTE]

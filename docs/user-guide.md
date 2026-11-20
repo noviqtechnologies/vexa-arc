@@ -79,15 +79,19 @@ To ensure clarity across security, DevOps, and AI development teams, the table b
 
 ### Quick Install (All Platforms)
 
-* **Zero-install via `npx` (Windows, macOS, Linux):**
+* **Zero-install quickstart via `npx` (Windows, macOS, Linux):**
   ```bash
-  npx @vexasec/arc init
+  npx @vexasec/arc@latest init
   ```
-* **macOS / Linux (`install.sh`):**
+* **Global install & upgrade via `npm` (recommended for daily use & IDE hooks):**
+  ```bash
+  npm install -g @vexasec/arc@latest
+  ```
+* **macOS / Linux standalone (`install.sh`, no Node.js required):**
   ```bash
   curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.sh | sh
   ```
-* **Windows PowerShell (`install.ps1`):**
+* **Windows PowerShell standalone (`install.ps1`, no Node.js required):**
   ```powershell
   irm https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.ps1 | iex
   ```
