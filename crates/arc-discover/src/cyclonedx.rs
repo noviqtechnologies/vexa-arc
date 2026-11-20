@@ -233,6 +233,7 @@ mod tests {
             unscanned_locations: vec![],
             excluded_paths: vec![],
             permission_errors: vec![],
+            truncated: false,
         };
 
         let bom = generate_cyclonedx_1_6_bom(&report);

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 arc-core = { path = "../arc-core" }
 arc-dlp = { path = "../arc-dlp" }
+vexa-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_jcs = { workspace = true }

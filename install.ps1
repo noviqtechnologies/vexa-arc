@@ -7,7 +7,8 @@ $InstallDir = if ($env:ARC_INSTALL_DIR) { $env:ARC_INSTALL_DIR } else { Join-Pat
 if ($Version -eq "latest") {
     $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
     $Tag = $Release.tag_name
-} else {
+}
+else {
     $Tag = $Version
 }
 
@@ -35,14 +36,32 @@ try {
     $ExtractDir = Join-Path $TmpDir "extracted"
     Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    Copy-Item -Path (Join-Path $ExtractDir "bin\arc.exe") -Destination (Join-Path $InstallDir "arc.exe") -Force
+    $InstalledExe = Join-Path $InstallDir "arc.exe"
+    Copy-Item -Path (Join-Path $ExtractDir "bin\arc.exe") -Destination $InstalledExe -Force
 
+    # Prepend InstallDir to User PATH so the newly installed binary takes precedence
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($UserPath -notlike "*$InstallDir*") {
-        [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
-        Write-Host "Added $InstallDir to your User PATH (restart your terminal to use 'arc')."
+        $NewUserPath = if ([string]::IsNullOrWhiteSpace($UserPath)) { $InstallDir } else { "$InstallDir;$UserPath" }
+        [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+        Write-Host "Added $InstallDir to your User PATH."
     }
-    Write-Host "Installed arc.exe to $(Join-Path $InstallDir 'arc.exe')"
-} finally {
+    if ($env:Path -notlike "*$InstallDir*") {
+        $env:Path = "$InstallDir;$env:Path"
+    }
+
+    Write-Host "Installed arc.exe to $InstalledExe"
+
+    # Warn if an older arc binary earlier in PATH shadows this installation
+    $FirstResolved = Get-Command arc -ErrorAction SilentlyContinue
+    if ($FirstResolved -and $FirstResolved.Source -and ($FirstResolved.Source -ne $InstalledExe)) {
+        Write-Host ""
+        Write-Host "[WARN] Another 'arc' binary earlier in PATH is shadowing this installation:" -ForegroundColor Yellow
+        Write-Host "       Shadowing: $($FirstResolved.Source)" -ForegroundColor Yellow
+        Write-Host "       Installed: $InstalledExe" -ForegroundColor Yellow
+        Write-Host "       Remove the older binary (e.g. Remove-Item '$($FirstResolved.Source)') or move $InstallDir earlier in PATH." -ForegroundColor Yellow
+    }
+}
+finally {
     Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }

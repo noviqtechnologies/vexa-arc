@@ -74,17 +74,24 @@ Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; 
 ## Quick Start (30 Seconds)
 
 ### 1. Install Prebuilt Binary or Run via `npx`
-```bash
-# macOS / Linux (one-liner):
-curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.sh | sh
 
-# Zero-install via Node.js (macOS / Linux / Windows):
-npx @vexasec/arc init
-```
+**Windows (PowerShell):**
 ```powershell
-# Windows (PowerShell):
 irm https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.ps1 | iex
 ```
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.sh | sh
+```
+
+**Zero-install via Node.js (macOS / Linux / Windows):**
+```bash
+npx @vexasec/arc init
+```
+
+> [!NOTE]
+> Both installers prepend the install directory to `PATH` and warn if an older `arc` binary (e.g. from `~/.cargo/bin`) is shadowing the new release. Running `arc init` from a default home terminal (`~` or `C:\Users\<user>`) automatically uses **workstation scope** (scanning only known IDE/AI config roots) so it never hangs walking your home directory; running `arc init` inside a project repository uses **project scope** with a bounded quick-scan.
 
 Or build from source with the Rust toolchain (`>= 1.97.0`):
 ```bash

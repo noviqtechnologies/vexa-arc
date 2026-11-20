@@ -72,6 +72,14 @@ chmod +x "$INSTALL_DIR/arc"
 
 echo "Installed arc to $INSTALL_DIR/arc"
 case ":$PATH:" in
-  *":$INSTALL_DIR:"*) ;;
+  *":$INSTALL_DIR:"*)
+    RESOLVED_BIN="$(command -v arc 2>/dev/null || true)"
+    if [ -n "$RESOLVED_BIN" ] && [ "$RESOLVED_BIN" != "$INSTALL_DIR/arc" ]; then
+      echo "[WARN] Another 'arc' binary earlier in PATH is shadowing this installation:" >&2
+      echo "       Shadowing: $RESOLVED_BIN" >&2
+      echo "       Installed: $INSTALL_DIR/arc" >&2
+      echo "       Remove the older binary or prepend $INSTALL_DIR to your PATH." >&2
+    fi
+    ;;
   *) echo "Add $INSTALL_DIR to your PATH: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac

@@ -300,13 +300,37 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
         install_windsurf,
     );
 
-    // 3. Instant repository discovery + secret check
+    // 3. Instant discovery + secret check (workstation-scoped if run in $HOME / root,
+    //    bounded quick-scan if run in a project repository so `arc init` never hangs)
+    let is_workstation_scope = vexa_core::fs_guard::is_unsafe_recursive_scan_root(path);
     let scanner = DiscoveryScanner::new();
-    let audit_report = match scanner.audit_directory(path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[Arc Init] Discovery scan failed: {e}");
-            return false;
+    let audit_report = if is_workstation_scope {
+        if !json {
+            eprintln!(
+                "[Arc Init] Home/root directory detected ({}) — using workstation scope (known IDE/AI config roots only).",
+                path.display()
+            );
+            eprintln!(
+                "[Arc Init] Tip: Run `arc init` inside a project repository for project-scoped policy & repo audit."
+            );
+        }
+        match scanner.audit_workstation() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[Arc Init] Workstation discovery scan failed: {e}");
+                return false;
+            }
+        }
+    } else {
+        if !json {
+            eprintln!("[Arc Init] Running quick discovery scan...");
+        }
+        match scanner.audit_directory_bounded(path, 5_000, std::time::Duration::from_secs(5)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[Arc Init] Discovery scan failed: {e}");
+                return false;
+            }
         }
     };
 
@@ -315,6 +339,7 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
             "{}",
             serde_json::json!({
                 "success": true,
+                "scope": if is_workstation_scope { "workstation" } else { "project" },
                 "path": path.display().to_string(),
                 "policy_path": policy_path.display().to_string(),
                 "policy_created": policy_created,
@@ -330,6 +355,7 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
                     "exposed_secrets": audit_report.exposed_secrets.len(),
                     "overall_risk_band": format!("{:?}", audit_report.overall_risk_band).to_lowercase(),
                     "scan_duration_ms": audit_report.scan_duration_ms,
+                    "truncated": audit_report.truncated,
                 }
             })
         );
@@ -339,6 +365,14 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     println!("\n=======================================================");
     println!("               VEXA ARC INITIALIZED                    ");
     println!("=======================================================");
+    println!(
+        "Scope:           {}",
+        if is_workstation_scope {
+            "workstation (home/root directory detected)"
+        } else {
+            "project"
+        }
+    );
     println!(
         "Policy:          {} ({})",
         policy_path.display(),
@@ -376,9 +410,14 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
         audit_report.model_assets.len()
     );
     println!(
-        "Exposed Secrets: {} finding(s) (scan took {} ms)",
+        "Exposed Secrets: {} finding(s) (scan took {} ms{})",
         audit_report.exposed_secrets.len(),
-        audit_report.scan_duration_ms
+        audit_report.scan_duration_ms,
+        if audit_report.truncated {
+            "; quick-scan capped — run `arc audit` for full scan"
+        } else {
+            ""
+        }
     );
     for w in &hook_warnings {
         println!("[WARN] {w}");

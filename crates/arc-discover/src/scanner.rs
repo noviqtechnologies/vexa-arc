@@ -59,6 +59,50 @@ pub struct AuditReport {
     pub excluded_paths: Vec<PathBuf>,
     #[serde(default)]
     pub permission_errors: Vec<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Default)]
+struct ScanBudget {
+    max_files: Option<usize>,
+    deadline: Option<std::time::Instant>,
+    files_scanned: usize,
+    truncated: bool,
+}
+
+impl ScanBudget {
+    fn unbounded() -> Self {
+        Self::default()
+    }
+
+    fn bounded(max_files: usize, max_duration: std::time::Duration) -> Self {
+        Self {
+            max_files: Some(max_files),
+            deadline: Some(std::time::Instant::now() + max_duration),
+            files_scanned: 0,
+            truncated: false,
+        }
+    }
+
+    fn is_exhausted(&mut self) -> bool {
+        if self.truncated {
+            return true;
+        }
+        if let Some(limit) = self.max_files {
+            if self.files_scanned >= limit {
+                self.truncated = true;
+                return true;
+            }
+        }
+        if let Some(deadline) = self.deadline {
+            if std::time::Instant::now() >= deadline {
+                self.truncated = true;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub struct DiscoveryScanner {
@@ -129,6 +173,25 @@ impl DiscoveryScanner {
 
     /// Performs zero-touch discovery of all AI assets, MCP servers, skills, and secrets.
     pub fn audit_directory(&self, root: &Path) -> io::Result<AuditReport> {
+        self.audit_directory_with_budget(root, ScanBudget::unbounded())
+    }
+
+    /// Performs bounded zero-touch discovery capped by file count and wall-clock duration
+    /// (used by `arc init` to guarantee sub-second / bounded onboarding even in large monorepos).
+    pub fn audit_directory_bounded(
+        &self,
+        root: &Path,
+        max_files: usize,
+        max_duration: std::time::Duration,
+    ) -> io::Result<AuditReport> {
+        self.audit_directory_with_budget(root, ScanBudget::bounded(max_files, max_duration))
+    }
+
+    fn audit_directory_with_budget(
+        &self,
+        root: &Path,
+        mut budget: ScanBudget,
+    ) -> io::Result<AuditReport> {
         if !root.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -159,6 +222,7 @@ impl DiscoveryScanner {
         self.scan_recursive(
             root,
             0,
+            &mut budget,
             &mut mcp_servers,
             &mut agent_skills,
             &mut model_assets,
@@ -197,12 +261,14 @@ impl DiscoveryScanner {
             unscanned_locations,
             excluded_paths,
             permission_errors,
+            truncated: budget.truncated,
         })
     }
 
     /// Opt-in workstation audit mode scanning known host roots across Windows, macOS, and Linux (FR-DISC-002)
     pub fn audit_workstation(&self) -> io::Result<AuditReport> {
         let start = std::time::Instant::now();
+        let mut budget = ScanBudget::bounded(10_000, std::time::Duration::from_secs(10));
         let mut mcp_servers = Vec::new();
         let mut agent_skills = Vec::new();
         let mut model_assets = Vec::new();
@@ -214,11 +280,16 @@ impl DiscoveryScanner {
 
         let roots = get_workstation_roots();
         for root in roots {
+            if budget.is_exhausted() {
+                unscanned_locations.push(root);
+                continue;
+            }
             if root.exists() && root.is_dir() {
                 scanned_locations.push(root.clone());
                 self.scan_recursive(
                     &root,
                     0,
+                    &mut budget,
                     &mut mcp_servers,
                     &mut agent_skills,
                     &mut model_assets,
@@ -258,6 +329,7 @@ impl DiscoveryScanner {
             unscanned_locations,
             excluded_paths,
             permission_errors,
+            truncated: budget.truncated,
         })
     }
 
@@ -266,6 +338,7 @@ impl DiscoveryScanner {
         &self,
         current: &Path,
         depth: usize,
+        budget: &mut ScanBudget,
         mcp_servers: &mut Vec<DiscoveredMcpServer>,
         agent_skills: &mut Vec<DiscoveredAgentSkill>,
         model_assets: &mut Vec<DiscoveredModelAsset>,
@@ -275,7 +348,7 @@ impl DiscoveryScanner {
         excluded_paths: &mut Vec<PathBuf>,
         permission_errors: &mut Vec<String>,
     ) {
-        if depth > 10 {
+        if depth > 10 || budget.is_exhausted() {
             unscanned_locations.push(current.to_path_buf());
             return;
         }
@@ -292,25 +365,34 @@ impl DiscoveryScanner {
         };
 
         for entry in entries.flatten() {
-            let path = entry.path();
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if budget.is_exhausted() {
+                unscanned_locations.push(entry.path());
+                return;
+            }
 
-            // Skip heavy build / source-control directories
-            if file_name == ".git"
-                || file_name == "target"
-                || file_name == "node_modules"
-                || file_name == ".venv"
-                || file_name == "venv"
-            {
+            let path = entry.path();
+            if vexa_core::fs_guard::is_symlink_or_reparse_point(&entry) {
                 excluded_paths.push(path);
                 continue;
             }
 
-            if path.is_dir() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // Skip heavy OS, package-cache, build, and VCS directories across Windows/macOS/Linux
+            if ft.is_dir() && vexa_core::fs_guard::is_os_heavy_dir(file_name) {
+                excluded_paths.push(path);
+                continue;
+            }
+
+            if ft.is_dir() {
                 scanned_locations.push(path.clone());
                 self.scan_recursive(
                     &path,
                     depth + 1,
+                    budget,
                     mcp_servers,
                     agent_skills,
                     model_assets,
@@ -320,7 +402,8 @@ impl DiscoveryScanner {
                     excluded_paths,
                     permission_errors,
                 );
-            } else if path.is_file() {
+            } else if ft.is_file() {
+                budget.files_scanned += 1;
                 self.inspect_file(
                     &path,
                     file_name,
@@ -644,5 +727,38 @@ mod tests {
             total_reported_locations > 0,
             "Must report inspected workstation roots"
         );
+    }
+
+    #[test]
+    fn test_bounded_scan_and_os_heavy_dir_exclusion() {
+        let scanner = DiscoveryScanner::new();
+        let temp_dir =
+            std::env::temp_dir().join(format!("vexa_arc_bounded_{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(temp_dir.join("AppData").join("Roaming")).unwrap();
+        fs::create_dir_all(temp_dir.join("Library")).unwrap();
+        fs::create_dir_all(temp_dir.join("src")).unwrap();
+        fs::write(
+            temp_dir.join("AppData").join("Roaming").join("skip.mdc"),
+            "# should never be scanned",
+        )
+        .unwrap();
+        for i in 0..10 {
+            fs::write(temp_dir.join("src").join(format!("file_{i}.txt")), "hello").unwrap();
+        }
+
+        let rep = scanner
+            .audit_directory_bounded(&temp_dir, 3, std::time::Duration::from_secs(5))
+            .expect("Bounded scan must succeed");
+        assert!(rep.truncated, "Should report truncation when file cap hit");
+        assert!(
+            rep.agent_skills.is_empty(),
+            "AppData should be excluded from discovery"
+        );
+        assert!(
+            rep.excluded_paths.iter().any(|p| p.ends_with("AppData")),
+            "AppData must appear in excluded_paths"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
