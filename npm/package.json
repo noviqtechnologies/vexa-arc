@@ -1,17 +1,21 @@
 {
   "name": "@vexasec/arc",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "publishConfig": {
     "access": "public"
   },
   "description": "Zero-friction CLI wrapper for Vexa Arc: local AI agent security engine & MCP policy broker",
   "bin": {
-    "arc": "./bin/arc.js"
+    "arc": "bin/arc.js"
   },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/noviqtechnologies/vexa-arc.git"
+    "url": "git+https://github.com/noviqtechnologies/vexa-arc.git"
   },
   "engines": {
     "node": ">=18"
