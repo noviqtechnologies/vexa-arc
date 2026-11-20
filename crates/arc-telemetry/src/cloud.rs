@@ -88,6 +88,19 @@ impl VexaCloudAuth {
     }
 
     pub fn load_stored_credentials() -> Option<StoredVexaCredentials> {
+        // Isolate `cargo test` (unit & integration tests) from the developer's real
+        // `~/.vexa/credentials.json` unless a test explicitly sets `VEXA_CREDENTIALS_PATH`.
+        let has_explicit_cred_path = std::env::var_os("VEXA_CREDENTIALS_PATH")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let in_cargo_test = cfg!(test)
+            || std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        if in_cargo_test && !has_explicit_cred_path {
+            return None;
+        }
+
         let path = Self::credentials_path();
         if !path.exists() {
             return None;
