@@ -39,7 +39,8 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<ParsedHttpRequest, 
         .to_string();
 
     let mut headers = HashMap::new();
-    let mut content_length: usize = 0;
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
     loop {
         let mut line = String::new();
         let bytes = reader
@@ -53,25 +54,52 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<ParsedHttpRequest, 
             let key = k.trim().to_ascii_lowercase();
             let val = v.trim().to_string();
             if key == "content-length" {
-                content_length = val.parse::<usize>().unwrap_or(0);
+                let parsed = val
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid Content-Length header '{val}'"))?;
+                if let Some(prev) = content_length {
+                    if prev != parsed {
+                        return Err("conflicting Content-Length headers".to_string());
+                    }
+                }
+                content_length = Some(parsed);
+            } else if key == "transfer-encoding" {
+                let lower = val.to_ascii_lowercase();
+                if lower.split(',').map(str::trim).any(|enc| enc == "chunked") {
+                    is_chunked = true;
+                } else {
+                    return Err(format!("unsupported Transfer-Encoding '{val}'"));
+                }
             }
             headers.insert(key, val);
         }
     }
 
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(format!(
-            "HTTP body size {content_length} exceeds max {MAX_HTTP_BODY_BYTES} bytes"
-        ));
+    if is_chunked && content_length.is_some() {
+        return Err(
+            "ambiguous HTTP framing: both Transfer-Encoding: chunked and Content-Length present"
+                .to_string(),
+        );
     }
 
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader
-            .read_exact(&mut body)
-            .await
-            .map_err(|e| format!("read body failed: {e}"))?;
-    }
+    let body = if is_chunked {
+        read_chunked_body(&mut reader, MAX_HTTP_BODY_BYTES).await?
+    } else {
+        let len = content_length.unwrap_or(0);
+        if len > MAX_HTTP_BODY_BYTES {
+            return Err(format!(
+                "HTTP body size {len} exceeds max {MAX_HTTP_BODY_BYTES} bytes"
+            ));
+        }
+        let mut buf = vec![0u8; len];
+        if len > 0 {
+            reader
+                .read_exact(&mut buf)
+                .await
+                .map_err(|e| format!("read body failed: {e}"))?;
+        }
+        buf
+    };
 
     Ok(ParsedHttpRequest {
         method,
@@ -79,6 +107,60 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<ParsedHttpRequest, 
         headers,
         body,
     })
+}
+
+async fn read_chunked_body<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        let n = reader
+            .read_line(&mut size_line)
+            .await
+            .map_err(|e| format!("read chunk size failed: {e}"))?;
+        if n == 0 {
+            return Err("unexpected EOF while reading chunked body".to_string());
+        }
+        let size_hex = size_line
+            .trim()
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let chunk_len = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| format!("invalid chunk size '{size_hex}'"))?;
+        if chunk_len == 0 {
+            // Drain optional trailers until blank line
+            loop {
+                let mut trailer = String::new();
+                let tn = reader
+                    .read_line(&mut trailer)
+                    .await
+                    .map_err(|e| format!("read chunk trailer failed: {e}"))?;
+                if tn == 0 || trailer == "\r\n" || trailer == "\n" {
+                    break;
+                }
+            }
+            break;
+        }
+        if out.len().saturating_add(chunk_len) > max_bytes {
+            return Err(format!(
+                "chunked HTTP body exceeds max {max_bytes} bytes"
+            ));
+        }
+        let start = out.len();
+        out.resize(start + chunk_len, 0);
+        reader
+            .read_exact(&mut out[start..])
+            .await
+            .map_err(|e| format!("read chunk data failed: {e}"))?;
+        // Consume trailing CRLF after chunk payload
+        let mut crlf = String::new();
+        let _ = reader.read_line(&mut crlf).await;
+    }
+    Ok(out)
 }
 
 async fn write_http_response(
@@ -121,9 +203,20 @@ fn build_target_url(base: &str, req_path: &str) -> String {
     }
 }
 
-fn process_sse_chunk(broker: &mut McpStdioBroker, chunk: &str) -> String {
-    let mut out = String::with_capacity(chunk.len());
-    for line in chunk.split_inclusive('\n') {
+/// Stateful line-buffered SSE mediator that reassembles `data: ...` JSON-RPC frames
+/// split across arbitrary TCP chunk boundaries before passing them to `McpStdioBroker`.
+struct SseStreamMediator {
+    pending: String,
+}
+
+impl SseStreamMediator {
+    fn new() -> Self {
+        Self {
+            pending: String::new(),
+        }
+    }
+
+    fn mediate_line(broker: &mut McpStdioBroker, line: &str) -> String {
         if let Some(rest) = line.strip_prefix("data:") {
             let trimmed = rest.trim();
             if !trimmed.is_empty() && trimmed != "[DONE]" && trimmed.starts_with('{') {
@@ -140,16 +233,44 @@ fn process_sse_chunk(broker: &mut McpStdioBroker, chunk: &str) -> String {
                         forward_line
                     }
                 };
+                let mut out = String::with_capacity(mediated.len() + 8);
                 out.push_str("data: ");
-                out.push_str(mediated.trim_end_matches('\n'));
-                if line.ends_with('\n') {
+                out.push_str(mediated.trim_end_matches(['\r', '\n']));
+                if line.ends_with("\r\n") {
+                    out.push_str("\r\n");
+                } else if line.ends_with('\n') {
                     out.push('\n');
                 }
-                continue;
+                return out;
             }
         }
-        out.push_str(line);
+        line.to_string()
     }
+
+    fn push_chunk(&mut self, broker: &mut McpStdioBroker, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        let mut out = String::with_capacity(chunk.len());
+        while let Some(pos) = self.pending.find('\n') {
+            let line: String = self.pending.drain(..=pos).collect();
+            out.push_str(&Self::mediate_line(broker, &line));
+        }
+        out
+    }
+
+    fn finish(&mut self, broker: &mut McpStdioBroker) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let remainder = std::mem::take(&mut self.pending);
+        Self::mediate_line(broker, &remainder)
+    }
+}
+
+#[cfg(test)]
+fn process_sse_chunk(broker: &mut McpStdioBroker, chunk: &str) -> String {
+    let mut mediator = SseStreamMediator::new();
+    let mut out = mediator.push_chunk(broker, chunk);
+    out.push_str(&mediator.finish(broker));
     out
 }
 
@@ -304,15 +425,24 @@ async fn handle_connection(
         if stream.write_all(head.as_bytes()).await.is_err() {
             return;
         }
+        let mut sse = SseStreamMediator::new();
         while let Ok(Some(chunk)) = upstream_resp.chunk().await {
             let text = String::from_utf8_lossy(&chunk);
             let mediated = {
                 let mut guard = broker.lock().await;
-                process_sse_chunk(&mut guard, &text)
+                sse.push_chunk(&mut guard, &text)
             };
-            if stream.write_all(mediated.as_bytes()).await.is_err() {
+            if !mediated.is_empty() && stream.write_all(mediated.as_bytes()).await.is_err() {
                 break;
             }
+            let _ = stream.flush().await;
+        }
+        let tail = {
+            let mut guard = broker.lock().await;
+            sse.finish(&mut guard)
+        };
+        if !tail.is_empty() {
+            let _ = stream.write_all(tail.as_bytes()).await;
             let _ = stream.flush().await;
         }
         return;
@@ -514,5 +644,63 @@ mod tests {
         let out = process_sse_chunk(&mut broker, chunk);
         assert!(out.contains("Hi!"));
         assert!(!out.contains("\\u200B"));
+    }
+
+    #[test]
+    fn sse_stream_mediator_reassembles_json_split_across_tcp_chunks() {
+        let mut broker = McpStdioBroker::new("github", "sse-split", PolicyEvaluator::default());
+        let mut sse = SseStreamMediator::new();
+        let part1 = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",";
+        let part2 = "\"text\":\"Split\\u200BPayload\\u202E\"}]}}\n\n";
+
+        let out1 = sse.push_chunk(&mut broker, part1);
+        let out2 = sse.push_chunk(&mut broker, part2);
+        let tail = sse.finish(&mut broker);
+        let combined = format!("{out1}{out2}{tail}");
+
+        assert!(combined.contains("SplitPayload"), "combined={combined}");
+        assert!(!combined.contains('\u{200B}'));
+        assert!(!combined.contains('\u{202E}'));
+    }
+
+    #[tokio::test]
+    async fn read_http_request_decodes_chunked_transfer_encoding_and_rejects_smuggling() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let body_json = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#;
+        let split_at = 18;
+        let c1 = &body_json[..split_at];
+        let c2 = &body_json[split_at..];
+        let raw_chunked = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            c1.len(),
+            c1,
+            c2.len(),
+            c2
+        );
+
+        let writer = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(raw_chunked.as_bytes()).await.unwrap();
+            let _ = client.shutdown().await;
+        });
+
+        let (mut srv, _) = listener.accept().await.unwrap();
+        let req = read_http_request(&mut srv).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(String::from_utf8(req.body).unwrap(), body_json);
+
+        // Dual Transfer-Encoding + Content-Length must be rejected (HTTP request smuggling protection)
+        let smuggle_raw = "POST /mcp HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let writer2 = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(smuggle_raw.as_bytes()).await.unwrap();
+            let _ = client.shutdown().await;
+        });
+        let (mut srv2, _) = listener.accept().await.unwrap();
+        let err = read_http_request(&mut srv2).await.unwrap_err();
+        writer2.await.unwrap();
+        assert!(err.contains("ambiguous HTTP framing"), "err={err}");
     }
 }

@@ -163,6 +163,12 @@ enum Commands {
         action: TelemetryAction,
     },
 
+    /// Sync and verify signed organization policies from Vexa Cloud
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+
     /// Manage, inspect DAG, report operational audit logs, and resolve storage for sessions (Pillar 2)
     Session {
         #[command(subcommand)]
@@ -173,6 +179,21 @@ enum Commands {
     Sca {
         #[command(subcommand)]
         action: ScaAction,
+    },
+
+    /// One-command workstation onboarding: browser Device Flow login, IDE hooks, signed policy sync, and registration
+    Setup {
+        /// Override Vexa Cloud API base URL (persisted for future hooks/syncs)
+        #[arg(long)]
+        api_url: Option<String>,
+
+        /// Optional PAT token for non-interactive CI/headless setup
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Output setup summary as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Zero-friction project onboarding: create .arc/policy.json, install IDE hooks, and run quick audit
@@ -406,6 +427,28 @@ enum TelemetryAction {
     Export {
         #[arg(short, long)]
         out: PathBuf,
+    },
+    /// Flush spooled zero-code runtime events & endpoint heartbeat to Vexa Cloud
+    Flush {
+        /// Override Vexa Cloud API base URL
+        #[arg(long)]
+        api_url: Option<String>,
+        /// Suppress stdout output
+        #[arg(long)]
+        quiet: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Fetch, verify (Ed25519 + JCS), and pin the organization's signed policy bundle
+    Sync {
+        /// Project directory where .arc/signed_policy.json will be written
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Override Vexa Cloud API base URL
+        #[arg(long)]
+        api_url: Option<String>,
     },
 }
 
@@ -1219,6 +1262,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Policy { action } => match action {
+            PolicyAction::Sync { path, api_url } => {
+                if !run_policy_sync(&path, api_url.as_deref()) {
+                    std::process::exit(1);
+                }
+            }
+        },
         Commands::Session { action } => match action {
             SessionAction::Dag {
                 session_id,
@@ -1330,6 +1380,20 @@ fn main() {
                 }
             }
         },
+        Commands::Setup {
+            api_url,
+            token,
+            json,
+        } => {
+            if !commands::setup::run_setup(
+                api_url.as_deref(),
+                token.as_deref(),
+                json,
+                run_policy_sync,
+            ) {
+                std::process::exit(1);
+            }
+        }
         Commands::Init {
             path,
             host,
@@ -1696,7 +1760,106 @@ fn run_telemetry(action: TelemetryAction) -> bool {
                 false
             }
         },
+        TelemetryAction::Flush { api_url, quiet } => {
+            let flushed = arc_telemetry::flush_arc_event_spool(api_url.as_deref());
+            let hb = commands::setup::build_workstation_heartbeat(Path::new("."));
+            let hb_ok = arc_telemetry::emit_cloud_heartbeat(&hb, api_url.as_deref());
+            if !quiet {
+                println!(
+                    "[Arc Telemetry] Flushed {flushed} event(s); heartbeat={hb_ok} (policy seq #{})",
+                    hb.active_policy_seq
+                );
+            }
+            true
+        }
     }
+}
+
+fn run_policy_sync(project_dir: &Path, api_url: Option<&str>) -> bool {
+    let bundle = match arc_telemetry::fetch_signed_policy_bundle(api_url) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[Arc Policy] {e}");
+            return false;
+        }
+    };
+
+    let Some(trusted_key) = bundle.get("trusted_key").and_then(|v| v.as_str()) else {
+        eprintln!("[Arc Policy] Server response missing trusted_key");
+        return false;
+    };
+    let Some(envelope) = bundle.get("signed_envelope") else {
+        eprintln!("[Arc Policy] Server response missing signed_envelope");
+        return false;
+    };
+    let seq = bundle
+        .get("sequence")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let arc_dir = project_dir.join(".arc");
+    if let Err(e) = fs::create_dir_all(&arc_dir) {
+        eprintln!("[Arc Policy] Failed to create {}: {e}", arc_dir.display());
+        return false;
+    }
+    let state_path = arc_dir.join("policy-state.json");
+    let local_min_seq = if state_path.exists() {
+        fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("min_sequence").and_then(|s| s.as_u64()))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    if seq < local_min_seq {
+        eprintln!(
+            "[Arc Policy] Rollback rejected: server sequence {seq} < local min_sequence {local_min_seq}"
+        );
+        return false;
+    }
+
+    let keys = match arc_policy_engine::evaluator::parse_trusted_policy_keys(trusted_key) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[Arc Policy] Invalid trusted_key from server: {e}");
+            return false;
+        }
+    };
+
+    let env_str = serde_json::to_string_pretty(envelope).unwrap_or_default();
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    if let Err(e) =
+        arc_policy_engine::evaluator::parse_signed_policy(&env_str, &keys, local_min_seq, now_ms)
+    {
+        eprintln!("[Arc Policy] Signature verification failed: {e}");
+        return false;
+    }
+
+    let policy_path = arc_dir.join("signed_policy.json");
+    if let Err(e) = fs::write(&policy_path, env_str.as_bytes()) {
+        eprintln!("[Arc Policy] Failed to write {}: {e}", policy_path.display());
+        return false;
+    }
+    let state_body = serde_json::json!({
+        "trusted_key": trusted_key,
+        "min_sequence": seq,
+        "synced_at": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Err(e) = fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state_body).unwrap_or_default(),
+    ) {
+        eprintln!("[Arc Policy] Failed to write {}: {e}", state_path.display());
+        return false;
+    }
+
+    println!(
+        "[Arc Policy] Verified & synced signed organization policy (sequence #{seq}) to {}",
+        policy_path.display()
+    );
+    true
 }
 
 fn run_doctor(json: bool, metrics: bool) -> bool {
@@ -3318,31 +3481,33 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
 
         // Post-phase hooks only report results for taint tracking; they never block.
         if event.phase == Phase::Pre && !verdict.is_allowed() {
-            let rule_str = verdict_rule(verdict).unwrap_or_else(|| "ARC-POLICY-BLOCK".to_string());
-            let reason_str = match verdict {
-                arc_core::verdict::Verdict::Deny { explanation, .. }
-                | arc_core::verdict::Verdict::Quarantine { explanation, .. }
-                | arc_core::verdict::Verdict::RequireApproval { explanation, .. } => {
-                    explanation.summary.clone()
-                }
-                arc_core::verdict::Verdict::Allow { .. } => {
-                    "Unapplied DLP redaction blocked".to_string()
-                }
-            };
-            let _ = arc_telemetry::emit_cloud_firewall_event(
-                &arc_telemetry::CloudFirewallEvent {
-                    package: format!("{}:{}", action_class(event), target_class(event)),
-                    version: "pre-hook".to_string(),
-                    ecosystem: format!("arc-hook:{host}"),
-                    action: "BLOCKED".to_string(),
-                    rule_triggered: rule_str,
-                    reason: reason_str,
-                    actor: arc_telemetry::VexaCloudAuth::current_actor(),
-                    os: std::env::consts::OS.to_string(),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                },
-                None,
-            );
+            let mut cloud_tel = TelemetryEventBuilder {
+                action_class: action_class(event).to_string(),
+                decision: verdict_decision(verdict).to_string(),
+                rule_id: verdict_rule(verdict),
+                taint_flags: taint_names(observation.taints_after),
+                sink_class: Some(sink_class_name(observation.sink_class)),
+                target_class: target_class(event).to_string(),
+                session_id_hash: arc_telemetry::hash_identifier(&event.host_session_id),
+                project_id_hash: std::env::current_dir()
+                    .ok()
+                    .map(|p| arc_telemetry::hash_identifier(&p.to_string_lossy())),
+                schema_pin_status: None,
+                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                error_class: None,
+            }
+            .build(host, Some("native_hook"));
+            cloud_tel.phase = "pre".to_string();
+            let repo_name = std::env::var("GITHUB_REPOSITORY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                });
+            let _ = arc_telemetry::spool_arc_event(&cloud_tel, repo_name.as_deref());
+            let _ = arc_telemetry::maybe_spawn_background_flush(60);
             response = adapter.encode(verdict);
             break;
         }
@@ -4766,6 +4931,36 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
     let updated_dag = evaluator.taint_tracker.get_or_create(session);
     let current_taints = updated_dag.current_taints;
     let newly_added_taints = current_taints - prev_taints;
+
+    if verdict.is_blocked() {
+        let mut cloud_tel = TelemetryEventBuilder {
+            action_class: action_class(&event).to_string(),
+            decision: verdict_decision(&verdict).to_string(),
+            rule_id: verdict_rule(&verdict),
+            taint_flags: taint_names(current_taints),
+            sink_class: None,
+            target_class: target_class(&event).to_string(),
+            session_id_hash: arc_telemetry::hash_identifier(session),
+            project_id_hash: std::env::current_dir()
+                .ok()
+                .map(|p| arc_telemetry::hash_identifier(&p.to_string_lossy())),
+            schema_pin_status: None,
+            latency_ms: 0.5,
+            error_class: None,
+        }
+        .build("cli_intercept", Some("cli"));
+        cloud_tel.phase = "pre".to_string();
+        let repo_name = std::env::var("GITHUB_REPOSITORY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            });
+        let _ = arc_telemetry::spool_arc_event(&cloud_tel, repo_name.as_deref());
+        let _ = arc_telemetry::maybe_spawn_background_flush(60);
+    }
 
     if opts.json {
         let json_output = serde_json::json!({

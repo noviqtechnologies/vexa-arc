@@ -94,6 +94,7 @@ flowchart BT
 
 * **`#![forbid(unsafe_code)]`** is enforced across domain logic crates.
 * Libraries use **`thiserror`**; the CLI binary handles user-facing errors cleanly.
+* `arc-firewall` consumes the shared **`vexa-sca`** and **`vexa-core`** crates (`noviqtechnologies/vexa-sca` tag `v1.4.0`) so local `arc shield` / `arc sca audit` and Vexa Cloud run the exact same OSV, `MAL-*`, CVSS, and AST reachability engine.
 
 ---
 
@@ -312,7 +313,7 @@ pub struct SessionTaintDag {
 - `check_field_level_lethal_trifecta(field, sink)` — tests the trifecta only for a specific field.
 - `check_event_trifecta_with_target(target, sink)` — tests using path-level granularity.
 - **Benign isolation:** Local commands (`git status`, `git diff`, `git log`, `cargo test`, `npm test`) bypass the session bitmask check entirely via `is_benign_local_command()`.
-- `compute_integrity_hash()` deterministically incorporates sorted field and path taints, preventing hash manipulation.
+- `compute_integrity_hash()` computes a **keyed HMAC-SHA256** authentication tag (using a per-workstation 32-byte key in `~/.arc/session.key` with mode `0600` on Unix or `ARC_SESSION_HMAC_KEY` in CI) over sorted `known_schemas`, `field_taints`, `path_taints`, `expires_at_ms`, and causal history. `verify_integrity()` verifies in constant time and **fails closed** if `integrity_hash` is missing, malformed, or mismatched.
 
 ### Threat-Modeled Human Approval Subsystem (`arc-policy-engine::approval`)
 
@@ -613,3 +614,12 @@ Enterprise is a separate managed-service and endpoint-operations problem. Before
 ### Tier implementation rule
 
 Do not split the core security logic into artificially weaker paid/free variants. Keep the local engine and basic protections available in Community; future paid value should come from coordination, administration, validated integrations, fleet operations, auditability, and support. Keep the tier-to-code boundary in adapters/services rather than embedding pricing checks in policy evaluation. Any proposed closed component requires a documented threat model, license/open-core decision, and compatibility contract before implementation.
+
+
+---
+
+## Multi-Environment Onboarding & Cross-OS Background Sync
+
+- **Persisted Environment URL (`StoredVexaCredentials.api_base_url`):** `arc setup --api-url <URL>` and `arc auth login --api-url <URL>` store `api_base_url` inside `~/.vexa/credentials.json`. Resolution precedence is: `--api-url` flag → `VEXA_API_URL` / `VEXA_API_BASE_URL` → stored `api_base_url` → default fallback.
+- **Cross-OS Detached Background Flush:** After spooling a blocked hook event to `arc_cloud_queue.jsonl`, `arc_telemetry::maybe_spawn_background_flush(60)` checks `last_sync_at` (60s cooldown) and spawns a detached `arc telemetry flush --quiet` process (`CREATE_NO_WINDOW | DETACHED_PROCESS` on Windows, `Stdio::null()` on macOS/Linux) so pre-execution hooks never block on network I/O.
+- **Policy Sequence Reporting:** Heartbeats read `min_sequence` from `.arc/policy-state.json` (fallback `~/.arc/policy-state.json`) via `commands::setup::read_active_policy_sequence`.

@@ -309,6 +309,55 @@ pub fn build_vexa_facts_payload(path: &Path, report: &CiReport) -> serde_json::V
     })
 }
 
+pub fn build_arc_inventory_payload(path: &Path, report: &CiReport) -> serde_json::Value {
+    let project_name = std::env::var("VEXA_PROJECT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("GITHUB_REPOSITORY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            path.canonicalize()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        })
+        .unwrap_or_else(|| "workspace".to_string());
+
+    let risk_band = if !report.secrets.is_empty() || !report.unicode_anomalies.is_empty() {
+        "CRITICAL"
+    } else if !report.unpinned_mcp_servers.is_empty() {
+        "HIGH"
+    } else {
+        "LOW"
+    };
+
+    let mcp_servers: Vec<serde_json::Value> = report
+        .unpinned_mcp_servers
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "transport": "stdio",
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "source_type": "repo",
+        "source_name": project_name,
+        "install_id": arc_telemetry::install_id(),
+        "overall_risk_band": risk_band,
+        "mcp_servers": mcp_servers,
+        "agent_skills": [],
+        "model_assets": [],
+        "exposed_secrets_count": report.secrets.len(),
+        "unicode_anomalies_count": report.unicode_anomalies.len(),
+        "unpinned_mcp_count": report.unpinned_mcp_servers.len(),
+    })
+}
+
 pub fn upload_ci_report_to_cloud(
     path: &Path,
     report: &CiReport,
@@ -321,43 +370,58 @@ pub fn upload_ci_report_to_cloud(
         "Authentication required for `--upload`. Run `arc auth login --token <vexa_pat_...>` or set `VEXA_TOKEN`.".to_string()
     })?;
     let base_url = VexaCloudAuth::resolve_api_base_url(api_url);
-    let sync_url = format!("{}/facts/sync", base_url.trim_end_matches('/'));
-    let org_slug = VexaCloudAuth::get_org_slug();
-    let payload = build_vexa_facts_payload(path, report);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Failed to initialize async runtime: {e}"))?;
+    // 1. Always upload Arc AI-workspace inventory to dedicated /arc/inventory
+    let inv_payload = build_arc_inventory_payload(path, report);
+    let inv_res = arc_telemetry::upload_arc_inventory(&inv_payload, api_url)?;
+    let mut result_url = inv_res
+        .get("snapshot_id")
+        .and_then(|s| s.as_str())
+        .map(|id| format!("{base_url}/arc/inventory/{id}"))
+        .unwrap_or_else(|| base_url.clone());
 
-    rt.block_on(async move {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+    // 2. Only upload to SCA /facts/sync when actual SCA scan data is present
+    if report.sca.is_some() {
+        let sync_url = format!("{}/facts/sync", base_url.trim_end_matches('/'));
+        let org_slug = VexaCloudAuth::get_org_slug();
+        let payload = build_vexa_facts_payload(path, report);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
-            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-        let mut req = client
-            .post(&sync_url)
-            .header("Authorization", format!("Bearer {}", token.trim()));
-        if let Some(org) = org_slug {
-            req = req.header("X-Vexa-Org", org);
-        }
-        let resp = req
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to connect to Vexa Cloud ({sync_url}): {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("Cloud upload failed ({status}): {text}"));
-        }
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let dash = body
-            .get("dashboard_url")
-            .and_then(|d| d.as_str())
-            .unwrap_or(&base_url);
-        Ok(dash.to_string())
-    })
+            .map_err(|e| format!("Failed to initialize async runtime: {e}"))?;
+
+        result_url = rt.block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+            let mut req = client
+                .post(&sync_url)
+                .header("Authorization", format!("Bearer {}", token.trim()));
+            if let Some(org) = org_slug {
+                req = req.header("X-Vexa-Org", org);
+            }
+            let resp = req
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| format!("Failed to connect to Vexa Cloud ({sync_url}): {e}"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("Cloud upload failed ({status}): {text}"));
+            }
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let dash = body
+                .get("dashboard_url")
+                .and_then(|d| d.as_str())
+                .unwrap_or(&base_url);
+            Ok(dash.to_string())
+        })?;
+    }
+
+    Ok(result_url)
 }
 
 pub fn render_markdown_report(report: &CiReport) -> String {

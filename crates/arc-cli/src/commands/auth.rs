@@ -62,8 +62,12 @@ pub fn run_auth_login(token_opt: Option<&str>, api_url: Option<&str>, json: bool
         }
     }
 
-    let path =
-        match VexaCloudAuth::save_credentials(&token, org_slug.as_deref(), user_email.as_deref()) {
+    let path = match VexaCloudAuth::save_credentials_with_url(
+        &token,
+        org_slug.as_deref(),
+        user_email.as_deref(),
+        Some(&base_url),
+    ) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[Arc Auth] {e}");

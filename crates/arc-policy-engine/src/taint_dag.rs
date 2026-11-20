@@ -314,54 +314,183 @@ impl SessionTaintDag {
         Ok(target_path)
     }
 
-    /// Computes a tamper-evident SHA-256 integrity hash of this session's state (NFR-SEC-005)
-    pub fn compute_integrity_hash(&self) -> String {
+    /// Resolves the per-workstation 32-byte HMAC-SHA256 key used to authenticate persisted
+    /// session taint DAGs (NFR-SEC-005).
+    ///
+    /// Precedence:
+    /// 1. `ARC_SESSION_HMAC_KEY` environment variable (domain-separated SHA-256 KDF).
+    /// 2. Persisted 32-byte CSPRNG key in `~/.arc/session.key` (mode `0600` on Unix,
+    ///    stored in user profile outside the project workspace; symlink-refused).
+    fn resolve_session_hmac_key() -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(self.session_id.as_bytes());
-        hasher.update(self.current_taints.bits().to_le_bytes());
-        hasher.update(self.created_at_ms.to_le_bytes());
+
+        if let Ok(env_key) = std::env::var("ARC_SESSION_HMAC_KEY") {
+            let trimmed = env_key.trim();
+            if !trimmed.is_empty() {
+                let mut h = Sha256::new();
+                h.update(b"VEXA-ARC-SESSION-HMAC-ENV-V2\0");
+                h.update(trimmed.as_bytes());
+                return h.finalize().into();
+            }
+        }
+
+        let home_dir = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let arc_dir = home_dir.join(".arc");
+        let key_path = arc_dir.join("session.key");
+
+        if let Ok(meta) = std::fs::symlink_metadata(&key_path) {
+            if !meta.file_type().is_symlink() {
+                if let Ok(raw) = std::fs::read_to_string(&key_path) {
+                    if let Ok(bytes) = hex::decode(raw.trim()) {
+                        if bytes.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&bytes);
+                            return arr;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut key = [0u8; 32];
+        let rng = ring::rand::SystemRandom::new();
+        if ring::rand::SecureRandom::fill(&rng, &mut key).is_err() {
+            // Fallback CSPRNG seed from UUIDv4 if OS RNG call failed
+            key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        }
+
+        if std::fs::create_dir_all(&arc_dir).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&arc_dir, std::fs::Permissions::from_mode(0o700));
+            }
+            let tmp_path = arc_dir.join(format!("session.key.tmp.{}", uuid::Uuid::now_v7()));
+            let key_hex = hex::encode(key);
+            #[cfg(unix)]
+            let write_ok = {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .and_then(|mut f| {
+                        f.write_all(key_hex.as_bytes())?;
+                        f.sync_all()
+                    })
+                    .is_ok()
+            };
+            #[cfg(not(unix))]
+            let write_ok = std::fs::write(&tmp_path, key_hex.as_bytes()).is_ok();
+
+            if write_ok {
+                // Only install if another process did not race to create session.key first.
+                let is_symlink = std::fs::symlink_metadata(&key_path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                if !is_symlink && !key_path.exists() {
+                    if std::fs::rename(&tmp_path, &key_path).is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                } else {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    if !is_symlink {
+                        if let Ok(raw) = std::fs::read_to_string(&key_path) {
+                            if let Ok(bytes) = hex::decode(raw.trim()) {
+                                if bytes.len() == 32 {
+                                    key.copy_from_slice(&bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        key
+    }
+
+    /// Computes a keyed HMAC-SHA256 authentication tag over all security-relevant session
+    /// state fields in deterministic sorted order (NFR-SEC-005).
+    pub fn compute_integrity_hash(&self) -> String {
+        let key_bytes = Self::resolve_session_hmac_key();
+        let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
+        let mut ctx = ring::hmac::Context::with_key(&hmac_key);
+        ctx.update(b"VEXA-ARC-SESSION-TAG-V2\0");
+        ctx.update(self.session_id.as_bytes());
+        ctx.update(&self.current_taints.bits().to_le_bytes());
+        ctx.update(&self.created_at_ms.to_le_bytes());
+        if let Some(exp) = self.expires_at_ms {
+            ctx.update(&[1u8]);
+            ctx.update(&exp.to_le_bytes());
+        } else {
+            ctx.update(&[0u8]);
+        }
         for h in &self.history {
-            hasher.update(h.taint.bits().to_le_bytes());
-            hasher.update(h.origin.as_bytes());
-            hasher.update(h.timestamp_ms.to_le_bytes());
+            ctx.update(&h.taint.bits().to_le_bytes());
+            ctx.update(h.origin.as_bytes());
+            ctx.update(&h.timestamp_ms.to_le_bytes());
         }
         for n in &self.causal_nodes {
-            hasher.update(n.node_id.as_bytes());
-            hasher.update(n.action_summary.as_bytes());
-            hasher.update(n.taints_introduced.bits().to_le_bytes());
+            ctx.update(n.node_id.as_bytes());
+            ctx.update(n.action_summary.as_bytes());
+            ctx.update(&n.taints_introduced.bits().to_le_bytes());
         }
-        for (k, v) in &self.known_schemas {
-            hasher.update(k.as_bytes());
-            hasher.update(v);
+        let mut sorted_schema_keys: Vec<_> = self.known_schemas.keys().collect();
+        sorted_schema_keys.sort();
+        for k in sorted_schema_keys {
+            ctx.update(k.as_bytes());
+            if let Some(v) = self.known_schemas.get(k) {
+                ctx.update(v);
+            }
         }
         let mut sorted_field_keys: Vec<_> = self.field_taints.keys().collect();
         sorted_field_keys.sort();
         for k in sorted_field_keys {
-            hasher.update(k.as_bytes());
+            ctx.update(k.as_bytes());
             if let Some(t) = self.field_taints.get(k) {
-                hasher.update(t.bits().to_le_bytes());
+                ctx.update(&t.bits().to_le_bytes());
             }
         }
         let mut sorted_path_keys: Vec<_> = self.path_taints.keys().collect();
         sorted_path_keys.sort();
         for k in sorted_path_keys {
-            hasher.update(k.as_bytes());
+            ctx.update(k.as_bytes());
             if let Some(t) = self.path_taints.get(k) {
-                hasher.update(t.bits().to_le_bytes());
+                ctx.update(&t.bits().to_le_bytes());
             }
         }
-        hex::encode(hasher.finalize())
+        hex::encode(ctx.sign().as_ref())
     }
 
-    /// Verifies the session integrity hash against current contents (NFR-SEC-005)
+    /// Verifies the keyed HMAC-SHA256 session integrity tag in constant time (NFR-SEC-005).
+    /// Fails closed (`false`) if `integrity_hash` is missing, malformed, or mismatched.
     pub fn verify_integrity(&self) -> bool {
-        if let Some(ref hash) = self.integrity_hash {
-            let expected = self.compute_integrity_hash();
-            hash == &expected
-        } else {
-            true // Backward-compatible for unhashed historical sessions
+        let Some(ref hash) = self.integrity_hash else {
+            return false;
+        };
+        let Ok(provided) = hex::decode(hash.trim()) else {
+            return false;
+        };
+        let expected_hex = self.compute_integrity_hash();
+        let Ok(expected) = hex::decode(&expected_hex) else {
+            return false;
+        };
+        if provided.len() != expected.len() {
+            return false;
         }
+        // Constant-time equality over fixed 32-byte HMAC-SHA256 digests
+        let mut diff = 0u8;
+        for (a, b) in provided.iter().zip(expected.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
     }
 
     /// Loads a session's state from disk if it exists, acquiring a lock for safety.
@@ -1513,6 +1642,17 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Tamper detected"));
+
+        // Stripping integrity_hash entirely MUST fail closed (no unhashed bypass)
+        let mut raw_val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw_val.as_object_mut().unwrap().remove("integrity_hash");
+        std::fs::write(&path, serde_json::to_string_pretty(&raw_val).unwrap()).unwrap();
+        let load_stripped = SessionTaintDag::load_from_dir(&temp_dir, "tamper-sess");
+        assert!(
+            load_stripped.is_err(),
+            "Session state with missing integrity_hash must fail closed"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

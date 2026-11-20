@@ -100,8 +100,10 @@ impl SecretScanEngine {
         // Stage 1: Quick Aho-Corasick check
         let has_any_match = self.ac.find(data).is_some();
         if !has_any_match {
-            // Also check for aws_secret_access_key if not caught by keyword
-            if !text.contains("aws_secret") && !text.contains("secret_key") {
+            // Case-insensitive fallback for env-var style secret assignments
+            // (e.g. AWS_SECRET_ACCESS_KEY=..., SECRET_KEY=...) that lack a fixed token prefix.
+            let lower = text.to_ascii_lowercase();
+            if !lower.contains("aws_secret") && !lower.contains("secret_key") {
                 return findings;
             }
         }
@@ -348,5 +350,16 @@ mod tests {
         let sample = "This is a clean developer prompt with no credentials or secrets.";
         let findings = engine.scan(sample.as_bytes());
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_secret_detector_catches_uppercase_aws_secret_without_akia() {
+        let engine = SecretScanEngine::new();
+        let sample = "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let findings = engine.scan(sample.as_bytes());
+        assert!(
+            findings.iter().any(|f| f.detector == "SEC-AWS-002"),
+            "Uppercase AWS_SECRET_ACCESS_KEY must be detected even without AKIA prefix"
+        );
     }
 }

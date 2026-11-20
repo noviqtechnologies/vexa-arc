@@ -11,9 +11,9 @@
 **Vexa Arc Community** (`arc`) is an open-source, local-first developer security utility: a Rust policy engine with selected Claude Code/Cursor hook events, an explicitly invoked MCP stdio broker, and advisory package checks. It is designed for individual developers, not as a universal endpoint firewall. Actions outside configured hooks and the broker are not mediated. `arc shield` does not intercept or execute package installs.
 
 > [!IMPORTANT]
-> **Availability:** The Community Core is currently available free under Apache-2.0. Team capabilities are in private Beta; access and enabled scope are cohort-specific. Enterprise is future direction, not a standard offer.
+> **Availability:** The Community Core is currently available free under Apache-2.0.
 >
-> **Community scope:** The supported target is one developer on one workstation. Enterprise fleet enforcement is deferred. Arc is **NOT** a kernel-level EDR, **NOT** a network egress firewall, and **NOT** a replacement for commercial endpoint protection. It provides defense-in-depth only on explicitly mediated paths. Session/sink classification is heuristic, ordinary Cursor file writes bypass the scanner, and end-to-end latency has not been independently validated. See the [Community Core scope and release-maintenance notes](docs/community-release-scope.md).
+> **Community scope:** The supported target is one developer on one workstation. Arc is **NOT** a kernel-level EDR, **NOT** a network egress firewall, and **NOT** a replacement for commercial endpoint protection. See the [Community Core scope and release-maintenance notes](docs/community-release-scope.md).
 
 <p align="center">
   <a href="#quick-start-30-seconds"><b>Quick Start</b></a> •
@@ -46,8 +46,8 @@ Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; 
 │   Evaluates:                                                                           │
 │   1. Lethal Trifecta DAG (Private Data + Untrusted Context + Egress)                   │
 │   2. Multi-Language Token Egress (curl, python urllib, node http, powershell)          │
-│   3. Advisory Package-Name Heuristics + Exact-Version OSV Check                        │
-│   4. Dynamic MCP Schema Rug-Pull Quarantine (RFC 8785 JCS Hash Pinning)                │
+│   3. OpenSSF MAL-* Malware Gate + Real Registry Attestations & Exact-Version OSV       │
+│   4. MCP Schema Rug-Pull & Tool-Description Poisoning Quarantine (JCS + POISON-001)    │
 │   5. Linear-Time Code Pattern Scanning (SQL string interpolation, eval/exec, innerHTML)│
 │   6. Process Lifecycle Controls (Job Objects / PR_SET_PDEATHSIG / Memory Limits)      │
 └────────────────────────────────────────────────────────────────────────────────────────┘
@@ -59,10 +59,10 @@ Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; 
 
 | Security Dimension | Threat Vector Addressed | Vexa Arc Mechanism | CLI Command |
 | :--- | :--- | :--- | :--- |
-| **Observed Taint Checks** | Some mediated private-data + untrusted-context flows | Session Taint DAG and heuristic classification of selected sinks; not general egress interception | `arc intercept eval --session s1` |
-| **Selected Agent Hooks** | Configured Claude Code, Cursor, Codex CLI, Gemini CLI, and Windsurf lifecycle events & package-install commands | Host hooks mediate supported events + `ARC-PKG-001` install checks; ordinary editor writes bypass Arc | `arc init` / `arc host install --host claude-code` |
-| **Package Risk Check** | Slopsquatting, malicious install scripts, 404s, and known vulnerabilities | Live cached npm/PyPI/crates.io registry lookups (`ARC_OFFLINE=1` fallback) + exact-version OSV check | `arc shield check lodash@4.17.21` |
-| **Wrapped MCP Schema Pinning** | Schema changes on an MCP server launched through the Arc stdio broker | RFC 8785 JCS hashing; local `.arc/mcp-pins.lock`, signed org policy pin, or `--allow-tofu` | `arc protect stdio --server github -- npx ...` |
+| **Observed Taint Checks** | Some mediated private-data + untrusted-context flows | Session Taint DAG with keyed HMAC-SHA256 fail-closed integrity (`~/.arc/session.key` / `ARC_SESSION_HMAC_KEY`) and heuristic classification of selected sinks | `arc intercept eval --session s1` |
+| **Selected Agent Hooks** | Configured Claude Code, Cursor, Codex CLI, Gemini CLI, and Windsurf lifecycle events & package-install commands | Host hooks mediate supported events + `ARC-PKG-001` install checks; dynamic host adapter detection & health reporting in `arc setup` | `arc init` / `arc host install --host claude-code` |
+| **Package Risk Check** | OpenSSF `MAL-*` malware, slopsquatting, malicious install scripts, 404s, and known vulnerabilities | Live cached npm, PyPI, crates.io, and Go module proxy (`proxy.golang.org`) lookups + live OSV `MAL-*` malware gate (`CompoundMalwareGate`), real npm Sigstore/PyPI PEP 740 attestation checks (zero fabricated scores), and compound shell command parsing (`&&`, `;`, `\|`, `sh -c`, `npx`/`bun`/`poetry`/`uvx`) | `arc shield check lodash@4.17.21` |
+| **Wrapped MCP Schema Pinning & Tool Poisoning Defense** | Schema rug-pulls, day-1 MCP tool-description poisoning (`<IMPORTANT>`, hidden credential exfil prompts), invisible Unicode smuggling, and cross-tool shadowing | RFC 8785 JCS hashing + `ARC-MCP-POISON-001` pre-pin quarantine; `Transfer-Encoding: chunked` + cross-chunk SSE mediation; local `.arc/mcp-pins.lock`, signed org policy pin, or `--allow-tofu` | `arc protect stdio --server github -- npx ...` |
 | **Local MCP Security Server** | Agents without native hooks (Codex, Gemini CLI, Windsurf, Cline) | Stdio MCP server exposing `scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets` | `arc mcp-server` |
 | **Process Lifecycle Controls** | Some child-process lifetime/resource risks in the wrapped broker | OS-specific lifecycle/resource controls; not sandboxing or network isolation | `arc protect stdio --max-memory-mb 512` |
 | **Secret Scanning** | Supported secret patterns in explicitly scanned inputs | Pattern/entropy detector; redaction applies only where the path can apply it | `arc scan-secrets --path . --redact` |
@@ -100,9 +100,12 @@ arc init
 # Or start in non-blocking audit mode first:
 arc init --audit-mode
 
-# ☁️ (Optional) Connect to Vexa Cloud to stream blocked events & CI scan facts (Linux / macOS / Windows):
-arc auth login --token vexa_pat_...
-arc auth status
+# ☁️ (Optional) One-command Vexa Cloud onboarding (browser Device Flow login, IDE hooks, signed policy sync & heartbeat):
+arc setup
+# For dev/test/pre-prod/self-hosted environments (persisted in ~/.vexa/credentials.json):
+arc setup --api-url https://<your-vexa-api>/v1
+# Non-interactive CI/headless setup:
+arc setup --token vexa_pat_...
 
 # 📦 Live registry + OSV package check (npm, PyPI, crates.io; set ARC_OFFLINE=1 for offline cache):
 arc shield check reactt --ecosystem npm

@@ -77,6 +77,7 @@ impl AuthoritativeRegistryCache {
                     has_slsa_provenance: false,
                     has_dangerous_lifecycle_scripts: false,
                     recent_registry_404: false,
+                    malicious_advisory_id: None,
                 },
             );
         }
@@ -146,6 +147,7 @@ impl PackageFirewall {
             has_slsa_provenance: false,
             has_dangerous_lifecycle_scripts: has_dangerous_scripts,
             recent_registry_404: false,
+            malicious_advisory_id: None,
         };
 
         self.engine.evaluate(&meta)
@@ -182,6 +184,7 @@ impl PackageFirewall {
                 has_slsa_provenance: false,
                 has_dangerous_lifecycle_scripts: has_dangerous_scripts,
                 recent_registry_404: false,
+                malicious_advisory_id: None,
             };
             self.engine.evaluate(&meta)
         }
@@ -327,16 +330,114 @@ impl PackageFirewall {
         }
     }
 
-    /// Extracts candidate packages from shell commands (e.g. npm i foo, pip install bar)
-    pub fn parse_command(command: &str) -> Vec<(Ecosystem, String)> {
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        if parts.is_empty() {
-            return Vec::new();
+    /// Splits a shell command into individual sub-commands across `&&`, `||`, `;`, `|`, and newlines,
+    /// unwrapping quoted subshell arguments (`sh -c "..."`, `bash -c "..."`, `cmd /c "..."`) and
+    /// stripping leading `KEY=VAL` environment assignments so compound commands cannot bypass `ARC-PKG-001`.
+    fn split_shell_subcommands(command: &str) -> Vec<Vec<String>> {
+        let mut subcommands: Vec<Vec<String>> = Vec::new();
+        let mut current: Vec<String> = Vec::new();
+        let mut token = String::new();
+        let mut quote: Option<char> = None;
+        let chars: Vec<char> = command.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let c = chars[i];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                } else {
+                    token.push(c);
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    i += 1;
+                }
+                ';' | '\n' | '\r' => {
+                    if !token.is_empty() {
+                        current.push(std::mem::take(&mut token));
+                    }
+                    if !current.is_empty() {
+                        subcommands.push(std::mem::take(&mut current));
+                    }
+                    i += 1;
+                }
+                '&' | '|' => {
+                    if !token.is_empty() {
+                        current.push(std::mem::take(&mut token));
+                    }
+                    if !current.is_empty() {
+                        subcommands.push(std::mem::take(&mut current));
+                    }
+                    if i + 1 < chars.len() && chars[i + 1] == c {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                w if w.is_whitespace() => {
+                    if !token.is_empty() {
+                        current.push(std::mem::take(&mut token));
+                    }
+                    i += 1;
+                }
+                _ => {
+                    token.push(c);
+                    i += 1;
+                }
+            }
+        }
+        if !token.is_empty() {
+            current.push(token);
+        }
+        if !current.is_empty() {
+            subcommands.push(current);
         }
 
+        // Unwrap nested subshells: `sh -c "..."`, `bash -c "..."`, `cmd /c "..."`
+        let mut expanded = Vec::new();
+        for mut parts in subcommands {
+            // Strip leading ENV=VAL prefixes (e.g. `NODE_ENV=dev npm install foo`)
+            while parts.len() > 1 && parts[0].contains('=') && !parts[0].starts_with('-') {
+                parts.remove(0);
+            }
+            if parts.len() >= 3 {
+                let bin = parts[0].to_ascii_lowercase();
+                let flag = parts[1].to_ascii_lowercase();
+                let is_subshell = (matches!(bin.as_str(), "sh" | "bash" | "zsh" | "/bin/sh" | "/bin/bash")
+                    && flag == "-c")
+                    || (matches!(bin.as_str(), "cmd" | "cmd.exe") && flag == "/c");
+                if is_subshell {
+                    let inner = parts[2..].join(" ");
+                    expanded.extend(Self::split_shell_subcommands(&inner));
+                    continue;
+                }
+            }
+            expanded.push(parts);
+        }
+        expanded
+    }
+
+    /// Extracts candidate packages from shell commands (including compound `&&`/`;`/`|` chains,
+    /// env prefixes, `npx`, `bun`, `poetry`, `pipx`, `uvx`, and `sh -c` / `cmd /c` subshells).
+    pub fn parse_command(command: &str) -> Vec<(Ecosystem, String)> {
         let mut out = Vec::new();
-        let collect_args = |args: &[&str], eco: Ecosystem, out: &mut Vec<(Ecosystem, String)>| {
-            for &arg in args {
+        let collect_args = |args: &[String], eco: Ecosystem, out: &mut Vec<(Ecosystem, String)>| {
+            let mut skip_next = false;
+            for arg in args {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                // Skip flag arguments that take a file/path value (e.g. `-r requirements.txt`)
+                if matches!(arg.as_str(), "-r" | "--requirement" | "-c" | "--constraint" | "--prefix" | "-C") {
+                    skip_next = true;
+                    continue;
+                }
                 if !arg.starts_with('-') {
                     let cleaned = Self::clean_package_name(arg, eco);
                     if !cleaned.is_empty() {
@@ -346,31 +447,65 @@ impl PackageFirewall {
             }
         };
 
-        if parts[0] == "npm" || parts[0] == "pnpm" || parts[0] == "yarn" {
-            if parts.len() > 1 && (parts[1] == "install" || parts[1] == "i" || parts[1] == "add") {
-                collect_args(&parts[2..], Ecosystem::Npm, &mut out);
+        for parts in Self::split_shell_subcommands(command) {
+            if parts.is_empty() {
+                continue;
             }
-        } else if parts[0] == "pip" || parts[0] == "pip3" {
-            if parts.len() > 1 && (parts[1] == "install" || parts[1] == "add") {
-                collect_args(&parts[2..], Ecosystem::Pypi, &mut out);
+            let p0 = parts[0].to_ascii_lowercase();
+            let p1 = parts.get(1).map(|s| s.to_ascii_lowercase());
+            let p2 = parts.get(2).map(|s| s.to_ascii_lowercase());
+            let p3 = parts.get(3).map(|s| s.to_ascii_lowercase());
+
+            if matches!(p0.as_str(), "npm" | "pnpm" | "yarn" | "bun") {
+                if matches!(p1.as_deref(), Some("install" | "i" | "add")) {
+                    collect_args(&parts[2..], Ecosystem::Npm, &mut out);
+                }
+            } else if p0 == "npx" || p0 == "bunx" {
+                // First non-flag argument to npx/bunx is the package being fetched & executed
+                for arg in &parts[1..] {
+                    if !arg.starts_with('-') {
+                        let cleaned = Self::clean_package_name(arg, Ecosystem::Npm);
+                        if !cleaned.is_empty() {
+                            out.push((Ecosystem::Npm, cleaned));
+                        }
+                        break;
+                    }
+                }
+            } else if p0 == "pip" || p0 == "pip3" || p0 == "pipx" {
+                if matches!(p1.as_deref(), Some("install" | "add")) {
+                    collect_args(&parts[2..], Ecosystem::Pypi, &mut out);
+                }
+            } else if p0 == "poetry" {
+                if matches!(p1.as_deref(), Some("add")) {
+                    collect_args(&parts[2..], Ecosystem::Pypi, &mut out);
+                }
+            } else if p0 == "uv" {
+                if p1.as_deref() == Some("add") {
+                    collect_args(&parts[2..], Ecosystem::Pypi, &mut out);
+                } else if p1.as_deref() == Some("pip") && p2.as_deref() == Some("install") {
+                    collect_args(&parts[3..], Ecosystem::Pypi, &mut out);
+                }
+            } else if p0 == "uvx" {
+                for arg in &parts[1..] {
+                    if !arg.starts_with('-') {
+                        let cleaned = Self::clean_package_name(arg, Ecosystem::Pypi);
+                        if !cleaned.is_empty() {
+                            out.push((Ecosystem::Pypi, cleaned));
+                        }
+                        break;
+                    }
+                }
+            } else if p0 == "cargo" && p1.as_deref() == Some("add") {
+                collect_args(&parts[2..], Ecosystem::Cargo, &mut out);
+            } else if p0 == "go" && p1.as_deref() == Some("get") {
+                collect_args(&parts[2..], Ecosystem::Go, &mut out);
+            } else if (p0 == "python" || p0 == "python3")
+                && p1.as_deref() == Some("-m")
+                && p2.as_deref() == Some("pip")
+                && matches!(p3.as_deref(), Some("install" | "add"))
+            {
+                collect_args(&parts[4..], Ecosystem::Pypi, &mut out);
             }
-        } else if parts[0] == "uv" {
-            if parts.len() > 1 && parts[1] == "add" {
-                collect_args(&parts[2..], Ecosystem::Pypi, &mut out);
-            } else if parts.len() > 2 && parts[1] == "pip" && parts[2] == "install" {
-                collect_args(&parts[3..], Ecosystem::Pypi, &mut out);
-            }
-        } else if parts[0] == "cargo" && parts.len() > 1 && parts[1] == "add" {
-            collect_args(&parts[2..], Ecosystem::Cargo, &mut out);
-        } else if parts[0] == "go" && parts.len() > 1 && parts[1] == "get" {
-            collect_args(&parts[2..], Ecosystem::Go, &mut out);
-        } else if (parts[0] == "python" || parts[0] == "python3")
-            && parts.len() > 3
-            && parts[1] == "-m"
-            && parts[2] == "pip"
-            && (parts[3] == "install" || parts[3] == "add")
-        {
-            collect_args(&parts[4..], Ecosystem::Pypi, &mut out);
         }
 
         out
@@ -392,8 +527,44 @@ mod tests {
     #[test]
     fn test_parse_command_pip() {
         let pkgs = PackageFirewall::parse_command("pip install requests -r requirements.txt");
-        assert_eq!(pkgs.len(), 2);
-        assert_eq!(pkgs[0], (Ecosystem::Pypi, "requests".to_string()));
+        assert_eq!(pkgs, vec![(Ecosystem::Pypi, "requests".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_compound_shell_and_modern_package_managers() {
+        let chained = PackageFirewall::parse_command(
+            "cd api && NODE_ENV=production npm install evil-npm-pkg; pip install evil-py-pkg",
+        );
+        assert_eq!(
+            chained,
+            vec![
+                (Ecosystem::Npm, "evil-npm-pkg".to_string()),
+                (Ecosystem::Pypi, "evil-py-pkg".to_string()),
+            ]
+        );
+
+        let shell_wrapped =
+            PackageFirewall::parse_command("bash -c \"uv pip install fastapi && bun add zod\"");
+        assert_eq!(
+            shell_wrapped,
+            vec![
+                (Ecosystem::Pypi, "fastapi".to_string()),
+                (Ecosystem::Npm, "zod".to_string()),
+            ]
+        );
+
+        assert_eq!(
+            PackageFirewall::parse_command("npx -y malicious-cli@1.0.0 --help"),
+            vec![(Ecosystem::Npm, "malicious-cli".to_string())]
+        );
+        assert_eq!(
+            PackageFirewall::parse_command("poetry add httpx"),
+            vec![(Ecosystem::Pypi, "httpx".to_string())]
+        );
+        assert_eq!(
+            PackageFirewall::parse_command("uvx ruff check ."),
+            vec![(Ecosystem::Pypi, "ruff".to_string())]
+        );
     }
 
     #[test]

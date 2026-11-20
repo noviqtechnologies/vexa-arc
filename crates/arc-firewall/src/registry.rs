@@ -140,22 +140,31 @@ pub fn parse_npm_registry_json(
                 .any(has_suspicious_script)
         });
 
+    let has_slsa_provenance = latest_obj
+        .and_then(|o| o.get("dist"))
+        .and_then(|d| d.get("attestations"))
+        .and_then(|a| a.get("provenance").or(Some(a)))
+        .is_some();
+
     PackageRegistryMetadata {
         name: name.to_string(),
         ecosystem: "npm".to_string(),
         age_days,
         monthly_downloads,
         has_verified_repository_link: has_repo,
-        repository_stars: if has_repo && age_days > 30 { 10 } else { 0 },
-        repository_commits: if has_repo && age_days > 30 { 10 } else { 0 },
-        has_slsa_provenance: false,
+        // Never fabricate GitHub star/commit counts when not queried from the VCS host.
+        repository_stars: 0,
+        repository_commits: 0,
+        has_slsa_provenance,
         has_dangerous_lifecycle_scripts,
         recent_registry_404: false,
+        malicious_advisory_id: None,
     }
 }
 
 pub fn parse_pypi_registry_json(name: &str, val: &serde_json::Value) -> PackageRegistryMetadata {
     let mut earliest_age: Option<u32> = None;
+    let mut has_pep740_provenance = false;
     if let Some(releases) = val.get("releases").and_then(|r| r.as_object()) {
         for files in releases.values() {
             if let Some(arr) = files.as_array() {
@@ -164,6 +173,9 @@ pub fn parse_pypi_registry_json(name: &str, val: &serde_json::Value) -> PackageR
                         if let Some(d) = days_since_rfc3339(ts) {
                             earliest_age = Some(earliest_age.map_or(d, |cur| cur.max(d)));
                         }
+                    }
+                    if f.get("provenance").is_some_and(|v| !v.is_null()) {
+                        has_pep740_provenance = true;
                     }
                 }
             }
@@ -181,21 +193,19 @@ pub fn parse_pypi_registry_json(name: &str, val: &serde_json::Value) -> PackageR
             .and_then(|h| h.as_str())
             .is_some_and(|s| !s.trim().is_empty());
 
-    // PyPI JSON API does not expose download counts; avoid false-positive blocking of
-    // established (>30d) packages with repository metadata.
-    let monthly_downloads = if age_days > 30 && has_repo { 10_000 } else { 0 };
-
+    // PyPI JSON API does not expose download counts; report 0 honestly rather than fabricating.
     PackageRegistryMetadata {
         name: name.to_string(),
         ecosystem: "pypi".to_string(),
         age_days,
-        monthly_downloads,
+        monthly_downloads: 0,
         has_verified_repository_link: has_repo,
-        repository_stars: if has_repo && age_days > 30 { 10 } else { 0 },
-        repository_commits: if has_repo && age_days > 30 { 10 } else { 0 },
-        has_slsa_provenance: false,
+        repository_stars: 0,
+        repository_commits: 0,
+        has_slsa_provenance: has_pep740_provenance,
         has_dangerous_lifecycle_scripts: false,
         recent_registry_404: false,
+        malicious_advisory_id: None,
     }
 }
 
@@ -221,11 +231,34 @@ pub fn parse_crates_registry_json(name: &str, val: &serde_json::Value) -> Packag
         age_days,
         monthly_downloads,
         has_verified_repository_link: has_repo,
-        repository_stars: if has_repo && age_days > 30 { 10 } else { 0 },
-        repository_commits: if has_repo && age_days > 30 { 10 } else { 0 },
+        repository_stars: 0,
+        repository_commits: 0,
         has_slsa_provenance: false,
         has_dangerous_lifecycle_scripts: false,
         recent_registry_404: false,
+        malicious_advisory_id: None,
+    }
+}
+
+pub fn parse_go_proxy_json(name: &str, val: &serde_json::Value) -> PackageRegistryMetadata {
+    let age_days = val
+        .get("Time")
+        .and_then(|t| t.as_str())
+        .and_then(days_since_rfc3339)
+        .unwrap_or(0);
+    let has_repo = name.contains('/') && name.contains('.');
+    PackageRegistryMetadata {
+        name: name.to_string(),
+        ecosystem: "go".to_string(),
+        age_days,
+        monthly_downloads: 0,
+        has_verified_repository_link: has_repo,
+        repository_stars: 0,
+        repository_commits: 0,
+        has_slsa_provenance: false,
+        has_dangerous_lifecycle_scripts: false,
+        recent_registry_404: false,
+        malicious_advisory_id: None,
     }
 }
 
@@ -241,7 +274,45 @@ fn phantom_404_metadata(ecosystem: &str, name: &str) -> PackageRegistryMetadata 
         has_slsa_provenance: false,
         has_dangerous_lifecycle_scripts: false,
         recent_registry_404: true,
+        malicious_advisory_id: None,
     }
+}
+
+/// Checks OSV live API for any active OpenSSF Malicious Package (`MAL-*`) advisory.
+async fn check_osv_malicious_advisory(
+    client: &reqwest::Client,
+    ecosystem: Ecosystem,
+    name: &str,
+) -> Option<String> {
+    let osv_eco = match ecosystem {
+        Ecosystem::Npm => "npm",
+        Ecosystem::Pypi => "PyPI",
+        Ecosystem::Cargo => "crates.io",
+        Ecosystem::Go => "Go",
+    };
+    let resp = client
+        .post("https://api.osv.dev/v1/query")
+        .json(&serde_json::json!({
+            "package": { "name": name, "ecosystem": osv_eco }
+        }))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let val: serde_json::Value = resp.json().await.ok()?;
+    val.get("vulns")?
+        .as_array()?
+        .iter()
+        .find_map(|v| {
+            let id = v.get("id")?.as_str()?;
+            if id.starts_with("MAL-") && v.get("withdrawn").is_none() {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
 }
 
 pub async fn fetch_live_registry_metadata_async(
@@ -252,7 +323,7 @@ pub async fn fetch_live_registry_metadata_async(
         Ecosystem::Npm => "npm",
         Ecosystem::Pypi => "pypi",
         Ecosystem::Cargo => "cargo",
-        Ecosystem::Go => return None,
+        Ecosystem::Go => "go",
     };
 
     let dir = cache_dir();
@@ -317,8 +388,34 @@ pub async fn fetch_live_registry_metadata_async(
                 return None;
             }
         }
-        Ecosystem::Go => return None,
+        Ecosystem::Go => {
+            let escaped: String = name
+                .chars()
+                .flat_map(|c| {
+                    if c.is_ascii_uppercase() {
+                        vec!['!', c.to_ascii_lowercase()]
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            let url = format!("https://proxy.golang.org/{escaped}/@latest");
+            let resp = client.get(&url).send().await.ok()?;
+            if resp.status().as_u16() == 404 || resp.status().as_u16() == 410 {
+                phantom_404_metadata("go", name)
+            } else if resp.status().is_success() {
+                let val: serde_json::Value = resp.json().await.ok()?;
+                parse_go_proxy_json(name, &val)
+            } else {
+                return None;
+            }
+        }
     };
+
+    let mut meta = meta;
+    if !meta.recent_registry_404 {
+        meta.malicious_advisory_id = check_osv_malicious_advisory(&client, ecosystem, name).await;
+    }
 
     write_cached_metadata(&dir, eco_str, name, &meta);
     Some((meta, RegistryMetadataSource::Live))
@@ -382,7 +479,18 @@ mod tests {
         let p_meta = parse_pypi_registry_json("requests", &pypi);
         assert!(p_meta.age_days > 365);
         assert!(p_meta.has_verified_repository_link);
-        assert!(p_meta.monthly_downloads > 1000);
+        // PyPI JSON API does not provide download counts; must not fabricate a fake number
+        assert_eq!(p_meta.monthly_downloads, 0);
+        assert_eq!(p_meta.repository_stars, 0);
+        assert_eq!(p_meta.repository_commits, 0);
+
+        let go_val = serde_json::json!({
+            "Version": "v1.9.1",
+            "Time": "2023-06-01T00:00:00Z"
+        });
+        let g_meta = parse_go_proxy_json("github.com/gin-gonic/gin", &go_val);
+        assert!(g_meta.age_days > 365);
+        assert!(g_meta.has_verified_repository_link);
 
         let crates = serde_json::json!({
             "crate": {

@@ -107,26 +107,25 @@ arc init --audit-mode
 arc allow --rule ARC-LTT-001 --target slack --reason "Approved workspace webhook"
 ```
 
-#### Connecting to Vexa Cloud (`arc auth` — Linux, macOS & Windows)
-Authenticate once to share `~/.vexa/credentials.json` (`%USERPROFILE%\.vexa\credentials.json` on Windows) across `arc` and `vexa-sca`. Once authenticated, blocked hook actions, package shield checks, and `arc ci-report --upload` automatically stream zero-code telemetry to the Vexa Cloud dashboard:
+#### Connecting to Vexa Cloud (`arc setup` — Linux, macOS & Windows)
+Run one command (`arc setup`) to authenticate via OAuth 2.0 Device Flow in your browser (issuing a revocable per-workstation token), install IDE hooks, sync your organization's signed policy, and register your workstation in **Endpoint Posture**:
+
+* **Multi-environment support (zero hardcoded URLs):** Pass `--api-url https://<env-api>/v1` once for `dev`, `test`, `pre-prod`, or self-hosted deployments. The URL is persisted in `~/.vexa/credentials.json` (`%USERPROFILE%\.vexa\credentials.json` on Windows) so all future IDE hooks and background syncs automatically target that environment.
+* **Dynamic posture & zero-secret telemetry:** `arc setup` dynamically detects installed IDE adapters (`claude-code`, `cursor`, `codex-cli`, `gemini-cli`, `windsurf`) and policy health (`healthy` / `unconfigured` / `degraded`), while cloud telemetry redacts any detected secrets before egress and never panics when invoked from async transports.
+* **Tamper-resistant session state:** Persisted session DAGs are authenticated with a per-workstation HMAC-SHA256 key (`~/.arc/session.key`, mode `0600` on Unix, or `ARC_SESSION_HMAC_KEY` in CI) and fail closed if the integrity tag is missing or altered.
+* **MCP Tool-Description Poisoning & Cross-Tool Shadowing Quarantine (`ARC-MCP-POISON-001`):** Before pinning or forwarding any MCP `tools/list` schema (including `--allow-tofu`), `arc-dlp` inspects every tool `description` and recursive `inputSchema` field for hidden LLM instructions (`<IMPORTANT>`, `<SYSTEM>`, secrecy directives), credential-exfiltration prompts (`.ssh/id_rsa`, `.aws/credentials`, `.env`), cross-tool shadowing, and invisible Unicode tag/Bidi smuggling — quarantining poisoned servers before the LLM sees them.
+* **Anti-Malware & Compound Shell Package Shield:** `arc shield` and `ARC-PKG-001` query live npm, PyPI, crates.io, and Go module proxy (`proxy.golang.org`) metadata with zero fabricated provenance/star/download scores, check real npm Sigstore (`dist.attestations`) and PyPI PEP 740 provenance, immediately block OpenSSF Malicious Packages (`MAL-*`) via `CompoundMalwareGate` even for previously established names, and parse compound shell chains (`&&`, `||`, `;`, `|`, `sh -c`/`bash -c`/`cmd /c`, `ENV=val`, `npx`, `bun`, `bunx`, `poetry`, `pipx`, `uvx`).
+* **Automatic background sync:** `arc intercept eval` never blocks IDE hooks on network I/O. Blocked events are appended to `arc_cloud_queue.jsonl` (`<1ms`) and flushed automatically in a detached, windowless background process (`arc telemetry flush --quiet`, 60s cooldown) across Windows, macOS, and Linux.
+* **AI-BOM & CI reporting:** `arc ci-report --upload` uploads AI-workspace inventory (`POST /v1/arc/inventory`) and—when `--sca` is passed—also syncs SCA dependency facts (`POST /v1/facts/sync`).
 
 ```bash
-# Linux / macOS:
-arc auth login --token vexa_pat_live_...
-arc auth status
+# Linux / macOS / Windows (interactive browser Device Flow):
+arc setup
+# Or target a specific dev / pre-prod / self-hosted environment:
+arc setup --api-url https://<your-vexa-api>/v1
 
-# Or via environment variable in CI:
-export VEXA_TOKEN="vexa_pat_live_..."
-arc ci-report --sca --upload
-```
-
-```powershell
-# Windows PowerShell:
-arc auth login --token vexa_pat_live_...
-arc auth status
-
-# Or via environment variable in PowerShell:
-$env:VEXA_TOKEN = "vexa_pat_live_..."
+# Non-interactive CI / headless setup:
+arc setup --token vexa_pat_live_... --api-url https://<your-vexa-api>/v1
 arc ci-report --sca --upload
 ```
 

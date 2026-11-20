@@ -13,6 +13,8 @@ pub struct StoredVexaCredentials {
     pub org_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
     pub created_at: String,
 }
 
@@ -45,7 +47,8 @@ impl VexaCloudAuth {
         false
     }
 
-    /// Resolve the Vexa Cloud API base URL (`override_url` -> `VEXA_API_URL` -> `VEXA_API_BASE_URL` -> default).
+    /// Resolve the Vexa Cloud API base URL:
+    /// `override_url` -> `VEXA_API_URL` -> `VEXA_API_BASE_URL` -> stored `api_base_url` -> default.
     pub fn resolve_api_base_url(override_url: Option<&str>) -> String {
         if let Some(url) = override_url {
             let trimmed = url.trim().trim_end_matches('/');
@@ -59,6 +62,12 @@ impl VexaCloudAuth {
                 if !trimmed.is_empty() {
                     return trimmed.to_string();
                 }
+            }
+        }
+        if let Some(stored_url) = Self::load_stored_credentials().and_then(|c| c.api_base_url) {
+            let trimmed = stored_url.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
             }
         }
         DEFAULT_VEXA_API_BASE_URL.to_string()
@@ -102,6 +111,15 @@ impl VexaCloudAuth {
         org_slug: Option<&str>,
         user_email: Option<&str>,
     ) -> Result<PathBuf, String> {
+        Self::save_credentials_with_url(token, org_slug, user_email, None)
+    }
+
+    pub fn save_credentials_with_url(
+        token: &str,
+        org_slug: Option<&str>,
+        user_email: Option<&str>,
+        api_base_url: Option<&str>,
+    ) -> Result<PathBuf, String> {
         let path = Self::credentials_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -123,10 +141,15 @@ impl VexaCloudAuth {
             }
         }
 
+        let clean_url = api_base_url
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
+
         let creds = StoredVexaCredentials {
             token: token.trim().to_string(),
             org_slug: org_slug.map(|s| s.to_string()),
             user_email: user_email.map(|s| s.to_string()),
+            api_base_url: clean_url,
             created_at: Utc::now().to_rfc3339(),
         };
 
@@ -230,17 +253,64 @@ impl VexaCloudAuth {
     }
 }
 
+/// Runs an async future synchronously without panicking if the caller is already
+/// executing inside a Tokio runtime (e.g. `arc protect http` or async tests).
+fn run_blocking_future<F, T>(fut: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::Builder::new()
+            .name("arc-cloud-io".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to initialize async runtime: {e}"))?;
+                Ok(rt.block_on(fut))
+            })
+            .map_err(|e| format!("Failed to spawn cloud I/O thread: {e}"))?
+            .join()
+            .map_err(|_| "Cloud I/O worker thread panicked".to_string())?
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to initialize async runtime: {e}"))?;
+        Ok(rt.block_on(fut))
+    }
+}
+
 /// Sanitize a reason string so raw secrets or multi-line outputs never leave the workstation.
 pub fn sanitize_cloud_reason(raw: &str) -> String {
+    static DLP: std::sync::OnceLock<arc_dlp::detector::SecretScanEngine> =
+        std::sync::OnceLock::new();
+    let dlp = DLP.get_or_init(arc_dlp::detector::SecretScanEngine::new);
+
     let first_line = raw
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim();
-    if first_line.chars().count() <= 160 {
+
+    let findings = dlp.scan(first_line.as_bytes());
+    let redacted = if findings.is_empty() {
         first_line.to_string()
     } else {
-        let prefix: String = first_line.chars().take(157).collect();
+        let mut buf = first_line.to_string();
+        for f in findings.iter().rev() {
+            if f.start < buf.len() && f.end <= buf.len() && f.start <= f.end {
+                buf.replace_range(f.start..f.end, &format!("[REDACTED:{}]", f.detector));
+            }
+        }
+        buf
+    };
+
+    if redacted.chars().count() <= 160 {
+        redacted
+    } else {
+        let prefix: String = redacted.chars().take(157).collect();
         format!("{prefix}...")
     }
 }
@@ -270,14 +340,7 @@ pub fn emit_cloud_firewall_event(event: &CloudFirewallEvent, api_base_url: Optio
         timestamp: event.timestamp.clone(),
     };
 
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return false;
-    };
-
-    rt.block_on(async move {
+    run_blocking_future(async move {
         let Ok(client) = reqwest::Client::builder()
             .timeout(Duration::from_millis(800))
             .build()
@@ -295,7 +358,11 @@ pub fn emit_cloud_firewall_event(event: &CloudFirewallEvent, api_base_url: Optio
             Err(_) => false,
         }
     })
+    .unwrap_or(false)
 }
+
+#[cfg(test)]
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -305,6 +372,7 @@ mod tests {
 
     #[test]
     fn credentials_roundtrip_and_cloud_event_post_succeeds() {
+        let _guard = crate::cloud::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_dir = std::env::temp_dir().join(format!("arc_cloud_test_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let cred_file = tmp_dir.join("credentials.json");
@@ -365,5 +433,650 @@ mod tests {
         assert!(!cred_file.exists());
         std::env::remove_var("VEXA_CREDENTIALS_PATH");
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+}
+
+
+/// Zero-code-retention runtime telemetry event sent in batches to `POST {base_url}/arc/events`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CloudArcEvent {
+    pub event_id: String,
+    pub install_id: String,
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    pub phase: String,
+    pub action_class: String,
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub taint_flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink_class: Option<String>,
+    pub target_class: String,
+    pub session_id_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_pin_status: Option<String>,
+    pub latency_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudArcHeartbeat {
+    pub install_id: String,
+    pub actor: String,
+    pub os: String,
+    pub host_adapters: Vec<String>,
+    pub arc_version: String,
+    pub policy_mode: String,
+    pub active_policy_seq: i64,
+    pub doctor_status: String,
+}
+
+pub fn cloud_spool_path() -> PathBuf {
+    crate::default_spool_dir().join("arc_cloud_queue.jsonl")
+}
+
+/// Appends a privacy-preserving `TelemetryEvent` to the local cloud-flush spool without network I/O.
+/// Safe to call on the pre-execution hook hot path across Windows, macOS, and Linux.
+pub fn spool_arc_event(
+    event: &crate::TelemetryEvent,
+    repo_name: Option<&str>,
+) -> Result<(), String> {
+    use std::io::Write;
+    let path = cloud_spool_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create telemetry spool dir: {e}"))?;
+    }
+    let occurred_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        event.occurred_at_unix_ms as i64,
+    )
+    .map(|dt| dt.to_rfc3339())
+    .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+    let cloud_ev = CloudArcEvent {
+        event_id: event.event_id.to_string(),
+        install_id: event.install_id.clone(),
+        host: event.host.clone(),
+        transport: event.transport.clone(),
+        phase: event.phase.clone(),
+        action_class: event.action_class.clone(),
+        decision: event.decision.clone(),
+        rule_id: event.rule_id.clone(),
+        taint_flags: event.taint_flags.clone(),
+        sink_class: event.sink_class.clone(),
+        target_class: event.target_class.clone(),
+        session_id_hash: event.session_id_hash.clone(),
+        project_id_hash: event.project_id_hash.clone(),
+        repo_name: repo_name.map(str::to_string),
+        schema_pin_status: event.schema_pin_status.clone(),
+        latency_ms: event.latency_ms,
+        error_class: event.error_class.clone(),
+        occurred_at,
+    };
+
+    let line = serde_json::to_string(&cloud_ev)
+        .map_err(|e| format!("Failed to serialize cloud Arc event: {e}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("Failed to open cloud telemetry spool: {e}"))?;
+    writeln!(file, "{line}").map_err(|e| format!("Failed to write cloud telemetry spool: {e}"))
+}
+
+/// Flushes up to 500 spooled Arc events to `POST {base_url}/arc/events` in a single batch.
+/// Preserves unacknowledged events in the spool on offline, unauthenticated, or 429/5xx responses.
+pub fn flush_arc_event_spool(api_base_url: Option<&str>) -> usize {
+    if VexaCloudAuth::is_offline() {
+        return 0;
+    }
+    let Some(token) = VexaCloudAuth::get_token() else {
+        return 0;
+    };
+    let path = cloud_spool_path();
+    if !path.exists() {
+        return 0;
+    }
+    let Ok(content) = fs::read_to_string(&path) else {
+        return 0;
+    };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return 0;
+    }
+
+    let batch_count = lines.len().min(500);
+    let mut batch = Vec::with_capacity(batch_count);
+    for line in &lines[..batch_count] {
+        if let Ok(ev) = serde_json::from_str::<CloudArcEvent>(line) {
+            batch.push(ev);
+        }
+    }
+    if batch.is_empty() {
+        let _ = fs::remove_file(&path);
+        return 0;
+    }
+
+    let base_url = VexaCloudAuth::resolve_api_base_url(api_base_url);
+    let url = format!("{}/arc/events", base_url.trim_end_matches('/'));
+    let org_slug = VexaCloudAuth::get_org_slug();
+
+    let sent_count = batch.len();
+    let ok = run_blocking_future(async move {
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        else {
+            return false;
+        };
+        let mut req = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.trim()));
+        if let Some(org) = org_slug {
+            req = req.header("X-Vexa-Org", org);
+        }
+        match req
+            .json(&serde_json::json!({ "events": batch }))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false);
+
+    if !ok {
+        return 0;
+    }
+
+    let remaining = &lines[batch_count..];
+    if remaining.is_empty() {
+        let _ = fs::remove_file(&path);
+    } else {
+        let new_content = format!("{}\n", remaining.join("\n"));
+        let _ = fs::write(&path, new_content);
+    }
+    sent_count
+}
+
+pub fn emit_cloud_heartbeat(hb: &CloudArcHeartbeat, api_base_url: Option<&str>) -> bool {
+    if VexaCloudAuth::is_offline() {
+        return false;
+    }
+    let Some(token) = VexaCloudAuth::get_token() else {
+        return false;
+    };
+    let base_url = VexaCloudAuth::resolve_api_base_url(api_base_url);
+    let url = format!("{}/arc/heartbeat", base_url.trim_end_matches('/'));
+    let org_slug = VexaCloudAuth::get_org_slug();
+    let hb_owned = hb.clone();
+
+    run_blocking_future(async move {
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+        else {
+            return false;
+        };
+        let mut req = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.trim()));
+        if let Some(org) = org_slug {
+            req = req.header("X-Vexa-Org", org);
+        }
+        match req.json(&hb_owned).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false)
+}
+
+pub fn upload_arc_inventory(
+    payload: &serde_json::Value,
+    api_base_url: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    if VexaCloudAuth::is_offline() {
+        return Err("Cloud upload skipped: offline mode is active".to_string());
+    }
+    let token = VexaCloudAuth::get_token().ok_or_else(|| {
+        "Authentication required. Run `arc auth login --token <VEXA_TOKEN>` first.".to_string()
+    })?;
+    let base_url = VexaCloudAuth::resolve_api_base_url(api_base_url);
+    let url = format!("{}/arc/inventory", base_url.trim_end_matches('/'));
+    let org_slug = VexaCloudAuth::get_org_slug();
+    let payload_owned = payload.clone();
+
+    run_blocking_future(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        let mut req = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token.trim()));
+        if let Some(org) = org_slug {
+            req = req.header("X-Vexa-Org", org);
+        }
+        let resp = req
+            .json(&payload_owned)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to upload Arc inventory to {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("Vexa Cloud inventory upload rejected ({status}): {text}"));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| format!("Invalid JSON response from Vexa Cloud: {e}"))
+    })?
+}
+
+pub fn fetch_signed_policy_bundle(
+    api_base_url: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    if VexaCloudAuth::is_offline() {
+        return Err("Policy sync skipped: offline mode is active".to_string());
+    }
+    let token = VexaCloudAuth::get_token().ok_or_else(|| {
+        "Authentication required. Run `arc auth login --token <VEXA_TOKEN>` first.".to_string()
+    })?;
+    let base_url = VexaCloudAuth::resolve_api_base_url(api_base_url);
+    let url = format!("{}/arc/policy/bundle", base_url.trim_end_matches('/'));
+    let org_slug = VexaCloudAuth::get_org_slug();
+
+    run_blocking_future(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        let mut req = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token.trim()));
+        if let Some(org) = org_slug {
+            req = req.header("X-Vexa-Org", org);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch signed policy from {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("Policy sync failed ({status}): {text}"));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| format!("Invalid JSON response from Vexa Cloud: {e}"))
+    })?
+}
+
+#[cfg(test)]
+mod arc_spool_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn spool_and_batch_flush_preserves_queue_on_503_and_drains_on_202() {
+        let _guard = crate::cloud::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_dir =
+            std::env::temp_dir().join(format!("arc_spool_test_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cred_file = tmp_dir.join("credentials.json");
+
+        std::env::set_var("ARC_TELEMETRY_DIR", &tmp_dir);
+        std::env::set_var("VEXA_CREDENTIALS_PATH", &cred_file);
+        std::env::remove_var("ARC_OFFLINE");
+        std::env::remove_var("VEXA_FIREWALL_OFFLINE");
+
+        VexaCloudAuth::save_credentials("vexa_pat_test_spool_1234", Some("acme"), None).unwrap();
+
+        let ev = crate::TelemetryEventBuilder {
+            action_class: "shell".to_string(),
+            decision: "deny".to_string(),
+            rule_id: Some("ARC-LTT-001".to_string()),
+            target_class: "network_utility".to_string(),
+            session_id_hash: crate::hash_identifier("secret-session-id"),
+            ..Default::default()
+        }
+        .build("claude_code", Some("native_hook"));
+
+        spool_arc_event(&ev, Some("noviq/vexa-arc")).unwrap();
+        assert!(cloud_spool_path().exists());
+
+        // 1. Server returns 503 -> spool must remain intact
+        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a1 = l1.local_addr().unwrap();
+        let h1 = std::thread::spawn(move || {
+            let (mut s, _) = l1.accept().unwrap();
+            let mut b = [0u8; 4096];
+            let _ = s.read(&mut b);
+            let _ = s.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+        });
+        let flushed_err = flush_arc_event_spool(Some(&format!("http://{a1}/sca/v1")));
+        h1.join().unwrap();
+        assert_eq!(flushed_err, 0);
+        assert!(cloud_spool_path().exists(), "spool must not be deleted on 503");
+
+        // 2. Server returns 202 -> spool drains and returns 1
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a2 = l2.local_addr().unwrap();
+        let h2 = std::thread::spawn(move || {
+            let (mut s, _) = l2.accept().unwrap();
+            let mut b = [0u8; 8192];
+            let n = s.read(&mut b).unwrap_or(0);
+            let req = String::from_utf8_lossy(&b[..n]).to_string();
+            let _ = s.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}");
+            req
+        });
+        let flushed_ok = flush_arc_event_spool(Some(&format!("http://{a2}/sca/v1")));
+        let received = h2.join().unwrap();
+        assert_eq!(flushed_ok, 1);
+        assert!(received.contains("POST /sca/v1/arc/events"));
+        assert!(received.contains("ARC-LTT-001"));
+        assert!(!received.contains("secret-session-id"));
+        assert!(!cloud_spool_path().exists(), "spool should be removed once empty");
+
+        std::env::remove_var("ARC_TELEMETRY_DIR");
+        std::env::remove_var("VEXA_CREDENTIALS_PATH");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+}
+
+
+/// OAuth 2.0 Device Flow (RFC 8628) initiation response from Vexa Cloud.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceCodeSession {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    #[serde(default = "default_device_expires")]
+    pub expires_in: u64,
+    #[serde(default = "default_device_interval")]
+    pub interval: u64,
+}
+
+fn default_device_expires() -> u64 {
+    600
+}
+
+fn default_device_interval() -> u64 {
+    2
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceTokenPollResult {
+    Pending,
+    Authorized {
+        token: String,
+        org_slug: Option<String>,
+        user_email: Option<String>,
+    },
+    Denied(String),
+    Expired,
+}
+
+/// Request a new Device Flow code pair (`POST {base_url}/auth/device/code`).
+pub fn request_device_code(api_base_url: Option<&str>) -> Result<DeviceCodeSession, String> {
+    if VexaCloudAuth::is_offline() {
+        return Err("Device login skipped: offline mode is active".to_string());
+    }
+    let base_url = VexaCloudAuth::resolve_api_base_url(api_base_url);
+    let url = format!("{}/auth/device/code", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "install_id": crate::install_id(),
+        "os": std::env::consts::OS,
+        "actor": VexaCloudAuth::current_actor(),
+    });
+
+    run_blocking_future(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to reach {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("Device code request failed ({status}): {text}"));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| format!("Invalid device code response JSON: {e}"))
+    })?
+}
+
+/// Poll `POST {base_url}/auth/device/token` once for approval status.
+pub fn poll_device_token(
+    device_code: &str,
+    api_base_url: Option<&str>,
+) -> Result<DeviceTokenPollResult, String> {
+    if VexaCloudAuth::is_offline() {
+        return Err("Offline mode is active".to_string());
+    }
+    let base_url = VexaCloudAuth::resolve_api_base_url(api_base_url);
+    let url = format!("{}/auth/device/token", base_url.trim_end_matches('/'));
+    let code = device_code.to_string();
+
+    run_blocking_future(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "device_code": code }))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to poll {url}: {e}"))?;
+        let status = resp.status();
+        let val: serde_json::Value = resp.json().await.unwrap_or_default();
+
+        if status.as_u16() == 202
+            || val.get("error").and_then(|v| v.as_str()) == Some("authorization_pending")
+        {
+            return Ok(DeviceTokenPollResult::Pending);
+        }
+        if status.as_u16() == 403
+            || val.get("error").and_then(|v| v.as_str()) == Some("access_denied")
+        {
+            let msg = val
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Authorization denied")
+                .to_string();
+            return Ok(DeviceTokenPollResult::Denied(msg));
+        }
+        if val.get("error").and_then(|v| v.as_str()) == Some("expired_token") {
+            return Ok(DeviceTokenPollResult::Expired);
+        }
+        if status.is_success() {
+            if let Some(tok) = val.get("token").and_then(|v| v.as_str()) {
+                return Ok(DeviceTokenPollResult::Authorized {
+                    token: tok.to_string(),
+                    org_slug: val
+                        .get("org_slug")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    user_email: val
+                        .get("user_email")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                });
+            }
+        }
+        Err(format!("Unexpected device token response ({status}): {val}"))
+    })?
+}
+
+/// Spawns a detached, windowless `arc telemetry flush --quiet` child process if:
+/// - Offline mode is NOT active,
+/// - Cloud credentials exist, and
+/// - At least `cooldown_secs` (60s) have elapsed since the last background sync.
+///
+/// Never blocks the caller (<1ms on hook hot path) and works across Windows, macOS, and Linux.
+pub fn maybe_spawn_background_flush(cooldown_secs: u64) -> bool {
+    if VexaCloudAuth::is_offline() || VexaCloudAuth::get_token().is_none() {
+        return false;
+    }
+    let dir = crate::default_spool_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let stamp_path = dir.join("last_sync_at");
+    let now_secs = Utc::now().timestamp().max(0) as u64;
+    if let Ok(raw) = fs::read_to_string(&stamp_path) {
+        if let Ok(prev) = raw.trim().parse::<u64>() {
+            if now_secs.saturating_sub(prev) < cooldown_secs {
+                return false;
+            }
+        }
+    }
+    let _ = fs::write(&stamp_path, now_secs.to_string());
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["telemetry", "flush", "--quiet"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (0x08000000) | DETACHED_PROCESS (0x00000008)
+        cmd.creation_flags(0x0800_0000 | 0x0000_0008);
+    }
+
+    cmd.spawn().is_ok()
+}
+
+#[cfg(test)]
+mod multi_env_device_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn credentials_persist_and_resolve_custom_api_base_url() {
+        let _guard = crate::cloud::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir =
+            std::env::temp_dir().join(format!("arc_url_persist_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cred_file = tmp_dir.join("credentials.json");
+
+        std::env::set_var("VEXA_CREDENTIALS_PATH", &cred_file);
+        std::env::remove_var("VEXA_API_URL");
+        std::env::remove_var("VEXA_API_BASE_URL");
+
+        VexaCloudAuth::save_credentials_with_url(
+            "vexa_pat_preprod_1234567890",
+            Some("acme-preprod"),
+            Some("dev@acme.io"),
+            Some("https://preprod-api.acme.internal/v1/"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            VexaCloudAuth::resolve_api_base_url(None),
+            "https://preprod-api.acme.internal/v1"
+        );
+
+        std::env::remove_var("VEXA_CREDENTIALS_PATH");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn device_flow_client_polls_pending_then_receives_token() {
+        let _guard = crate::cloud::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ARC_OFFLINE");
+        std::env::remove_var("VEXA_FIREWALL_OFFLINE");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            // 1. /auth/device/code
+            let (mut s1, _) = listener.accept().unwrap();
+            let mut b = [0u8; 4096];
+            let _ = s1.read(&mut b);
+            let body1 = r#"{"device_code":"dev-1","user_code":"ABCD-1234","verification_uri":"https://dev.example/auth/device","expires_in":600,"interval":1}"#;
+            let _ = s1.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body1.len(), body1).as_bytes(),
+            );
+            // 2. /auth/device/token -> 202 pending
+            let (mut s2, _) = listener.accept().unwrap();
+            let _ = s2.read(&mut b);
+            let body2 = r#"{"error":"authorization_pending","status":"pending"}"#;
+            let _ = s2.write_all(
+                format!("HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body2.len(), body2).as_bytes(),
+            );
+            // 3. /auth/device/token -> 200 authorized
+            let (mut s3, _) = listener.accept().unwrap();
+            let _ = s3.read(&mut b);
+            let body3 = r#"{"token":"vexa_pat_minted_999","token_type":"Bearer","status":"authorized","org_slug":"acme","user_email":"dev@acme.io"}"#;
+            let _ = s3.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body3.len(), body3).as_bytes(),
+            );
+        });
+
+        let api_base = format!("http://{addr}/v1");
+        let sess = request_device_code(Some(&api_base)).unwrap();
+        assert_eq!(sess.user_code, "ABCD-1234");
+        assert_eq!(
+            poll_device_token(&sess.device_code, Some(&api_base)).unwrap(),
+            DeviceTokenPollResult::Pending
+        );
+        assert_eq!(
+            poll_device_token(&sess.device_code, Some(&api_base)).unwrap(),
+            DeviceTokenPollResult::Authorized {
+                token: "vexa_pat_minted_999".to_string(),
+                org_slug: Some("acme".to_string()),
+                user_email: Some("dev@acme.io".to_string()),
+            }
+        );
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn sanitize_cloud_reason_redacts_secrets_before_egress() {
+        let raw = "Blocked command containing AKIAIOSFODNN7EXAMPLE and ghp_111122223333444455556666777788889999\nsecond line";
+        let clean = sanitize_cloud_reason(raw);
+        assert!(!clean.contains("AKIAIOSFODNN7EXAMPLE"), "AWS key leaked: {clean}");
+        assert!(
+            !clean.contains("ghp_111122223333444455556666777788889999"),
+            "GitHub PAT leaked: {clean}"
+        );
+        assert!(clean.contains("[REDACTED:SEC-AWS-001]"), "clean={clean}");
+        assert!(clean.contains("[REDACTED:SEC-GTH-001]"), "clean={clean}");
+        assert!(!clean.contains("second line"));
+    }
+
+    #[tokio::test]
+    async fn run_blocking_future_does_not_panic_inside_active_tokio_runtime() {
+        let res = run_blocking_future(async { 42usize }).unwrap();
+        assert_eq!(res, 42);
     }
 }
