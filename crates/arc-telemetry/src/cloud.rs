@@ -295,11 +295,46 @@ where
     }
 }
 
-/// Sanitize a reason string so raw secrets or multi-line outputs never leave the workstation.
+/// Sanitize a reason string so raw secrets, credentials, PII (emails/IPs),
+/// OS home-directory paths containing usernames (Windows/macOS/Linux/WSL),
+/// or multi-line outputs never leave the workstation.
 pub fn sanitize_cloud_reason(raw: &str) -> String {
+    use regex::Regex;
+
     static DLP: std::sync::OnceLock<arc_dlp::detector::SecretScanEngine> =
         std::sync::OnceLock::new();
+    static RE_AUTH_HEADER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_QUERY_SECRET: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_WIN_USER_PATH: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_WIN_FWD_USER_PATH: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_UNIX_USER_PATH: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_EMAIL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_IPV4: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
     let dlp = DLP.get_or_init(arc_dlp::detector::SecretScanEngine::new);
+    let re_auth = RE_AUTH_HEADER.get_or_init(|| {
+        Regex::new(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}").expect("valid regex")
+    });
+    let re_query = RE_QUERY_SECRET.get_or_init(|| {
+        Regex::new(
+            r"(?i)([?&](?:token|api_key|apikey|secret|password|passwd|auth|key|access_token)=)[^&\s]+",
+        )
+        .expect("valid regex")
+    });
+    let re_win_path = RE_WIN_USER_PATH
+        .get_or_init(|| Regex::new(r#"(?i)\b[A-Z]:\\Users\\[^\\\s"']+"#).expect("valid regex"));
+    let re_win_fwd = RE_WIN_FWD_USER_PATH.get_or_init(|| {
+        Regex::new(r#"(?i)(?:\b[A-Z]:/Users/|/mnt/[a-z]/Users/)[^/\s"']+"#).expect("valid regex")
+    });
+    let re_unix_path = RE_UNIX_USER_PATH
+        .get_or_init(|| Regex::new(r#"(?:/Users/|/home/)[^/\s"']+"#).expect("valid regex"));
+    let re_email = RE_EMAIL.get_or_init(|| {
+        Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("valid regex")
+    });
+    let re_ipv4 = RE_IPV4.get_or_init(|| {
+        Regex::new(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+            .expect("valid regex")
+    });
 
     let first_line = raw
         .lines()
@@ -307,8 +342,9 @@ pub fn sanitize_cloud_reason(raw: &str) -> String {
         .unwrap_or("")
         .trim();
 
+    // 1. DLP secret/credential redaction
     let findings = dlp.scan(first_line.as_bytes());
-    let redacted = if findings.is_empty() {
+    let mut redacted = if findings.is_empty() {
         first_line.to_string()
     } else {
         let mut buf = first_line.to_string();
@@ -320,12 +356,76 @@ pub fn sanitize_cloud_reason(raw: &str) -> String {
         buf
     };
 
+    // 2. Auth headers & query-string secrets
+    redacted = re_auth
+        .replace_all(&redacted, "$1 [REDACTED:auth_header]")
+        .into_owned();
+    redacted = re_query
+        .replace_all(&redacted, "${1}[REDACTED:query_secret]")
+        .into_owned();
+
+    // 3. Cross-OS user home paths (Windows, WSL, macOS, Linux) -> ~
+    redacted = re_win_path.replace_all(&redacted, "~").into_owned();
+    redacted = re_win_fwd.replace_all(&redacted, "~").into_owned();
+    redacted = re_unix_path.replace_all(&redacted, "~").into_owned();
+
+    // 4. PII: email addresses and IPv4 addresses
+    redacted = re_email
+        .replace_all(&redacted, "[REDACTED:email]")
+        .into_owned();
+    redacted = re_ipv4.replace_all(&redacted, "[REDACTED:ip]").into_owned();
+
     if redacted.chars().count() <= 160 {
         redacted
     } else {
         let prefix: String = redacted.chars().take(157).collect();
         format!("{prefix}...")
     }
+}
+
+/// Sanitize the `actor` field before cloud egress across Windows, macOS, and Linux.
+///
+/// - Strips Windows `DOMAIN\` prefixes (never leaks AD domain names).
+/// - If `ARC_ANONYMIZE_ACTOR=1` (or `true`), replaces the username with a deterministic
+///   one-way SHA-256 pseudonym (`anon_<12-hex>`) for strict zero-PII environments.
+/// - Redacts any accidentally embedded email/secret patterns.
+pub fn sanitize_cloud_actor(actor: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let trimmed = actor.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    let clean = trimmed
+        .rsplit_once('\\')
+        .map(|(_, user)| user)
+        .unwrap_or(trimmed);
+
+    let anonymize = std::env::var("ARC_ANONYMIZE_ACTOR")
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+
+    if anonymize {
+        let mut hasher = Sha256::new();
+        hasher.update(b"vexa-arc-actor-v1:");
+        hasher.update(clean.as_bytes());
+        let digest = hex::encode(hasher.finalize());
+        return format!("anon_{}", &digest[..12]);
+    }
+
+    if clean.contains('@') {
+        let mut hasher = Sha256::new();
+        hasher.update(b"vexa-arc-actor-v1:");
+        hasher.update(clean.as_bytes());
+        let digest = hex::encode(hasher.finalize());
+        return format!("user_{}", &digest[..12]);
+    }
+
+    clean.chars().take(64).collect()
 }
 
 /// Emits a zero-code firewall/hook telemetry event to `vexa-sca-cloud` (`POST {base_url}/firewall/events`).
@@ -348,7 +448,7 @@ pub fn emit_cloud_firewall_event(event: &CloudFirewallEvent, api_base_url: Optio
         action: event.action.clone(),
         rule_triggered: event.rule_triggered.clone(),
         reason: sanitize_cloud_reason(&event.reason),
-        actor: event.actor.clone(),
+        actor: sanitize_cloud_actor(&event.actor),
         os: event.os.clone(),
         timestamp: event.timestamp.clone(),
     };
@@ -632,7 +732,8 @@ pub fn emit_cloud_heartbeat(hb: &CloudArcHeartbeat, api_base_url: Option<&str>) 
     let base_url = VexaCloudAuth::resolve_api_base_url(api_base_url);
     let url = format!("{}/arc/heartbeat", base_url.trim_end_matches('/'));
     let org_slug = VexaCloudAuth::get_org_slug();
-    let hb_owned = hb.clone();
+    let mut hb_owned = hb.clone();
+    hb_owned.actor = sanitize_cloud_actor(&hb_owned.actor);
 
     run_blocking_future(async move {
         let Ok(client) = reqwest::Client::builder()
@@ -1095,6 +1196,57 @@ mod multi_env_device_tests {
         assert!(clean.contains("[REDACTED:SEC-AWS-001]"), "clean={clean}");
         assert!(clean.contains("[REDACTED:SEC-GTH-001]"), "clean={clean}");
         assert!(!clean.contains("second line"));
+    }
+
+    #[test]
+    fn sanitize_cloud_reason_scrubs_cross_os_paths_pii_and_auth_headers() {
+        let win = sanitize_cloud_reason(r"Denied read of C:\Users\wasim\.env by wasim@corp.io");
+        assert!(!win.contains("wasim"), "Windows username leaked: {win}");
+        assert!(!win.contains("wasim@corp.io"), "Email leaked: {win}");
+        assert!(win.contains(r"~\.env"), "win={win}");
+        assert!(win.contains("[REDACTED:email]"), "win={win}");
+
+        let mac = sanitize_cloud_reason("Denied /Users/alice/.aws/credentials to 192.168.1.42");
+        assert!(!mac.contains("alice"), "macOS username leaked: {mac}");
+        assert!(!mac.contains("192.168.1.42"), "IPv4 leaked: {mac}");
+        assert!(mac.contains("~/.aws/credentials"), "mac={mac}");
+        assert!(mac.contains("[REDACTED:ip]"), "mac={mac}");
+
+        let linux = sanitize_cloud_reason("Blocked /home/bob/.ssh/id_rsa and /mnt/c/Users/bob/app");
+        assert!(!linux.contains("bob"), "Linux/WSL username leaked: {linux}");
+        assert!(linux.contains("~/.ssh/id_rsa"), "linux={linux}");
+        assert!(linux.contains("~/app"), "linux={linux}");
+
+        let auth = sanitize_cloud_reason(
+            "Blocked Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig https://api.example.com?token=secret123",
+        );
+        assert!(
+            !auth.contains("eyJhbGciOiJIUzI1NiJ9"),
+            "Bearer leaked: {auth}"
+        );
+        assert!(!auth.contains("secret123"), "Query token leaked: {auth}");
+        assert!(auth.contains("[REDACTED:auth_header]"), "auth={auth}");
+        assert!(auth.contains("[REDACTED:query_secret]"), "auth={auth}");
+    }
+
+    #[test]
+    fn sanitize_cloud_actor_strips_domain_hashes_emails_and_honors_anonymize_flag() {
+        std::env::remove_var("ARC_ANONYMIZE_ACTOR");
+
+        assert_eq!(sanitize_cloud_actor(r"CORP\wasim"), "wasim");
+        assert_eq!(sanitize_cloud_actor(""), "unknown");
+
+        let email_actor = sanitize_cloud_actor("wasim@company.com");
+        assert!(!email_actor.contains("wasim"));
+        assert!(!email_actor.contains('@'));
+        assert!(email_actor.starts_with("user_"));
+
+        std::env::set_var("ARC_ANONYMIZE_ACTOR", "1");
+        let anon = sanitize_cloud_actor("wasim");
+        std::env::remove_var("ARC_ANONYMIZE_ACTOR");
+        assert!(!anon.contains("wasim"));
+        assert!(anon.starts_with("anon_"));
+        assert_eq!(anon.len(), "anon_".len() + 12);
     }
 
     #[tokio::test]

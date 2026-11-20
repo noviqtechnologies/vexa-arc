@@ -242,6 +242,7 @@ dependencies = [
  "arc-dlp",
  "chrono",
  "hex",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
