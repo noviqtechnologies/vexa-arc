@@ -68,12 +68,12 @@ pub fn run_auth_login(token_opt: Option<&str>, api_url: Option<&str>, json: bool
         user_email.as_deref(),
         Some(&base_url),
     ) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[Arc Auth] {e}");
-                return false;
-            }
-        };
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[Arc Auth] {e}");
+            return false;
+        }
+    };
 
     if json {
         println!(
@@ -162,7 +162,8 @@ pub fn run_auth_status(api_url: Option<&str>, json: bool) -> bool {
                                     if let Some(o) = info.get("org_slug").and_then(|v| v.as_str()) {
                                         org_slug = Some(o.to_string());
                                     }
-                                    if let Some(e) = info.get("user_email").and_then(|v| v.as_str()) {
+                                    if let Some(e) = info.get("user_email").and_then(|v| v.as_str())
+                                    {
                                         user_email = Some(e.to_string());
                                     }
                                     if let Some(t) = info.get("tier").and_then(|v| v.as_str()) {

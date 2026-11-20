@@ -302,17 +302,14 @@ async fn check_osv_malicious_advisory(
         return None;
     }
     let val: serde_json::Value = resp.json().await.ok()?;
-    val.get("vulns")?
-        .as_array()?
-        .iter()
-        .find_map(|v| {
-            let id = v.get("id")?.as_str()?;
-            if id.starts_with("MAL-") && v.get("withdrawn").is_none() {
-                Some(id.to_string())
-            } else {
-                None
-            }
-        })
+    val.get("vulns")?.as_array()?.iter().find_map(|v| {
+        let id = v.get("id")?.as_str()?;
+        if id.starts_with("MAL-") && v.get("withdrawn").is_none() {
+            Some(id.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 pub async fn fetch_live_registry_metadata_async(

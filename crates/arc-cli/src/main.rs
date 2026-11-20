@@ -1792,10 +1792,7 @@ fn run_policy_sync(project_dir: &Path, api_url: Option<&str>) -> bool {
         eprintln!("[Arc Policy] Server response missing signed_envelope");
         return false;
     };
-    let seq = bundle
-        .get("sequence")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let seq = bundle.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let arc_dir = project_dir.join(".arc");
     if let Err(e) = fs::create_dir_all(&arc_dir) {
@@ -1839,7 +1836,10 @@ fn run_policy_sync(project_dir: &Path, api_url: Option<&str>) -> bool {
 
     let policy_path = arc_dir.join("signed_policy.json");
     if let Err(e) = fs::write(&policy_path, env_str.as_bytes()) {
-        eprintln!("[Arc Policy] Failed to write {}: {e}", policy_path.display());
+        eprintln!(
+            "[Arc Policy] Failed to write {}: {e}",
+            policy_path.display()
+        );
         return false;
     }
     let state_body = serde_json::json!({

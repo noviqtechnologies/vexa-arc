@@ -123,12 +123,7 @@ async fn read_chunked_body<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
         if n == 0 {
             return Err("unexpected EOF while reading chunked body".to_string());
         }
-        let size_hex = size_line
-            .trim()
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let size_hex = size_line.trim().split(';').next().unwrap_or("").trim();
         let chunk_len = usize::from_str_radix(size_hex, 16)
             .map_err(|_| format!("invalid chunk size '{size_hex}'"))?;
         if chunk_len == 0 {
@@ -146,9 +141,7 @@ async fn read_chunked_body<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
             break;
         }
         if out.len().saturating_add(chunk_len) > max_bytes {
-            return Err(format!(
-                "chunked HTTP body exceeds max {max_bytes} bytes"
-            ));
+            return Err(format!("chunked HTTP body exceeds max {max_bytes} bytes"));
         }
         let start = out.len();
         out.resize(start + chunk_len, 0);

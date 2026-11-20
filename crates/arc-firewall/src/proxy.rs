@@ -408,8 +408,10 @@ impl PackageFirewall {
             if parts.len() >= 3 {
                 let bin = parts[0].to_ascii_lowercase();
                 let flag = parts[1].to_ascii_lowercase();
-                let is_subshell = (matches!(bin.as_str(), "sh" | "bash" | "zsh" | "/bin/sh" | "/bin/bash")
-                    && flag == "-c")
+                let is_subshell = (matches!(
+                    bin.as_str(),
+                    "sh" | "bash" | "zsh" | "/bin/sh" | "/bin/bash"
+                ) && flag == "-c")
                     || (matches!(bin.as_str(), "cmd" | "cmd.exe") && flag == "/c");
                 if is_subshell {
                     let inner = parts[2..].join(" ");
@@ -434,7 +436,10 @@ impl PackageFirewall {
                     continue;
                 }
                 // Skip flag arguments that take a file/path value (e.g. `-r requirements.txt`)
-                if matches!(arg.as_str(), "-r" | "--requirement" | "-c" | "--constraint" | "--prefix" | "-C") {
+                if matches!(
+                    arg.as_str(),
+                    "-r" | "--requirement" | "-c" | "--constraint" | "--prefix" | "-C"
+                ) {
                     skip_next = true;
                     continue;
                 }

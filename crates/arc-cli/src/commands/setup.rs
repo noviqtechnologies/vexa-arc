@@ -1,8 +1,8 @@
+use arc_policy_engine::evaluator::{PolicyConfig, PolicyMode};
 use arc_telemetry::{
     emit_cloud_heartbeat, poll_device_token, request_device_code, CloudArcHeartbeat,
     DeviceTokenPollResult, VexaCloudAuth,
 };
-use arc_policy_engine::evaluator::{PolicyConfig, PolicyMode};
 use std::path::Path;
 use std::time::{Duration, Instant};
 

@@ -372,7 +372,9 @@ mod tests {
 
     #[test]
     fn credentials_roundtrip_and_cloud_event_post_succeeds() {
-        let _guard = crate::cloud::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::cloud::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp_dir = std::env::temp_dir().join(format!("arc_cloud_test_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let cred_file = tmp_dir.join("credentials.json");
@@ -436,7 +438,6 @@ mod tests {
     }
 }
 
-
 /// Zero-code-retention runtime telemetry event sent in batches to `POST {base_url}/arc/events`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CloudArcEvent {
@@ -496,11 +497,10 @@ pub fn spool_arc_event(
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create telemetry spool dir: {e}"))?;
     }
-    let occurred_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-        event.occurred_at_unix_ms as i64,
-    )
-    .map(|dt| dt.to_rfc3339())
-    .unwrap_or_else(|| Utc::now().to_rfc3339());
+    let occurred_at =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(event.occurred_at_unix_ms as i64)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
 
     let cloud_ev = CloudArcEvent {
         event_id: event.event_id.to_string(),
@@ -676,16 +676,16 @@ pub fn upload_arc_inventory(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(format!("Vexa Cloud inventory upload rejected ({status}): {text}"));
+            return Err(format!(
+                "Vexa Cloud inventory upload rejected ({status}): {text}"
+            ));
         }
         serde_json::from_str(&text)
             .map_err(|e| format!("Invalid JSON response from Vexa Cloud: {e}"))
     })?
 }
 
-pub fn fetch_signed_policy_bundle(
-    api_base_url: Option<&str>,
-) -> Result<serde_json::Value, String> {
+pub fn fetch_signed_policy_bundle(api_base_url: Option<&str>) -> Result<serde_json::Value, String> {
     if VexaCloudAuth::is_offline() {
         return Err("Policy sync skipped: offline mode is active".to_string());
     }
@@ -729,9 +729,10 @@ mod arc_spool_tests {
 
     #[test]
     fn spool_and_batch_flush_preserves_queue_on_503_and_drains_on_202() {
-        let _guard = crate::cloud::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp_dir =
-            std::env::temp_dir().join(format!("arc_spool_test_{}", uuid::Uuid::now_v7()));
+        let _guard = crate::cloud::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!("arc_spool_test_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let cred_file = tmp_dir.join("credentials.json");
 
@@ -767,7 +768,10 @@ mod arc_spool_tests {
         let flushed_err = flush_arc_event_spool(Some(&format!("http://{a1}/sca/v1")));
         h1.join().unwrap();
         assert_eq!(flushed_err, 0);
-        assert!(cloud_spool_path().exists(), "spool must not be deleted on 503");
+        assert!(
+            cloud_spool_path().exists(),
+            "spool must not be deleted on 503"
+        );
 
         // 2. Server returns 202 -> spool drains and returns 1
         let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -786,14 +790,16 @@ mod arc_spool_tests {
         assert!(received.contains("POST /sca/v1/arc/events"));
         assert!(received.contains("ARC-LTT-001"));
         assert!(!received.contains("secret-session-id"));
-        assert!(!cloud_spool_path().exists(), "spool should be removed once empty");
+        assert!(
+            !cloud_spool_path().exists(),
+            "spool should be removed once empty"
+        );
 
         std::env::remove_var("ARC_TELEMETRY_DIR");
         std::env::remove_var("VEXA_CREDENTIALS_PATH");
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
-
 
 /// OAuth 2.0 Device Flow (RFC 8628) initiation response from Vexa Cloud.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -858,8 +864,7 @@ pub fn request_device_code(api_base_url: Option<&str>) -> Result<DeviceCodeSessi
         if !status.is_success() {
             return Err(format!("Device code request failed ({status}): {text}"));
         }
-        serde_json::from_str(&text)
-            .map_err(|e| format!("Invalid device code response JSON: {e}"))
+        serde_json::from_str(&text).map_err(|e| format!("Invalid device code response JSON: {e}"))
     })?
 }
 
@@ -922,7 +927,9 @@ pub fn poll_device_token(
                 });
             }
         }
-        Err(format!("Unexpected device token response ({status}): {val}"))
+        Err(format!(
+            "Unexpected device token response ({status}): {val}"
+        ))
     })?
 }
 
@@ -1064,7 +1071,10 @@ mod multi_env_device_tests {
     fn sanitize_cloud_reason_redacts_secrets_before_egress() {
         let raw = "Blocked command containing AKIAIOSFODNN7EXAMPLE and ghp_111122223333444455556666777788889999\nsecond line";
         let clean = sanitize_cloud_reason(raw);
-        assert!(!clean.contains("AKIAIOSFODNN7EXAMPLE"), "AWS key leaked: {clean}");
+        assert!(
+            !clean.contains("AKIAIOSFODNN7EXAMPLE"),
+            "AWS key leaked: {clean}"
+        );
         assert!(
             !clean.contains("ghp_111122223333444455556666777788889999"),
             "GitHub PAT leaked: {clean}"

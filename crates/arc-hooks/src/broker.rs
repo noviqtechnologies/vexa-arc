@@ -895,7 +895,10 @@ mod fingerprint_tests {
             }
             other => panic!("expected Forward(JSON-RPC error), got {other:?}"),
         }
-        assert!(broker.current_schema_hash.is_none(), "poisoned schema must NOT be pinned");
+        assert!(
+            broker.current_schema_hash.is_none(),
+            "poisoned schema must NOT be pinned"
+        );
         assert!(broker.schema_pin_violated);
         assert_eq!(broker.requests_blocked, 1);
     }
