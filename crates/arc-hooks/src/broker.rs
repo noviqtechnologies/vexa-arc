@@ -96,6 +96,10 @@ pub struct McpStdioBroker {
     pub session_storage_dir: Option<PathBuf>,
     /// Optional local `.arc/mcp-pins.lock` path for saving TOFU pins on bootstrap.
     pub pin_lockfile: Option<PathBuf>,
+    /// When true, broker runs in explicit Safe Rollout observe mode: evaluates full policy,
+    /// records hypothetical verdict (`would_allow`, `would_deny`, `would_require_approval`),
+    /// prints persistent warnings, and forwards the original unmodified request.
+    pub observe_only: bool,
     /// In-flight `tools/call` request id (JSON text) -> tool name, for result taint attribution.
     pending_calls: HashMap<String, String>,
 }
@@ -125,8 +129,14 @@ impl McpStdioBroker {
             principal: crate::current_os_principal(),
             session_storage_dir: None,
             pin_lockfile: None,
+            observe_only: false,
             pending_calls: HashMap::new(),
         }
+    }
+
+    pub fn with_observe_mode(mut self, observe: bool) -> Self {
+        self.observe_only = observe;
+        self
     }
 
     pub fn with_host(mut self, host: AgentHost) -> Self {
@@ -298,10 +308,17 @@ impl McpStdioBroker {
 
         match method {
             Some("tools/call") => {
+                let params = parsed.get("params").cloned().unwrap_or(Value::Null);
+                let tool_name = params
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown_tool")
+                    .to_string();
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+
                 if self.schema_pin_violated
                     || (self.schema_pin_required && self.current_schema_hash.is_none())
                 {
-                    self.requests_blocked += 1;
                     let verdict = Self::deny_verdict(
                         "ARC-MCP-003",
                         format!(
@@ -313,20 +330,72 @@ impl McpStdioBroker {
                                 .to_string(),
                         ],
                     );
-                    return ClientMessageOutcome::RespondLocally(
-                        crate::mcp_jsonrpc::McpJsonRpcInterceptor::format_response(
-                            &req_id, &verdict,
-                        ),
-                    );
+                    if self.observe_only {
+                        eprintln!(
+                            "[ARC OBSERVE MODE - NOT ENFORCED] WARNING: MCP server '{}' tool '{}' failed schema pin verification (ARC-MCP-003: would_deny). Forwarding unmodified because observe mode was explicitly selected.",
+                            self.server_name, tool_name
+                        );
+                        if let Some(ref dir) = self.session_storage_dir {
+                            let policy_rev =
+                                self.evaluator.config.read().ok().map(|c| c.revision_hash());
+                            let rec = arc_policy_engine::taint_dag::SessionAuditRecord::new(
+                                uuid::Uuid::now_v7().to_string(),
+                                &tool_name,
+                                "mcp_tool_call",
+                                "allow",
+                                Some("ARC-MCP-003".to_string()),
+                                0,
+                            )
+                            .with_rollout_details(
+                                Some(self.server_name.clone()),
+                                self.current_schema_hash.map(hex::encode),
+                                policy_rev,
+                                "observe",
+                                "deny",
+                                "allow",
+                                "would_deny",
+                                None,
+                                0.0,
+                                "observe_only",
+                                None,
+                            );
+                            let _ = rec.append_to_dir(dir, &self.session_id);
+                        }
+                    } else {
+                        self.requests_blocked += 1;
+                        if let Some(ref dir) = self.session_storage_dir {
+                            let policy_rev =
+                                self.evaluator.config.read().ok().map(|c| c.revision_hash());
+                            let rec = arc_policy_engine::taint_dag::SessionAuditRecord::new(
+                                uuid::Uuid::now_v7().to_string(),
+                                &tool_name,
+                                "mcp_tool_call",
+                                "deny",
+                                Some("ARC-MCP-003".to_string()),
+                                0,
+                            )
+                            .with_rollout_details(
+                                Some(self.server_name.clone()),
+                                self.current_schema_hash.map(hex::encode),
+                                policy_rev,
+                                "enforce",
+                                "deny",
+                                "deny",
+                                "deny",
+                                None,
+                                0.0,
+                                "enforced",
+                                None,
+                            );
+                            let _ = rec.append_to_dir(dir, &self.session_id);
+                        }
+                        return ClientMessageOutcome::RespondLocally(
+                            crate::mcp_jsonrpc::McpJsonRpcInterceptor::format_response(
+                                &req_id, &verdict,
+                            ),
+                        );
+                    }
                 }
-
-                let params = parsed.get("params").cloned().unwrap_or(Value::Null);
-                let tool_name = params
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("unknown_tool")
-                    .to_string();
-                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
                 let caps = Capability::infer(&tool_name, false, false, false);
 
@@ -358,30 +427,137 @@ impl McpStdioBroker {
                 .with_capabilities(caps)
                 .with_transport("stdio");
 
+                let mut session_io_error: Option<String> = None;
                 if let Some(ref dir) = self.session_storage_dir {
-                    let _ = self.evaluator.load_session_state(dir, &self.session_id);
+                    if let Err(e) = self.evaluator.load_session_state(dir, &self.session_id) {
+                        session_io_error = Some(format!("failed to load session state: {e}"));
+                    }
                 }
 
                 let started = std::time::Instant::now();
-                let observation = self.evaluator.evaluate_with_observation(&event);
-                if let Some(ref dir) = self.session_storage_dir {
-                    let _ = self.evaluator.save_session_state(dir, &self.session_id);
-                }
-                let verdict = &observation.verdict;
-                self.emit_observation(
+                let mode_override = if self.observe_only {
+                    Some(arc_policy_engine::evaluator::PolicyMode::Observe)
+                } else {
+                    None
+                };
+                let mut observation = self.evaluator.evaluate_with_mode_override(
                     &event,
-                    &observation,
-                    started.elapsed().as_secs_f64() * 1000.0,
+                    mode_override,
+                    session_io_error,
                 );
+                if let Some(ref dir) = self.session_storage_dir {
+                    if let Err(e) = self.evaluator.save_session_state(dir, &self.session_id) {
+                        let err_msg = format!("failed to save session state: {e}");
+                        observation.evaluation_error = Some(err_msg.clone());
+                        observation.outcome =
+                            arc_policy_engine::evaluator::PolicyOutcomeKind::EvaluationError;
+                        let fail_closed = self
+                            .evaluator
+                            .config
+                            .read()
+                            .map(|c| c.fail_closed_on_eval_error)
+                            .unwrap_or(true);
+                        if fail_closed && !observation.mode.is_preview() {
+                            let deny = Self::deny_verdict(
+                                "ARC-EVAL-ERR-001",
+                                format!("Policy evaluation error (fail-closed): {err_msg}"),
+                                vec![
+                                    "Inspect session storage directory permissions and lockfiles."
+                                        .to_string(),
+                                ],
+                            );
+                            observation.hypothetical_verdict = deny.clone();
+                            observation.effective_verdict = deny.clone();
+                            observation.verdict = deny;
+                        }
+                    }
+                }
+                let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+                self.emit_observation(&event, &observation, latency_ms);
 
+                let is_observe = self.observe_only
+                    || observation.mode == arc_policy_engine::evaluator::PolicyMode::Observe;
+                let hypothetical_decision =
+                    verdict_decision(&observation.hypothetical_verdict).to_string();
+                let hypothetical_rule = verdict_rule(&observation.hypothetical_verdict);
+
+                if is_observe {
+                    eprintln!(
+                        "[ARC OBSERVE MODE - NOT ENFORCED] WARNING: Server '{}' tool '{}' evaluated as {} (hypothetical={}, rule={}). Call is NOT protected and will be forwarded unmodified.",
+                        self.server_name,
+                        tool_name,
+                        observation.outcome.as_str(),
+                        hypothetical_decision,
+                        hypothetical_rule.as_deref().unwrap_or("none")
+                    );
+                    if let Some(ref dir) = self.session_storage_dir {
+                        let rec = arc_policy_engine::taint_dag::SessionAuditRecord::new(
+                            event.event_id.to_string(),
+                            &tool_name,
+                            "mcp_tool_call",
+                            "allow",
+                            hypothetical_rule,
+                            0,
+                        )
+                        .with_rollout_details(
+                            Some(self.server_name.clone()),
+                            self.current_schema_hash.map(hex::encode),
+                            Some(observation.policy_revision.clone()),
+                            observation.mode.as_str(),
+                            &hypothetical_decision,
+                            "allow",
+                            observation.outcome.as_str(),
+                            None,
+                            latency_ms,
+                            "observe_only",
+                            observation.evaluation_error.clone(),
+                        );
+                        let _ = rec.append_to_dir(dir, &self.session_id);
+                    }
+                    if !req_id.is_null() {
+                        if self.pending_calls.len() >= MAX_PENDING_CALLS {
+                            self.pending_calls.clear();
+                        }
+                        self.pending_calls
+                            .insert(req_id.to_string(), tool_name.clone());
+                    }
+                    return ClientMessageOutcome::Forward(line.to_string());
+                }
+
+                let verdict = &observation.verdict;
                 if verdict.is_denied() {
                     self.requests_blocked += 1;
+                    if let Some(ref dir) = self.session_storage_dir {
+                        let rec = arc_policy_engine::taint_dag::SessionAuditRecord::new(
+                            event.event_id.to_string(),
+                            &tool_name,
+                            "mcp_tool_call",
+                            verdict_decision(verdict),
+                            verdict_rule(verdict),
+                            0,
+                        )
+                        .with_rollout_details(
+                            Some(self.server_name.clone()),
+                            self.current_schema_hash.map(hex::encode),
+                            Some(observation.policy_revision.clone()),
+                            observation.mode.as_str(),
+                            &hypothetical_decision,
+                            verdict_decision(verdict),
+                            observation.outcome.as_str(),
+                            None,
+                            latency_ms,
+                            "enforced",
+                            observation.evaluation_error.clone(),
+                        );
+                        let _ = rec.append_to_dir(dir, &self.session_id);
+                    }
                     let local_resp = crate::mcp_jsonrpc::McpJsonRpcInterceptor::format_response(
                         &req_id, verdict,
                     );
                     return ClientMessageOutcome::RespondLocally(local_resp);
                 }
 
+                let mut approval_outcome_str: Option<String> = None;
                 let final_verdict = match verdict {
                     Verdict::RequireApproval {
                         rule, explanation, ..
@@ -396,6 +572,7 @@ impl McpStdioBroker {
                             &explanation.summary,
                         ) {
                             Ok(grant) => {
+                                approval_outcome_str = Some("approved".to_string());
                                 // Human approved via OS modal!
                                 Verdict::Allow {
                                     obligations: vec![arc_core::verdict::Obligation::ExceptionGranted {
@@ -406,6 +583,32 @@ impl McpStdioBroker {
                             }
                             Err(deny_verdict) => {
                                 self.requests_blocked += 1;
+                                if let Some(ref dir) = self.session_storage_dir {
+                                    let rec =
+                                        arc_policy_engine::taint_dag::SessionAuditRecord::new(
+                                            event.event_id.to_string(),
+                                            &tool_name,
+                                            "mcp_tool_call",
+                                            "deny",
+                                            verdict_rule(&deny_verdict)
+                                                .or_else(|| Some(rule.0.clone())),
+                                            0,
+                                        )
+                                        .with_rollout_details(
+                                            Some(self.server_name.clone()),
+                                            self.current_schema_hash.map(hex::encode),
+                                            Some(observation.policy_revision.clone()),
+                                            observation.mode.as_str(),
+                                            &hypothetical_decision,
+                                            "deny",
+                                            "deny",
+                                            Some("denied_or_timed_out".to_string()),
+                                            latency_ms,
+                                            "enforced",
+                                            observation.evaluation_error.clone(),
+                                        );
+                                    let _ = rec.append_to_dir(dir, &self.session_id);
+                                }
                                 let local_resp =
                                     crate::mcp_jsonrpc::McpJsonRpcInterceptor::format_response(
                                         &req_id,
@@ -430,9 +633,11 @@ impl McpStdioBroker {
                 // If allowed with DLP obligations, redact arguments before forwarding!
                 if let Verdict::Allow { ref obligations } = final_verdict {
                     let mut modified_args = args;
+                    let mut redacted_count = 0usize;
                     for ob in obligations {
                         if let Obligation::Redact { spans } = ob {
                             if !spans.is_empty() {
+                                redacted_count += spans.len();
                                 self.secrets_redacted += spans.len();
                                 // Redact secret spans in the JSON arguments string
                                 let mut args_str = modified_args.to_string();
@@ -449,6 +654,35 @@ impl McpStdioBroker {
                                 }
                             }
                         }
+                    }
+
+                    if let Some(ref dir) = self.session_storage_dir {
+                        let rec = arc_policy_engine::taint_dag::SessionAuditRecord::new(
+                            event.event_id.to_string(),
+                            &tool_name,
+                            "mcp_tool_call",
+                            "allow",
+                            hypothetical_rule,
+                            redacted_count,
+                        )
+                        .with_rollout_details(
+                            Some(self.server_name.clone()),
+                            self.current_schema_hash.map(hex::encode),
+                            Some(observation.policy_revision.clone()),
+                            observation.mode.as_str(),
+                            &hypothetical_decision,
+                            "allow",
+                            if redacted_count > 0 {
+                                "redact_or_transform"
+                            } else {
+                                observation.outcome.as_str()
+                            },
+                            approval_outcome_str,
+                            latency_ms,
+                            "enforced",
+                            observation.evaluation_error.clone(),
+                        );
+                        let _ = rec.append_to_dir(dir, &self.session_id);
                     }
 
                     let mut forward_val = parsed.clone();
@@ -901,5 +1135,55 @@ mod fingerprint_tests {
         );
         assert!(broker.schema_pin_violated);
         assert_eq!(broker.requests_blocked, 1);
+    }
+
+    #[test]
+    fn broker_observe_mode_records_hypothetical_verdicts_and_forwards_unmodified() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("arc_broker_observe_{}", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let cfg = arc_policy_engine::evaluator::PolicyConfig {
+            block_unapproved_mcp: true,
+            redact_secrets: true,
+            ..Default::default()
+        };
+        let evaluator = arc_policy_engine::evaluator::PolicyEvaluator::new(cfg);
+
+        // 1. Unapproved server in observe mode: would_deny recorded, request forwarded unchanged
+        let mut broker =
+            super::McpStdioBroker::new("unapproved-mcp", "sess-rollout-preview", evaluator)
+                .allow_schema_tofu()
+                .with_observe_mode(true)
+                .with_session_storage_dir(temp_dir.clone());
+
+        let raw_call = r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"query_db","arguments":{"key":"AKIAIOSFODNN7EXAMPLE"}}}"#;
+        match broker.handle_client_message(raw_call) {
+            super::ClientMessageOutcome::Forward(forwarded) => {
+                assert_eq!(
+                    forwarded, raw_call,
+                    "Observe mode must forward the exact unmodified JSON-RPC call without redaction"
+                );
+            }
+            other => panic!("Expected Forward in observe mode, got {other:?}"),
+        }
+        assert_eq!(broker.requests_blocked, 0);
+        assert_eq!(broker.secrets_redacted, 0);
+
+        let records = arc_policy_engine::taint_dag::SessionAuditRecord::read_all_from_dir(
+            &temp_dir,
+            "sess-rollout-preview",
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].mode.as_deref(), Some("observe"));
+        assert_eq!(records[0].hypothetical_verdict.as_deref(), Some("deny"));
+        assert_eq!(records[0].effective_verdict.as_deref(), Some("allow"));
+        assert_eq!(records[0].outcome.as_deref(), Some("would_deny"));
+        assert_eq!(records[0].rule_id.as_deref(), Some("ARC-MCP-001"));
+        assert_eq!(records[0].coverage_state.as_deref(), Some("observe_only"));
+        assert!(records[0].policy_revision.is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

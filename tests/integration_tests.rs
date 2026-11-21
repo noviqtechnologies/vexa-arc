@@ -2606,3 +2606,139 @@ async fn test_phase4_disposable_worktree_sca_remediation_matrix() {
     let _ = fs::remove_dir_all(&invalid_dir);
     let _ = fs::remove_dir_all(&base_tmp);
 }
+
+#[test]
+fn test_mcp_safe_rollout_inventory_fixtures_and_scoped_allow_lifecycle() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let temp_dir =
+        std::env::temp_dir().join(format!("arc_safe_rollout_e2e_{}", uuid::Uuid::now_v7()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create a local .mcp.json configuration
+    fs::write(
+        temp_dir.join(".mcp.json"),
+        r#"{"mcpServers":{"github":{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]}}}"#,
+    )
+    .unwrap();
+
+    // 1. arc policy test --json runs all 10 deterministic policy & broker fixtures
+    let out_policy_test = Command::new(arc_bin)
+        .args([
+            "policy",
+            "test",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("failed to run arc policy test");
+    assert_eq!(out_policy_test.status.code(), Some(0));
+    let pt_json: serde_json::Value =
+        serde_json::from_slice(&out_policy_test.stdout).expect("valid policy test json");
+    assert_eq!(pt_json["all_passed"], true);
+    assert_eq!(pt_json["fixture_count"], 10);
+    assert!(pt_json["policy_revision"].as_str().is_some());
+
+    // 2. arc mcp inventory --json inspects local MCP configs and coverage contracts
+    let out_inv = Command::new(arc_bin)
+        .args([
+            "mcp",
+            "inventory",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("failed to run arc mcp inventory");
+    assert_eq!(out_inv.status.code(), Some(0));
+    let inv_json: serde_json::Value =
+        serde_json::from_slice(&out_inv.stdout).expect("valid inventory json");
+    assert_eq!(inv_json["mcp_servers_total"], 1);
+    assert_eq!(inv_json["mcp_servers"][0]["server_name"], "github");
+    assert_eq!(inv_json["mcp_servers"][0]["schema_pin_status"], "unpinned");
+    assert!(inv_json["coverage_contracts"].as_array().unwrap().len() >= 5);
+
+    // 3. Staged rollout transition: observe -> enforce via arc mcp rollout
+    let out_rollout_obs = Command::new(arc_bin)
+        .args([
+            "mcp",
+            "rollout",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--stage",
+            "observe",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run arc mcp rollout --stage observe");
+    assert_eq!(out_rollout_obs.status.code(), Some(0));
+    let ro_json: serde_json::Value =
+        serde_json::from_slice(&out_rollout_obs.stdout).expect("valid rollout json");
+    assert_eq!(ro_json["policy_mode"], "observe");
+
+    // 4. Scoped allow lifecycle: add -> list -> explain -> diff -> revoke
+    let out_allow = Command::new(arc_bin)
+        .args([
+            "allow",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--rule",
+            "ARC-MCP-001",
+            "--server",
+            "custom-db",
+            "--target",
+            "query_ro",
+            "--ttl-hours",
+            "24",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run arc allow");
+    assert_eq!(out_allow.status.code(), Some(0));
+    let allow_json: serde_json::Value =
+        serde_json::from_slice(&out_allow.stdout).expect("valid allow json");
+    let exc_id = allow_json["exception"]["id"].as_str().unwrap().to_string();
+
+    let out_list = Command::new(arc_bin)
+        .args([
+            "allow",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--list",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run arc allow --list");
+    assert_eq!(out_list.status.code(), Some(0));
+    let list_json: serde_json::Value = serde_json::from_slice(&out_list.stdout).unwrap();
+    assert_eq!(list_json["exceptions"].as_array().unwrap().len(), 1);
+
+    let out_explain = Command::new(arc_bin)
+        .args([
+            "allow",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--explain",
+            &exc_id,
+            "--json",
+        ])
+        .output()
+        .expect("failed to run arc allow --explain");
+    assert_eq!(out_explain.status.code(), Some(0));
+
+    let out_revoke = Command::new(arc_bin)
+        .args([
+            "allow",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--revoke",
+            &exc_id,
+            "--json",
+        ])
+        .output()
+        .expect("failed to run arc allow --revoke");
+    assert_eq!(out_revoke.status.code(), Some(0));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

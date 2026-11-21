@@ -20,11 +20,11 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Build and install Vexa SCA CLI
         run: |
-          git clone --depth 1 https://github.com/noviqtechnologies/vexa-sca.git /tmp/vexa-sca
+          git clone --depth 1 --branch v1.5.0 https://github.com/noviqtechnologies/vexa-sca.git /tmp/vexa-sca
           cargo build --locked --release --manifest-path /tmp/vexa-sca/Cargo.toml
           sudo cp /tmp/vexa-sca/target/release/vexa-sca /usr/local/bin/vexa-sca
           rm -rf /tmp/vexa-sca
@@ -40,7 +40,7 @@ jobs:
 
       - name: Archive Scan Reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: vexa-sca-reports
           path: |

@@ -48,18 +48,28 @@ fn cache_file_path(dir: &Path, ecosystem: &str, name: &str) -> PathBuf {
     dir.join(format!("{key}.json"))
 }
 
+fn read_cached_metadata_with_age(
+    dir: &Path,
+    ecosystem: &str,
+    name: &str,
+) -> Option<(PackageRegistryMetadata, u64)> {
+    let path = cache_file_path(dir, ecosystem, name);
+    let raw = std::fs::read_to_string(path).ok()?;
+    let entry: CachedRegistryEntry = serde_json::from_str(&raw).ok()?;
+    let age_secs = now_unix_secs().saturating_sub(entry.fetched_at_unix_secs);
+    if age_secs > CACHE_TTL_SECS {
+        return None;
+    }
+    Some((entry.metadata, age_secs))
+}
+
+#[cfg(test)]
 fn read_cached_metadata(
     dir: &Path,
     ecosystem: &str,
     name: &str,
 ) -> Option<PackageRegistryMetadata> {
-    let path = cache_file_path(dir, ecosystem, name);
-    let raw = std::fs::read_to_string(path).ok()?;
-    let entry: CachedRegistryEntry = serde_json::from_str(&raw).ok()?;
-    if now_unix_secs().saturating_sub(entry.fetched_at_unix_secs) > CACHE_TTL_SECS {
-        return None;
-    }
-    Some(entry.metadata)
+    read_cached_metadata_with_age(dir, ecosystem, name).map(|(m, _)| m)
 }
 
 fn write_cached_metadata(dir: &Path, ecosystem: &str, name: &str, meta: &PackageRegistryMetadata) {
@@ -312,10 +322,10 @@ async fn check_osv_malicious_advisory(
     })
 }
 
-pub async fn fetch_live_registry_metadata_async(
+pub async fn fetch_live_registry_metadata_with_age_async(
     ecosystem: Ecosystem,
     name: &str,
-) -> Option<(PackageRegistryMetadata, RegistryMetadataSource)> {
+) -> Option<(PackageRegistryMetadata, RegistryMetadataSource, Option<u64>)> {
     let eco_str = match ecosystem {
         Ecosystem::Npm => "npm",
         Ecosystem::Pypi => "pypi",
@@ -324,11 +334,13 @@ pub async fn fetch_live_registry_metadata_async(
     };
 
     let dir = cache_dir();
-    if let Some(cached) = read_cached_metadata(&dir, eco_str, name) {
-        return Some((cached, RegistryMetadataSource::Cache));
+    if let Some((cached, age_secs)) = read_cached_metadata_with_age(&dir, eco_str, name) {
+        return Some((cached, RegistryMetadataSource::Cache, Some(age_secs)));
     }
 
-    if std::env::var("ARC_OFFLINE").ok().as_deref() == Some("1") {
+    if std::env::var("ARC_OFFLINE").ok().as_deref() == Some("1")
+        || std::env::var("VEXA_FIREWALL_OFFLINE").ok().as_deref() == Some("1")
+    {
         return None;
     }
 
@@ -415,29 +427,48 @@ pub async fn fetch_live_registry_metadata_async(
     }
 
     write_cached_metadata(&dir, eco_str, name, &meta);
-    Some((meta, RegistryMetadataSource::Live))
+    Some((meta, RegistryMetadataSource::Live, Some(0)))
 }
 
-pub fn fetch_live_registry_metadata(
+pub async fn fetch_live_registry_metadata_async(
     ecosystem: Ecosystem,
     name: &str,
 ) -> Option<(PackageRegistryMetadata, RegistryMetadataSource)> {
-    if cfg!(test) || std::env::var("ARC_OFFLINE").ok().as_deref() == Some("1") {
+    fetch_live_registry_metadata_with_age_async(ecosystem, name)
+        .await
+        .map(|(m, src, _)| (m, src))
+}
+
+pub fn fetch_live_registry_metadata_with_age(
+    ecosystem: Ecosystem,
+    name: &str,
+) -> Option<(PackageRegistryMetadata, RegistryMetadataSource, Option<u64>)> {
+    if cfg!(test)
+        || std::env::var("ARC_OFFLINE").ok().as_deref() == Some("1")
+        || std::env::var("VEXA_FIREWALL_OFFLINE").ok().as_deref() == Some("1")
+    {
         let eco_str = match ecosystem {
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "pypi",
             Ecosystem::Cargo => "cargo",
             Ecosystem::Go => return None,
         };
-        return read_cached_metadata(&cache_dir(), eco_str, name)
-            .map(|m| (m, RegistryMetadataSource::Cache));
+        return read_cached_metadata_with_age(&cache_dir(), eco_str, name)
+            .map(|(m, age)| (m, RegistryMetadataSource::Cache, Some(age)));
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
-    rt.block_on(fetch_live_registry_metadata_async(ecosystem, name))
+    rt.block_on(fetch_live_registry_metadata_with_age_async(ecosystem, name))
+}
+
+pub fn fetch_live_registry_metadata(
+    ecosystem: Ecosystem,
+    name: &str,
+) -> Option<(PackageRegistryMetadata, RegistryMetadataSource)> {
+    fetch_live_registry_metadata_with_age(ecosystem, name).map(|(m, src, _)| (m, src))
 }
 
 #[cfg(test)]

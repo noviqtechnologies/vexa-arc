@@ -129,8 +129,17 @@ arc audit
 # 🔒 Detect secrets with local pseudonymization token replacement:
 arc scan-secrets --path .env --redact
 
-# 🔓 Allowlist a specific rule/target in .arc/policy.json:
-arc allow --rule ARC-LTT-001 --target slack --reason "Approved workspace webhook"
+# 🔓 Scoped allowlist management (add, list, explain, diff, revoke) in .arc/policy.json:
+arc allow --rule ARC-MCP-001 --server custom-db --target query_ro --ttl-hours 168 --reason "Approved read-only query tool"
+arc allow --list
+arc allow --diff
+
+# 🧭 MCP Safe Rollout: local inventory, preview mode, rollout impact report, and deterministic policy fixtures:
+arc mcp inventory
+arc protect stdio --server github --observe -- npx -y @modelcontextprotocol/server-github
+arc mcp rollout --stage review
+arc policy test --json
+arc policy simulate --json
 
 # 🔌 Expose Arc security tools to any MCP-capable agent (Codex, Gemini CLI, Windsurf, Cline):
 arc mcp-server
@@ -547,12 +556,13 @@ jobs:
   arc-security-gate:
     runs-on: ubuntu-latest # also supports macos-latest and windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: noviqtechnologies/vexa-arc@v1.0.5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: noviqtechnologies/vexa-arc@v1.2.5
         with:
           fail-on: high
           fail-on-secrets: 'true'
           run-sca: 'true'
+          run-policy-test: 'true'
           comment-pr: 'true'
 ```
 
@@ -560,14 +570,17 @@ jobs:
 
 ## Automated Tests & Verification
 
-The workspace includes unit and integration test suites across its crates. Tests, formatting, and Clippy were not run during this source review because the Rust toolchain was unavailable; run these checks and review the current CI matrix before merge or deployment:
+Run the locked formatting, linter, action regression, and workspace test suites across Linux, macOS, and Windows:
 
 ```bash
+# Run GitHub Action & installer fail-closed regression tests
+node .github/actions/comment-pr.test.js
+
 # Run the entire workspace test suite
-cargo test --workspace
+cargo test --workspace --all-targets --locked
 
 # Run strict clippy verification (zero warnings allowed)
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 | Crate | Source/test coverage summary |

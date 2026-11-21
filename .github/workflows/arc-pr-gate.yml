@@ -15,10 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Run Vexa Arc Action (from PR source)
         uses: ./
@@ -28,4 +28,15 @@ jobs:
           fail-on: 'high'
           fail-on-secrets: 'false' # Repo contains synthetic secret fixtures in arc-dlp/tests
           run-sca: 'true'
+          run-policy-test: 'true'
           comment-pr: 'true'
+
+      - name: Upload Redacted PR Security & Policy Report Artifact
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: arc-pr-gate-report
+          path: |
+            ${{ runner.temp }}/arc-pr-report.json
+            ${{ runner.temp }}/arc-pr-report.md
+            ${{ runner.temp }}/arc-policy-test.json

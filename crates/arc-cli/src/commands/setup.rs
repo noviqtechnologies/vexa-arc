@@ -147,6 +147,7 @@ pub fn build_workstation_heartbeat(project_dir: &Path) -> CloudArcHeartbeat {
         .map(|p| match p.mode {
             PolicyMode::Enforce => "enforce",
             PolicyMode::Audit => "audit",
+            PolicyMode::Observe => "observe",
         })
         .unwrap_or("enforce");
 

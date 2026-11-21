@@ -1379,6 +1379,8 @@ pub fn classify_shell_command(command: &str) -> SinkClass {
     sink
 }
 
+pub const MAX_AUDIT_RECORDS_PER_SESSION: usize = 5000;
+
 /// Represents a structured operational audit log entry for a mediated session event (Pillar 2)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionAuditRecord {
@@ -1392,6 +1394,28 @@ pub struct SessionAuditRecord {
     pub rule_id: Option<String>,
     #[serde(default)]
     pub redactions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypothetical_verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_error: Option<String>,
 }
 
 impl SessionAuditRecord {
@@ -1404,20 +1428,66 @@ impl SessionAuditRecord {
         redactions: usize,
     ) -> Self {
         let timestamp = chrono::Utc::now().timestamp().max(0) as u64;
+        let verdict_str = verdict.into();
         Self {
             timestamp,
             event_id: event_id.into(),
             tool: tool.into(),
             action_kind: action_kind.into(),
-            verdict: verdict.into(),
+            verdict: verdict_str.clone(),
             rule_id,
             redactions,
+            server_name: None,
+            schema_fingerprint: None,
+            policy_revision: None,
+            mode: None,
+            hypothetical_verdict: None,
+            effective_verdict: Some(verdict_str),
+            outcome: None,
+            approval_outcome: None,
+            latency_ms: None,
+            coverage_state: None,
+            evaluation_error: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_rollout_details(
+        mut self,
+        server_name: Option<String>,
+        schema_fingerprint: Option<String>,
+        policy_revision: Option<String>,
+        mode: impl Into<String>,
+        hypothetical_verdict: impl Into<String>,
+        effective_verdict: impl Into<String>,
+        outcome: impl Into<String>,
+        approval_outcome: Option<String>,
+        latency_ms: f64,
+        coverage_state: impl Into<String>,
+        evaluation_error: Option<String>,
+    ) -> Self {
+        self.server_name = server_name;
+        self.schema_fingerprint = schema_fingerprint;
+        self.policy_revision = policy_revision;
+        self.mode = Some(mode.into());
+        self.hypothetical_verdict = Some(hypothetical_verdict.into());
+        self.effective_verdict = Some(effective_verdict.into());
+        self.outcome = Some(outcome.into());
+        self.approval_outcome = approval_outcome;
+        self.latency_ms = Some(latency_ms);
+        self.coverage_state = Some(coverage_state.into());
+        self.evaluation_error = evaluation_error;
+        self
     }
 
     /// Appends this audit record as a single JSON line to <storage_dir>/<safe_session_id>.audit.jsonl
     pub fn append_to_dir(&self, dir: &Path, session_id: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
         let safe_name = SessionTaintDag::safe_file_name(session_id);
         let path = dir.join(format!("{safe_name}.audit.jsonl"));
         let json_line = serde_json::to_string(self)
@@ -1427,7 +1497,27 @@ impl SessionAuditRecord {
             .create(true)
             .append(true)
             .open(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         writeln!(file, "{}", json_line)?;
+
+        // Enforce bounded retention (MAX_AUDIT_RECORDS_PER_SESSION)
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 2 * 1024 * 1024 {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let lines: Vec<&str> =
+                        content.lines().filter(|l| !l.trim().is_empty()).collect();
+                    if lines.len() > MAX_AUDIT_RECORDS_PER_SESSION {
+                        let kept = &lines[lines.len() - MAX_AUDIT_RECORDS_PER_SESSION..];
+                        let trimmed = format!("{}\n", kept.join("\n"));
+                        let _ = std::fs::write(&path, trimmed.as_bytes());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

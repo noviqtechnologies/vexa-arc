@@ -7,7 +7,10 @@ pub use approval::{
     ApprovalGrant, ApprovalManager, ApprovalModal, ApprovalPromptError, ApprovalStore,
     DesktopSessionPreflight,
 };
-pub use evaluator::{EvaluationObservation, PolicyConfig, PolicyEvaluator};
+pub use evaluator::{
+    EvaluationObservation, PolicyConfig, PolicyEvaluator, PolicyException, PolicyMode,
+    PolicyOutcomeKind, PolicySource,
+};
 pub use taint_dag::{
     SessionAuditRecord, SessionAuditSummary, SessionTaintDag, TaintEntry, TaintTracker,
 };

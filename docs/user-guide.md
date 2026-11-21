@@ -107,8 +107,20 @@ arc init
 # Or start in non-blocking audit mode ("mode": "audit" in .arc/policy.json)
 arc init --audit-mode
 
-# Allowlist a specific rule/target if needed
-arc allow --rule ARC-LTT-001 --target slack --reason "Approved workspace webhook"
+# Allowlist a specific rule/target with narrow server/tool scope, or inspect/revoke saved exceptions
+arc allow --rule ARC-LTT-001 --server slack --target slack_post_message --ttl-hours 168 --reason "Approved workspace webhook"
+arc allow --list
+arc allow --explain <exception-id>
+arc allow --diff
+arc allow --revoke <exception-id>
+
+# MCP Safe Rollout workflow (observe -> review -> enforce)
+arc mcp inventory --json
+arc protect stdio --server github --observe -- npx -y @modelcontextprotocol/server-github
+arc mcp rollout --stage review
+arc policy test --json
+arc policy simulate --json
+arc mcp rollout --stage enforce
 ```
 
 #### Connecting to Vexa Cloud (`arc setup` — Linux, macOS & Windows)

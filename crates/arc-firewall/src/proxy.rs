@@ -1,12 +1,14 @@
 use arc_core::event::Ecosystem;
 
-use crate::registry::{fetch_live_registry_metadata, RegistryMetadataSource};
+use crate::registry::{fetch_live_registry_metadata_with_age, RegistryMetadataSource};
 use crate::slopsquat::{CompoundAntiSlopsquatEngine, PackageRegistryMetadata, SlopsquatVerdict};
 
 #[derive(Debug, Clone)]
 pub struct LivePackageInspection {
     pub verdict: SlopsquatVerdict,
     pub source: RegistryMetadataSource,
+    pub cache_age_secs: Option<u64>,
+    pub confidence_known: bool,
     pub metadata: Option<PackageRegistryMetadata>,
 }
 
@@ -198,7 +200,29 @@ impl PackageFirewall {
         package_name: &str,
         has_dangerous_scripts: bool,
     ) -> LivePackageInspection {
-        if let Some((mut meta, source)) = fetch_live_registry_metadata(ecosystem, package_name) {
+        self.inspect_package_live_with_control(
+            ecosystem,
+            package_name,
+            has_dangerous_scripts,
+            false,
+        )
+    }
+
+    /// Evaluates a package with explicit fail-open/closed behavior when live and cached registry
+    /// metadata are unavailable (`RegistryMetadataSource::HeuristicFallback`).
+    /// When `fail_closed_on_unknown` is false (default), an unverified package without typosquatting,
+    /// malware, or lifecycle script signals returns `SlopsquatVerdict::Review` ("UnverifiedHeuristicFallback")
+    /// rather than blocking solely on fabricated heuristic zeros.
+    pub fn inspect_package_live_with_control(
+        &self,
+        ecosystem: Ecosystem,
+        package_name: &str,
+        has_dangerous_scripts: bool,
+        fail_closed_on_unknown: bool,
+    ) -> LivePackageInspection {
+        if let Some((mut meta, source, cache_age_secs)) =
+            fetch_live_registry_metadata_with_age(ecosystem, package_name)
+        {
             if has_dangerous_scripts {
                 meta.has_dangerous_lifecycle_scripts = true;
             }
@@ -206,14 +230,34 @@ impl PackageFirewall {
             LivePackageInspection {
                 verdict,
                 source,
+                cache_age_secs,
+                confidence_known: true,
                 metadata: Some(meta),
             }
         } else {
-            let verdict =
+            let raw_verdict =
                 self.inspect_package_protected(ecosystem, package_name, has_dangerous_scripts);
+            let verdict = match raw_verdict {
+                SlopsquatVerdict::Blocked { gate, reason }
+                    if gate == "CompoundProvenanceGate" && !fail_closed_on_unknown =>
+                {
+                    SlopsquatVerdict::Review {
+                        gate: "UnverifiedHeuristicFallback",
+                        reason: format!(
+                            "Registry metadata unavailable (heuristic fallback, confidence=unknown): {reason}"
+                        ),
+                        containment_recommendation:
+                            "Live registry metadata was not reachable; verify package provenance online or enable strict offline blocking."
+                                .to_string(),
+                    }
+                }
+                other => other,
+            };
             LivePackageInspection {
                 verdict,
                 source: RegistryMetadataSource::HeuristicFallback,
+                cache_age_secs: None,
+                confidence_known: false,
                 metadata: None,
             }
         }

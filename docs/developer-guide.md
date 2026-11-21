@@ -94,7 +94,8 @@ flowchart BT
 
 * **`#![forbid(unsafe_code)]`** is enforced across domain logic crates.
 * Libraries use **`thiserror`**; the CLI binary handles user-facing errors cleanly.
-* `arc-firewall` consumes the shared **`vexa-sca`** and **`vexa-core`** crates (`noviqtechnologies/vexa-sca` tag `v1.4.0`) so local `arc shield` / `arc sca audit` and Vexa Cloud run the exact same OSV, `MAL-*`, CVSS, and AST reachability engine.
+* `arc-firewall` consumes the shared **`vexa-sca`** and **`vexa-core`** crates (`noviqtechnologies/vexa-sca` tag `v1.5.0`) so local `arc shield` / `arc sca audit` and Vexa Cloud run the exact same OSV, `MAL-*`, CVSS, and AST reachability engine.
+* `arc-policy-engine` separates **`hypothetical_verdict`** from **`effective_verdict`** in `EvaluationObservation` with stable `PolicyOutcomeKind` classifications (`allow`, `deny`, `require_approval`, `quarantine`, `redact_or_transform`, `would_allow`, `would_deny`, `would_require_approval`, `would_quarantine`, `evaluation_error`, `not_observed`) and deterministic SHA-256 JCS `policy_revision` hashes. `SignedOrganization` and `EmergencyDeny` layers cannot be weakened by lower-precedence `ProjectLocal` or `UserGlobal` configuration or local `active_exceptions`.
 
 ---
 

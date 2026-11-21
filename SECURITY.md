@@ -6,7 +6,8 @@ Vexa Arc follows semantic versioning and provides security updates for the follo
 
 | Version | Supported          | Security Maintenance Level |
 | ------- | ------------------ | --------------------------- |
-| 1.0.x   | :white_check_mark: | Active security updates     |
+| 1.2.x   | :white_check_mark: | Active security updates     |
+| 1.0.x   | :white_check_mark: | Security fixes only         |
 | < 1.0.0 | :x:                | Deprecated / Not maintained |
 
 ---

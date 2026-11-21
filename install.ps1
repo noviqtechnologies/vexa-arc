@@ -12,6 +12,10 @@ else {
     $Tag = $Version
 }
 
+if ([string]::IsNullOrWhiteSpace($Tag) -or ($Tag -notmatch '^v\d+\.\d+\.\d+(-[A-Za-z0-9._-]+)?$')) {
+    throw "Invalid release tag format '$Tag' (expected vX.Y.Z); failing closed."
+}
+
 $Archive = "vexa-arc-$Tag-windows-x86_64.zip"
 $BaseUrl = "https://github.com/$Repo/releases/download/$Tag"
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("vexa-arc-install-" + [System.Guid]::NewGuid().ToString("N"))
@@ -24,20 +28,35 @@ try {
     Invoke-WebRequest -Uri "$BaseUrl/$Archive" -OutFile $ArchivePath
     Invoke-WebRequest -Uri "$BaseUrl/checksums.txt" -OutFile $ChecksumsPath
 
-    $ExpectedLine = Get-Content $ChecksumsPath | Where-Object { $_ -match "\s$([regex]::Escape($Archive))$" } | Select-Object -First 1
-    if ($ExpectedLine) {
-        $ExpectedSha = ($ExpectedLine -split "\s+")[0].ToLowerInvariant()
-        $ActualSha = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($ActualSha -ne $ExpectedSha) {
-            throw "Checksum mismatch! Expected $ExpectedSha, got $ActualSha"
-        }
+    if (-not (Test-Path -LiteralPath $ChecksumsPath) -or ((Get-Item -LiteralPath $ChecksumsPath).Length -eq 0)) {
+        throw "Downloaded checksums.txt is empty or missing; failing closed."
+    }
+
+    $ExpectedLine = Get-Content -LiteralPath $ChecksumsPath | Where-Object { $_ -match "^\s*([0-9a-fA-F]{64})\s+(\./)?$([regex]::Escape($Archive))\s*$" } | Select-Object -First 1
+    if (-not $ExpectedLine) {
+        throw "No valid SHA-256 entry found for '$Archive' in checksums.txt; failing closed."
+    }
+
+    $ExpectedSha = (($ExpectedLine.Trim() -split "\s+")[0]).ToLowerInvariant()
+    if ($ExpectedSha -notmatch '^[0-9a-f]{64}$') {
+        throw "Malformed SHA-256 digest '$ExpectedSha' in checksums.txt; failing closed."
+    }
+
+    $ActualSha = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($ActualSha -ne $ExpectedSha) {
+        throw "Checksum mismatch for $Archive! Expected $ExpectedSha, got $ActualSha"
     }
 
     $ExtractDir = Join-Path $TmpDir "extracted"
-    Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
+    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ExtractDir -Force
+    $ExtractedBin = Join-Path $ExtractDir "bin\arc.exe"
+    if (-not (Test-Path -LiteralPath $ExtractedBin)) {
+        throw "Extracted archive did not contain expected binary bin\arc.exe; failing closed."
+    }
+
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     $InstalledExe = Join-Path $InstallDir "arc.exe"
-    Copy-Item -Path (Join-Path $ExtractDir "bin\arc.exe") -Destination $InstalledExe -Force
+    Copy-Item -LiteralPath $ExtractedBin -Destination $InstalledExe -Force
 
     # Prepend InstallDir to User PATH so the newly installed binary takes precedence
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,5 +82,5 @@ try {
     }
 }
 finally {
-    Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }

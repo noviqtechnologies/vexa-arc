@@ -17,6 +17,57 @@ pub enum PolicyMode {
     #[default]
     Enforce,
     Audit,
+    #[serde(alias = "preview")]
+    Observe,
+}
+
+impl PolicyMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PolicyMode::Enforce => "enforce",
+            PolicyMode::Audit => "audit",
+            PolicyMode::Observe => "observe",
+        }
+    }
+
+    pub fn is_preview(&self) -> bool {
+        matches!(self, PolicyMode::Audit | PolicyMode::Observe)
+    }
+}
+
+/// Stable policy evaluation classification separating enforcement decisions from preview/observe outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyOutcomeKind {
+    Allow,
+    Deny,
+    RequireApproval,
+    Quarantine,
+    RedactOrTransform,
+    WouldAllow,
+    WouldDeny,
+    WouldRequireApproval,
+    WouldQuarantine,
+    EvaluationError,
+    NotObserved,
+}
+
+impl PolicyOutcomeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PolicyOutcomeKind::Allow => "allow",
+            PolicyOutcomeKind::Deny => "deny",
+            PolicyOutcomeKind::RequireApproval => "require_approval",
+            PolicyOutcomeKind::Quarantine => "quarantine",
+            PolicyOutcomeKind::RedactOrTransform => "redact_or_transform",
+            PolicyOutcomeKind::WouldAllow => "would_allow",
+            PolicyOutcomeKind::WouldDeny => "would_deny",
+            PolicyOutcomeKind::WouldRequireApproval => "would_require_approval",
+            PolicyOutcomeKind::WouldQuarantine => "would_quarantine",
+            PolicyOutcomeKind::EvaluationError => "evaluation_error",
+            PolicyOutcomeKind::NotObserved => "not_observed",
+        }
+    }
 }
 
 #[derive(
@@ -31,7 +82,7 @@ pub enum PolicySource {
     EmergencyDeny,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct McpIdentityRule {
     pub server_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,7 +91,7 @@ pub struct McpIdentityRule {
     pub schema_root: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PolicyException {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,6 +102,14 @@ pub struct PolicyException {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PolicySource>,
     pub granted_by: String,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
@@ -69,6 +128,18 @@ impl PolicyException {
         target: Option<&str>,
         now_ms: u64,
     ) -> bool {
+        self.matches_scoped(session_id, rule_id, target, None, None, now_ms)
+    }
+
+    pub fn matches_scoped(
+        &self,
+        session_id: &str,
+        rule_id: &str,
+        target: Option<&str>,
+        server_name: Option<&str>,
+        schema_fingerprint: Option<&str>,
+        now_ms: u64,
+    ) -> bool {
         if !self.is_active(now_ms) {
             return false;
         }
@@ -82,6 +153,22 @@ impl PolicyException {
                 return false;
             }
         }
+        if let Some(ref srv) = self.server_name {
+            if srv != "*" {
+                match server_name {
+                    Some(actual_srv) if actual_srv == srv => {}
+                    _ => return false,
+                }
+            }
+        }
+        if let Some(ref pinned_fp) = self.schema_fingerprint {
+            if pinned_fp != "*" {
+                match schema_fingerprint {
+                    Some(actual_fp) if actual_fp.eq_ignore_ascii_case(pinned_fp) => {}
+                    _ => return false,
+                }
+            }
+        }
         if let Some(ref t) = self.target {
             if let Some(tgt) = target {
                 if !tgt.contains(t) && t != "*" {
@@ -93,6 +180,10 @@ impl PolicyException {
         }
         true
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -111,6 +202,8 @@ pub struct PolicyConfig {
     pub block_unapproved_mcp: bool,
     pub enforce_taint_dag: bool,
     pub redact_secrets: bool,
+    #[serde(default = "default_true")]
+    pub fail_closed_on_eval_error: bool,
     #[serde(default)]
     pub emergency_deny_servers: HashSet<String>,
     #[serde(default)]
@@ -141,6 +234,7 @@ impl Default for PolicyConfig {
             block_unapproved_mcp: false,
             enforce_taint_dag: true,
             redact_secrets: true,
+            fail_closed_on_eval_error: true,
             emergency_deny_servers: HashSet::new(),
             active_exceptions: Vec::new(),
             require_approval_rules: HashSet::new(),
@@ -268,10 +362,25 @@ pub fn parse_signed_policy(
         }
     }
     policy.source = Some(PolicySource::SignedOrganization);
+    for exc in &mut policy.active_exceptions {
+        exc.source = Some(PolicySource::SignedOrganization);
+    }
     Ok(policy)
 }
 
 impl PolicyConfig {
+    /// Computes a deterministic SHA-256 JCS revision hash of this policy configuration.
+    pub fn revision_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_jcs::to_vec(self)
+            .or_else(|_| serde_json::to_vec(self))
+            .unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(b"VEXA-ARC-POLICY-REV-V1\0");
+        hasher.update(&bytes);
+        hex::encode(hasher.finalize())
+    }
+
     fn read_policy_file(
         path: &std::path::Path,
         source: PolicySource,
@@ -284,6 +393,9 @@ impl PolicyConfig {
         let mut parsed: PolicyConfig = serde_json::from_str(&content)
             .map_err(|e| format!("malformed policy {}: {e}", path.display()))?;
         parsed.source = Some(source);
+        for exc in &mut parsed.active_exceptions {
+            exc.source = Some(source);
+        }
         // Local project/user files are not trust anchors for MCP schema hashes.
         parsed.mcp_schema_pins.clear();
         Ok(Some(parsed))
@@ -389,20 +501,60 @@ impl PolicyConfig {
     }
 
     /// Merges higher precedence config over current config, preserving emergency deny rules
-    pub fn merge_lower_precedence(&mut self, higher: PolicyConfig) {
+    /// and ensuring SignedOrganization / EmergencyDeny policies cannot be weakened by local policy.
+    pub fn merge_lower_precedence(&mut self, mut higher: PolicyConfig) {
+        let self_is_authoritative = matches!(
+            self.source,
+            Some(PolicySource::SignedOrganization | PolicySource::EmergencyDeny)
+        );
+        let higher_is_authoritative = matches!(
+            higher.source,
+            Some(PolicySource::SignedOrganization | PolicySource::EmergencyDeny)
+        );
+
+        // Stamp exceptions with their policy source if not already stamped
+        if let Some(src) = higher.source {
+            for exc in &mut higher.active_exceptions {
+                if exc.source.is_none() {
+                    exc.source = Some(src);
+                }
+            }
+        }
+
+        // Emergency deny rules are monotonic and cannot be removed by any layer
+        for s in higher.emergency_deny_servers {
+            self.emergency_deny_servers.insert(s);
+        }
+
+        // If self is already SignedOrganization/EmergencyDeny and a lower-authority layer is merged,
+        // the lower layer must NEVER weaken enforcement, allowlists, schema pins, or inject local exceptions.
+        if self_is_authoritative && !higher_is_authoritative {
+            self.block_unapproved_mcp |= higher.block_unapproved_mcp;
+            self.enforce_taint_dag |= higher.enforce_taint_dag;
+            self.redact_secrets |= higher.redact_secrets;
+            self.fail_closed_on_eval_error |= higher.fail_closed_on_eval_error;
+            self.require_approval_for_trifecta |= higher.require_approval_for_trifecta;
+            for rule in higher.require_approval_rules {
+                self.require_approval_rules.insert(rule);
+            }
+            for srv in higher.require_approval_servers {
+                self.require_approval_servers.insert(srv);
+            }
+            for denied in &self.emergency_deny_servers {
+                self.allowed_mcp_servers.remove(denied);
+            }
+            return;
+        }
+
         self.version = higher.version;
         self.mode = higher.mode;
-        self.source = higher.source;
+        self.source = higher.source.or(self.source);
         self.block_unapproved_mcp = higher.block_unapproved_mcp;
         self.enforce_taint_dag = higher.enforce_taint_dag;
         self.redact_secrets = higher.redact_secrets;
+        self.fail_closed_on_eval_error = higher.fail_closed_on_eval_error;
         if higher.source == Some(PolicySource::SignedOrganization) {
             self.mcp_schema_pins = higher.mcp_schema_pins;
-        }
-
-        // Emergency deny rules cannot be removed by local policy
-        for s in higher.emergency_deny_servers {
-            self.emergency_deny_servers.insert(s);
         }
 
         // Allowed servers from higher precedence
@@ -414,13 +566,26 @@ impl PolicyConfig {
 
         // Merge MCP identities
         for id_rule in higher.allowed_mcp_identities {
-            if !self
+            if let Some(existing) = self
                 .allowed_mcp_identities
-                .iter()
-                .any(|r| r.server_name == id_rule.server_name)
+                .iter_mut()
+                .find(|r| r.server_name == id_rule.server_name)
             {
+                *existing = id_rule;
+            } else {
                 self.allowed_mcp_identities.push(id_rule);
             }
+        }
+
+        // When SignedOrganization or EmergencyDeny is applied, purge any lower-authority exceptions
+        // so UserGlobal / ProjectLocal allowlist exceptions cannot bypass signed org policy.
+        if higher_is_authoritative {
+            self.active_exceptions.retain(|e| {
+                matches!(
+                    e.source,
+                    Some(PolicySource::SignedOrganization | PolicySource::EmergencyDeny)
+                )
+            });
         }
 
         // Merge active exceptions
@@ -477,8 +642,24 @@ pub struct PolicyEvaluator {
     known_schemas: RwLock<HashMap<(String, String), [u8; 32]>>, // (session_id, server_name) -> canonical JCS sha256
 }
 
+#[derive(Debug, Clone)]
 pub struct EvaluationObservation {
+    /// Effective verdict returned to caller (for backward compatibility with `.verdict` consumers).
     pub verdict: Verdict,
+    /// Raw enforcement verdict before any Audit/Observe preview conversion.
+    pub hypothetical_verdict: Verdict,
+    /// Effective action taken after mode-aware evaluation.
+    pub effective_verdict: Verdict,
+    /// Explicit stable policy outcome classification.
+    pub outcome: PolicyOutcomeKind,
+    /// Policy mode under which the evaluation ran.
+    pub mode: PolicyMode,
+    /// Authoritative policy source layer.
+    pub policy_source: PolicySource,
+    /// Deterministic SHA-256 JCS revision hash of the active PolicyConfig.
+    pub policy_revision: String,
+    /// Populated when an evaluator or session lock error occurred.
+    pub evaluation_error: Option<String>,
     pub taints_after: Taint,
     pub newly_added_taints: Taint,
     pub sink_class: SinkClass,
@@ -502,6 +683,16 @@ impl PolicyEvaluator {
         }
     }
 
+    fn read_config_safe(&self) -> (PolicyConfig, Option<String>) {
+        match self.config.read() {
+            Ok(g) => (g.clone(), None),
+            Err(poisoned) => (
+                poisoned.into_inner().clone(),
+                Some("PolicyEvaluator config RwLock was poisoned".to_string()),
+            ),
+        }
+    }
+
     pub fn load_session_state(
         &self,
         dir: &std::path::Path,
@@ -509,7 +700,10 @@ impl PolicyEvaluator {
     ) -> std::io::Result<Option<crate::taint_dag::SessionTaintDag>> {
         let res = self.taint_tracker.load_session_from_disk(dir, session_id)?;
         if let Some(ref dag) = res {
-            let mut schemas = self.known_schemas.write().unwrap();
+            let mut schemas = match self.known_schemas.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             for (srv, hash) in &dag.known_schemas {
                 schemas.insert((session_id.to_string(), srv.clone()), *hash);
             }
@@ -522,7 +716,10 @@ impl PolicyEvaluator {
         dir: &std::path::Path,
         session_id: &str,
     ) -> std::io::Result<std::path::PathBuf> {
-        let schemas = self.known_schemas.read().unwrap();
+        let schemas = match self.known_schemas.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let session_schemas: HashMap<String, [u8; 32]> = schemas
             .iter()
             .filter(|((s_id, _), _)| s_id == session_id)
@@ -538,31 +735,52 @@ impl PolicyEvaluator {
         dir: Option<&std::path::Path>,
         session_id: &str,
     ) -> std::io::Result<bool> {
-        let mut schemas = self.known_schemas.write().unwrap();
+        let mut schemas = match self.known_schemas.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         schemas.retain(|(s_id, _), _| s_id != session_id);
         self.taint_tracker.clear_session(dir, session_id)
     }
 
-    pub fn evaluate_with_observation(&self, event: &ActionEvent) -> EvaluationObservation {
-        let before = self.taint_tracker.current_taints(&event.host_session_id);
-        let sink_class = TaintTracker::classify_event_sink(event);
-        let verdict = self.evaluate(event);
-        let taints_after = self.taint_tracker.current_taints(&event.host_session_id);
-        EvaluationObservation {
-            verdict,
-            taints_after,
-            newly_added_taints: taints_after & !before,
-            sink_class,
+    fn classify_outcome(
+        mode: PolicyMode,
+        hypothetical: &Verdict,
+        evaluation_error: Option<&str>,
+    ) -> PolicyOutcomeKind {
+        if evaluation_error.is_some() {
+            return PolicyOutcomeKind::EvaluationError;
+        }
+        match mode {
+            PolicyMode::Enforce => match hypothetical {
+                Verdict::Allow { obligations } => {
+                    let has_redaction = obligations
+                        .iter()
+                        .any(|o| matches!(o, Obligation::Redact { .. }));
+                    if has_redaction {
+                        PolicyOutcomeKind::RedactOrTransform
+                    } else {
+                        PolicyOutcomeKind::Allow
+                    }
+                }
+                Verdict::Deny { .. } => PolicyOutcomeKind::Deny,
+                Verdict::RequireApproval { .. } => PolicyOutcomeKind::RequireApproval,
+                Verdict::Quarantine { .. } => PolicyOutcomeKind::Quarantine,
+            },
+            PolicyMode::Audit | PolicyMode::Observe => match hypothetical {
+                Verdict::Allow { .. } => PolicyOutcomeKind::WouldAllow,
+                Verdict::Deny { .. } => PolicyOutcomeKind::WouldDeny,
+                Verdict::RequireApproval { .. } => PolicyOutcomeKind::WouldRequireApproval,
+                Verdict::Quarantine { .. } => PolicyOutcomeKind::WouldQuarantine,
+            },
         }
     }
 
-    /// Evaluates an ActionEvent against enterprise policies and the session Taint DAG.
-    pub fn evaluate(&self, event: &ActionEvent) -> Verdict {
-        let cfg = self.config.read().unwrap().clone();
-        let verdict = self.evaluate_enforced(event, &cfg);
-        if cfg.mode == PolicyMode::Audit {
-            match verdict {
-                Verdict::Allow { .. } => verdict,
+    fn to_effective_verdict(mode: PolicyMode, hypothetical: &Verdict) -> Verdict {
+        match mode {
+            PolicyMode::Enforce => hypothetical.clone(),
+            PolicyMode::Audit => match hypothetical {
+                Verdict::Allow { .. } => hypothetical.clone(),
                 Verdict::Deny { rule, explanation }
                 | Verdict::Quarantine { rule, explanation }
                 | Verdict::RequireApproval {
@@ -575,10 +793,100 @@ impl PolicyEvaluator {
                         ),
                     }],
                 },
+            },
+            PolicyMode::Observe => match hypothetical {
+                Verdict::Allow { obligations } => {
+                    // Observe mode must never mutate or redact arguments in preview.
+                    let filtered = obligations
+                        .iter()
+                        .filter(|o| !matches!(o, Obligation::Redact { .. }))
+                        .cloned()
+                        .collect();
+                    Verdict::Allow {
+                        obligations: filtered,
+                    }
+                }
+                Verdict::Deny { rule, explanation }
+                | Verdict::Quarantine { rule, explanation }
+                | Verdict::RequireApproval {
+                    rule, explanation, ..
+                } => Verdict::Allow {
+                    obligations: vec![Obligation::AddContext {
+                        text: format!(
+                            "[ARC OBSERVE MODE - NOT ENFORCED] Would have blocked ({}): {}",
+                            rule.0, explanation.summary
+                        ),
+                    }],
+                },
+            },
+        }
+    }
+
+    pub fn evaluate_with_observation(&self, event: &ActionEvent) -> EvaluationObservation {
+        self.evaluate_with_mode_override(event, None, None)
+    }
+
+    pub fn evaluate_with_mode_override(
+        &self,
+        event: &ActionEvent,
+        mode_override: Option<PolicyMode>,
+        external_error: Option<String>,
+    ) -> EvaluationObservation {
+        let before = self.taint_tracker.current_taints(&event.host_session_id);
+        let sink_class = TaintTracker::classify_event_sink(event);
+        let (cfg, lock_err) = self.read_config_safe();
+        let mode = mode_override.unwrap_or(cfg.mode);
+        let policy_source = cfg.source.unwrap_or(PolicySource::BuiltInDefault);
+        let policy_revision = cfg.revision_hash();
+        let eval_err = external_error.or(lock_err);
+
+        let hypothetical_verdict = if let Some(ref err_msg) = eval_err {
+            if cfg.fail_closed_on_eval_error {
+                Verdict::Deny {
+                    rule: RuleId("ARC-EVAL-ERR-001".to_string()),
+                    explanation: Explanation::new(
+                        format!("Policy evaluation error (fail-closed): {err_msg}"),
+                        vec![
+                            "Inspect session storage permissions and policy configuration integrity."
+                                .to_string(),
+                        ],
+                        Some("https://docs.vexa.ai/arc/policies/ARC-EVAL-ERR-001".to_string()),
+                    ),
+                }
+            } else {
+                self.evaluate_enforced(event, &cfg)
             }
         } else {
-            verdict
+            self.evaluate_enforced(event, &cfg)
+        };
+
+        let effective_verdict =
+            if eval_err.is_some() && cfg.fail_closed_on_eval_error && !mode.is_preview() {
+                hypothetical_verdict.clone()
+            } else {
+                Self::to_effective_verdict(mode, &hypothetical_verdict)
+            };
+        let outcome = Self::classify_outcome(mode, &hypothetical_verdict, eval_err.as_deref());
+        let taints_after = self.taint_tracker.current_taints(&event.host_session_id);
+
+        EvaluationObservation {
+            verdict: effective_verdict.clone(),
+            hypothetical_verdict,
+            effective_verdict,
+            outcome,
+            mode,
+            policy_source,
+            policy_revision,
+            evaluation_error: eval_err,
+            taints_after,
+            newly_added_taints: taints_after & !before,
+            sink_class,
         }
+    }
+
+    /// Evaluates an ActionEvent against enterprise policies and the session Taint DAG.
+    pub fn evaluate(&self, event: &ActionEvent) -> Verdict {
+        self.evaluate_with_observation(event).effective_verdict
     }
 
     fn evaluate_enforced(&self, event: &ActionEvent, cfg: &PolicyConfig) -> Verdict {
@@ -594,6 +902,15 @@ impl PolicyEvaluator {
             Action::PromptSubmit { text, .. } => Some(text.clone()),
             Action::PackageInstall { name, .. } => Some(name.clone()),
             _ => None,
+        };
+
+        let (mcp_server_name, mcp_schema_hex): (Option<&str>, Option<String>) = match &event.action
+        {
+            Action::McpToolCall { server, .. } | Action::McpToolsList { server, .. } => (
+                Some(server.config_name.as_str()),
+                server.schema_root.map(hex::encode),
+            ),
+            _ => (None, None),
         };
 
         let canonical_bytes_res = match &event.action {
@@ -648,10 +965,34 @@ impl PolicyEvaluator {
             None
         };
 
+        let cfg_is_authoritative = matches!(
+            cfg.source,
+            Some(PolicySource::SignedOrganization | PolicySource::EmergencyDeny)
+        );
+
         let check_exception = |rule_id: &str| -> Option<Verdict> {
             cfg.active_exceptions
                 .iter()
-                .find(|e| e.matches(session_id, rule_id, target_str.as_deref(), now_ms))
+                .filter(|e| {
+                    if cfg_is_authoritative {
+                        matches!(
+                            e.source,
+                            Some(PolicySource::SignedOrganization | PolicySource::EmergencyDeny)
+                        )
+                    } else {
+                        true
+                    }
+                })
+                .find(|e| {
+                    e.matches_scoped(
+                        session_id,
+                        rule_id,
+                        target_str.as_deref(),
+                        mcp_server_name,
+                        mcp_schema_hex.as_deref(),
+                        now_ms,
+                    )
+                })
                 .map(|exc| Verdict::Allow {
                     obligations: vec![Obligation::ExceptionGranted {
                         id: exc.id.clone(),
@@ -795,7 +1136,10 @@ impl PolicyEvaluator {
 
             // Check Schema Rug-Pull (Session-scoped)
             if let Some(schema_hash) = server.schema_root {
-                let mut schemas = self.known_schemas.write().unwrap();
+                let mut schemas = match self.known_schemas.write() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 let key = (session_id.clone(), server.config_name.clone());
                 if let Some(known) = schemas.get(&key) {
                     if known != &schema_hash {
@@ -1430,6 +1774,7 @@ mod tests {
                 created_at_unix_ms: now_ms - 1000,
                 expires_at_unix_ms: now_ms + 60_000, // active for 60 seconds
                 reason: "Authorized incident response broadcast".to_string(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1802,6 +2147,154 @@ mod tests {
         match evaluator.evaluate(&poisoned) {
             Verdict::Quarantine { rule, .. } => assert_eq!(rule.0, "ARC-MCP-POISON-001"),
             other => panic!("expected Quarantine(ARC-MCP-POISON-001), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_local_exceptions_cannot_weaken_signed_organization_policy() {
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let mut local = PolicyConfig {
+            source: Some(PolicySource::ProjectLocal),
+            mode: PolicyMode::Audit,
+            block_unapproved_mcp: false,
+            active_exceptions: vec![PolicyException {
+                id: "local-wildcard-bypass".to_string(),
+                session_id: Some("*".to_string()),
+                rule_id: Some("*".to_string()),
+                target: Some("*".to_string()),
+                source: Some(PolicySource::ProjectLocal),
+                granted_by: "developer".to_string(),
+                created_at_unix_ms: now_ms,
+                expires_at_unix_ms: now_ms + 3_600_000,
+                reason: "Try to bypass org policy locally".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let org = PolicyConfig {
+            source: Some(PolicySource::SignedOrganization),
+            mode: PolicyMode::Enforce,
+            block_unapproved_mcp: true,
+            allowed_mcp_servers: HashSet::from(["github".to_string()]),
+            ..Default::default()
+        };
+
+        // Case A: SignedOrganization merged over ProjectLocal (standard load order)
+        local.merge_lower_precedence(org.clone());
+        assert_eq!(local.source, Some(PolicySource::SignedOrganization));
+        assert_eq!(local.mode, PolicyMode::Enforce);
+        assert!(local.block_unapproved_mcp);
+        assert!(
+            local.active_exceptions.is_empty(),
+            "ProjectLocal exceptions must be purged when SignedOrganization policy is applied"
+        );
+
+        // Case B: ProjectLocal merged after SignedOrganization must still not weaken it
+        let mut org_first = org;
+        let rogue_local = PolicyConfig {
+            source: Some(PolicySource::ProjectLocal),
+            mode: PolicyMode::Observe,
+            block_unapproved_mcp: false,
+            allowed_mcp_servers: HashSet::from(["rogue-mcp".to_string()]),
+            active_exceptions: vec![PolicyException {
+                id: "rogue-exc".to_string(),
+                rule_id: Some("ARC-MCP-001".to_string()),
+                target: Some("*".to_string()),
+                source: Some(PolicySource::ProjectLocal),
+                granted_by: "dev".to_string(),
+                created_at_unix_ms: now_ms,
+                expires_at_unix_ms: now_ms + 3_600_000,
+                reason: "Rogue bypass".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        org_first.merge_lower_precedence(rogue_local);
+        assert_eq!(org_first.mode, PolicyMode::Enforce);
+        assert!(org_first.block_unapproved_mcp);
+        assert!(!org_first.allowed_mcp_servers.contains("rogue-mcp"));
+        assert!(org_first.active_exceptions.is_empty());
+
+        let evaluator = PolicyEvaluator::new(org_first);
+        let event = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "sess-org-test",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "rogue-mcp".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: None,
+                },
+                tool: "exec".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        assert!(evaluator.evaluate(&event).is_denied());
+    }
+
+    #[test]
+    fn observe_mode_preserves_hypothetical_verdict_and_never_redacts() {
+        let cfg = PolicyConfig {
+            mode: PolicyMode::Observe,
+            block_unapproved_mcp: true,
+            redact_secrets: true,
+            ..Default::default()
+        };
+        let evaluator = PolicyEvaluator::new(cfg);
+
+        // 1. Denied call in Observe mode records WouldDeny + original Deny hypothetical_verdict
+        let denied_event = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "sess-observe",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "unapproved-mcp".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: None,
+                },
+                tool: "query".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let obs = evaluator.evaluate_with_observation(&denied_event);
+        assert_eq!(obs.outcome, PolicyOutcomeKind::WouldDeny);
+        assert!(obs.hypothetical_verdict.is_denied());
+        assert!(obs.effective_verdict.is_allowed());
+
+        // 2. Allowed call with secret in Observe mode must not include RedactRange obligations
+        let secret_event = ActionEvent::new(
+            AgentHost::ClaudeCode,
+            "sess-observe",
+            OsPrincipal::Uid(1000),
+            Phase::Pre,
+            Action::McpToolCall {
+                server: ServerIdentity {
+                    config_name: "github".to_string(),
+                    artifact: Artifact::Unknown,
+                    schema_root: None,
+                },
+                tool: "create_issue".to_string(),
+                arguments: serde_json::json!({
+                    "body": "token AKIAIOSFODNN7EXAMPLE"
+                }),
+            },
+        );
+        let secret_obs = evaluator.evaluate_with_observation(&secret_event);
+        assert_eq!(secret_obs.outcome, PolicyOutcomeKind::WouldAllow);
+        if let Verdict::Allow { obligations } = &secret_obs.effective_verdict {
+            assert!(
+                !obligations
+                    .iter()
+                    .any(|o| matches!(o, Obligation::Redact { .. })),
+                "Observe mode must never mutate or redact arguments"
+            );
+        } else {
+            panic!("Expected effective Allow in Observe mode");
         }
     }
 }

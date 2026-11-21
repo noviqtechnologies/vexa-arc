@@ -1,12 +1,12 @@
 name: 'Vexa Arc Security Gate'
-description: 'Scan PRs for leaked secrets, hidden Unicode prompt injection, unpinned MCP servers, and vulnerable dependencies.'
+description: 'Scan PRs for leaked secrets, hidden Unicode prompt injection, unpinned MCP servers, policy fixture validation, and vulnerable dependencies.'
 branding:
   icon: 'shield'
   color: 'blue'
 
 inputs:
   version:
-    description: 'Vexa Arc release tag to use (e.g. v1.0.2, latest, or source to build from checkout)'
+    description: 'Vexa Arc release tag to use (e.g. v1.2.5, latest, or source to build from checkout)'
     required: false
     default: 'latest'
   path:
@@ -25,6 +25,10 @@ inputs:
     description: 'Run dependency SCA check (true/false)'
     required: false
     default: 'true'
+  run-policy-test:
+    description: 'Run deterministic policy & MCP rollout fixture verification (true/false)'
+    required: false
+    default: 'false'
   comment-pr:
     description: 'Post or update a deduplicated security summary comment on pull requests (true/false)'
     required: false
@@ -51,15 +55,37 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Validate Action Inputs
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_FAIL_ON_SECRETS: ${{ inputs.fail-on-secrets }}
+        INPUT_RUN_SCA: ${{ inputs.run-sca }}
+        INPUT_RUN_POLICY_TEST: ${{ inputs.run-policy-test }}
+        INPUT_COMMENT_PR: ${{ inputs.comment-pr }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        node "${ACTION_PATH}/.github/actions/validate-inputs.js"
+
     - name: Install Vexa Arc (Unix)
       if: runner.os != 'Windows' && inputs.version != 'source'
       shell: bash
       env:
         ARC_VERSION: ${{ inputs.version }}
         ARC_INSTALL_DIR: ${{ runner.temp }}/vexa-arc-bin
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.sh | sh
-        echo "${{ runner.temp }}/vexa-arc-bin" >> "$GITHUB_PATH"
+        if [ -f "${ACTION_PATH}/install.sh" ]; then
+          sh "${ACTION_PATH}/install.sh"
+        else
+          INSTALL_REF="main"
+          if [ "${ARC_VERSION}" != "latest" ]; then
+            INSTALL_REF="${ARC_VERSION}"
+          fi
+          curl -fsSL "https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/${INSTALL_REF}/install.sh" | sh
+        fi
+        printf '%s\n' "${ARC_INSTALL_DIR}" >> "$GITHUB_PATH"
 
     - name: Install Vexa Arc (Windows)
       if: runner.os == 'Windows' && inputs.version != 'source'
@@ -67,45 +93,69 @@ runs:
       env:
         ARC_VERSION: ${{ inputs.version }}
         ARC_INSTALL_DIR: ${{ runner.temp }}\vexa-arc-bin
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        irm https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/install.ps1 | iex
-        "${{ runner.temp }}\vexa-arc-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        $LocalInstaller = Join-Path $env:ACTION_PATH "install.ps1"
+        if (Test-Path -LiteralPath $LocalInstaller) {
+          & $LocalInstaller
+        } else {
+          $InstallRef = if ($env:ARC_VERSION -ne "latest") { $env:ARC_VERSION } else { "main" }
+          irm "https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/$InstallRef/install.ps1" | iex
+        }
+        $env:ARC_INSTALL_DIR | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
     - name: Build Vexa Arc from Source
       if: inputs.version == 'source'
       shell: bash
       run: |
         cargo build --release --locked
-        echo "${PWD}/target/release" >> "$GITHUB_PATH"
+        printf '%s\n' "${PWD}/target/release" >> "$GITHUB_PATH"
 
     - name: Run Vexa Arc CI Report
       id: scan
       shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_FAIL_ON_SECRETS: ${{ inputs.fail-on-secrets }}
+        INPUT_RUN_SCA: ${{ inputs.run-sca }}
+        INPUT_RUN_POLICY_TEST: ${{ inputs.run-policy-test }}
+        RUNNER_TEMP_DIR: ${{ runner.temp }}
       run: |
-        ARGS=(ci-report --path "${{ inputs.path }}" --markdown-out "${{ runner.temp }}/arc-pr-report.md" --json-out "${{ runner.temp }}/arc-pr-report.json" --fail-on-secrets "${{ inputs.fail-on-secrets }}")
-        if [ "${{ inputs.run-sca }}" = "true" ]; then
+        MD_OUT="${RUNNER_TEMP_DIR}/arc-pr-report.md"
+        JSON_OUT="${RUNNER_TEMP_DIR}/arc-pr-report.json"
+        ARGS=(ci-report --path "$INPUT_PATH" --markdown-out "$MD_OUT" --json-out "$JSON_OUT" --fail-on-secrets "$INPUT_FAIL_ON_SECRETS")
+        if [ "$INPUT_RUN_SCA" = "true" ]; then
           ARGS+=(--sca)
         fi
-        if [ -n "${{ inputs.fail-on }}" ]; then
-          ARGS+=(--fail-on "${{ inputs.fail-on }}")
+        if [ -n "$INPUT_FAIL_ON" ]; then
+          ARGS+=(--fail-on "$INPUT_FAIL_ON")
         fi
 
         set +e
         arc "${ARGS[@]}"
         EXIT_CODE=$?
+
+        if [ "$INPUT_RUN_POLICY_TEST" = "true" ]; then
+          arc policy test --path "$INPUT_PATH" --json > "${RUNNER_TEMP_DIR}/arc-policy-test.json"
+          POLICY_EXIT=$?
+          if [ "$EXIT_CODE" -eq 0 ] && [ "$POLICY_EXIT" -ne 0 ]; then
+            EXIT_CODE=$POLICY_EXIT
+          fi
+        fi
         set -e
 
         node -e '
           const fs = require("fs");
           const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
           const out = process.env.GITHUB_OUTPUT;
-          fs.appendFileSync(out, `passed=${r.passed}\n`);
-          fs.appendFileSync(out, `secrets_count=${r.secrets.length}\n`);
+          fs.appendFileSync(out, `passed=${Boolean(r.passed)}\n`);
+          fs.appendFileSync(out, `secrets_count=${Array.isArray(r.secrets) ? r.secrets.length : 0}\n`);
           fs.appendFileSync(out, `sca_critical=${r.sca ? r.sca.critical_count : 0}\n`);
           fs.appendFileSync(out, `sca_high=${r.sca ? r.sca.high_count : 0}\n`);
-        ' "${{ runner.temp }}/arc-pr-report.json"
+        ' "$JSON_OUT"
 
-        echo "ARC_EXIT_CODE=$EXIT_CODE" >> "$GITHUB_ENV"
+        printf 'ARC_EXIT_CODE=%s\n' "$EXIT_CODE" >> "$GITHUB_ENV"
 
     - name: Post or Update PR Comment
       if: inputs.comment-pr == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
@@ -113,8 +163,9 @@ runs:
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         ARC_REPORT_PATH: ${{ runner.temp }}/arc-pr-report.md
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        node "${{ github.action_path }}/.github/actions/comment-pr.js"
+        node "${ACTION_PATH}/.github/actions/comment-pr.js"
 
     - name: Enforce Gate Status
       shell: bash

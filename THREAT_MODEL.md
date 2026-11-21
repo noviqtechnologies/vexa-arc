@@ -66,11 +66,12 @@ Vexa Arc (`arc`) acts as a local, deterministic security control and pre-executi
 - **Mitigation / limitation:** The current `arc shield` CLI is advisory only and does not intercept installs or fetch registry reputation/lifecycle data. Its library applies ecosystem-scoped name heuristics, blocks a caller-reported dangerous lifecycle signal, and can review caller-reported provenance/SLSA signals. Those values are not verified by the CLI; keep registry, lockfile, and endpoint controls in place.
 
 ### T-06: Local State & Policy Tampering
-- **Threat:** Multiple concurrent agent processes race to corrupt session files, or an attacker attempts to downgrade policy settings.
+- **Threat:** Multiple concurrent agent processes race to corrupt session files, or an attacker attempts to downgrade policy settings or inject local exceptions to bypass enterprise controls.
 - **Mitigation:**
-  - Policy precedence is enforced: BuiltInDefault < ProjectLocal < UserGlobal < SignedOrganization < EmergencyDeny. Emergency deny rules cannot be overridden by project-local configuration.
-  - Multi-process safety is guaranteed via cross-platform file locking (`SessionLock`).
-  - File persistence is atomic (write to temporary UUID file + atomic rename).
+  - Policy precedence is strictly enforced: `BuiltInDefault < UserGlobal < ProjectLocal < SignedOrganization < EmergencyDeny`. Emergency deny rules and signed organization policies cannot be weakened by project-local or user-global configuration or local `active_exceptions`.
+  - Safe Rollout `Observe` mode (`PolicyMode::Observe` / `arc protect stdio --observe`) records both `hypothetical_verdict` and `effective_verdict` (`would_allow`, `would_deny`, `would_require_approval`, `would_quarantine`) without mutating or redacting arguments, and emits persistent warnings that preview traffic is not enforced.
+  - Multi-process safety is guaranteed via cross-platform file locking (`SessionLock`), and evaluator/session lock errors fail closed (`ARC-EVAL-ERR-001`) by default in `Enforce` mode.
+  - File persistence is atomic (write to temporary UUID file + atomic rename) with restrictive permissions (`0600` files / `0700` directories on Unix).
 
 ### T-07: Telemetry & Payload Leakage
 - **Threat:** Sensitive source code, developer prompts, or secrets are transmitted to external servers under the guise of telemetry.

@@ -215,15 +215,23 @@ enum Commands {
         json: bool,
     },
 
-    /// Add a scoped allowlist exception to .arc/policy.json
+    /// Add, list, explain, diff, or revoke scoped allowlist exceptions in .arc/policy.json
     Allow {
         /// Rule ID to allow (e.g. ARC-LTT-001, ARC-MCP-001, ARC-DLP-001, or '*')
         #[arg(long)]
-        rule: String,
+        rule: Option<String>,
 
         /// Optional target substring (file path, tool name, or MCP server)
         #[arg(long)]
         target: Option<String>,
+
+        /// Optional MCP server name to scope the exception to
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Optional 64-hex SHA-256 JCS tool schema fingerprint to bind the exception to
+        #[arg(long)]
+        schema_fingerprint: Option<String>,
 
         /// Reason for granting this exception
         #[arg(long, default_value = "Developer allowlist via arc allow")]
@@ -233,6 +241,22 @@ enum Commands {
         #[arg(long, default_value = "8760")]
         ttl_hours: u64,
 
+        /// List all project-local policy exceptions and their precedence/expiry status
+        #[arg(long)]
+        list: bool,
+
+        /// Explain a specific policy exception by ID
+        #[arg(long)]
+        explain: Option<String>,
+
+        /// Revoke a saved project-local policy exception by ID
+        #[arg(long)]
+        revoke: Option<String>,
+
+        /// Show policy diff against default baseline
+        #[arg(long)]
+        diff: bool,
+
         /// Project directory containing .arc/policy.json (default: current directory)
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
@@ -240,6 +264,12 @@ enum Commands {
         /// Output result as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Local MCP inventory and Safe Rollout preview-to-enforce reporting
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
     },
 
     /// Run a local stdio MCP server exposing scan_secrets, check_package, sca_audit, and audit_ai_assets
@@ -450,6 +480,64 @@ enum PolicyAction {
         #[arg(long)]
         api_url: Option<String>,
     },
+
+    /// Run the 10 checked-in deterministic policy & broker rollout verification fixtures
+    Test {
+        /// Project directory to load active policy revision from
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Output deterministic fixture report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Simulate active policy against captured session audit metadata without executing tools
+    Simulate {
+        /// Project directory containing .arc/policy.json
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Optional custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+        /// Output simulation report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Local inventory of inspectable MCP server configs, schema pin status, and coverage contracts
+    Inventory {
+        /// Target project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Scan user workstation MCP configuration roots
+        #[arg(long)]
+        workstation: bool,
+        /// Output inventory as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Summarize observed MCP rollout preview impact (would_deny / would_require_approval) or transition stage
+    Rollout {
+        /// Target project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Optional custom session storage directory
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+        /// Filter report or stage transition to a specific MCP server name
+        #[arg(long)]
+        server: Option<String>,
+        /// Explicit human stage transition: observe, review, or enforce
+        #[arg(long)]
+        stage: Option<String>,
+        /// Output rollout report as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -596,6 +684,10 @@ enum ProtectAction {
         /// Explicitly allow trust-on-first-use for development/bootstrap only; unsuitable for managed deployment
         #[arg(long)]
         allow_tofu: bool,
+
+        /// Run broker in Safe Rollout observe mode (records would_deny/would_require_approval without blocking or redacting)
+        #[arg(long)]
+        observe: bool,
 
         /// Maximum memory for the supervised server (MiB; Windows job-wide, Linux per-process)
         #[arg(long)]
@@ -1161,6 +1253,7 @@ fn main() {
                 session,
                 pin_schema,
                 allow_tofu,
+                observe,
                 max_memory_mb,
                 host,
                 command,
@@ -1170,6 +1263,7 @@ fn main() {
                     &session,
                     pin_schema.as_deref(),
                     allow_tofu,
+                    observe,
                     max_memory_mb,
                     &host,
                     command,
@@ -1265,6 +1359,20 @@ fn main() {
         Commands::Policy { action } => match action {
             PolicyAction::Sync { path, api_url } => {
                 if !run_policy_sync(&path, api_url.as_deref()) {
+                    std::process::exit(1);
+                }
+            }
+            PolicyAction::Test { path, json } => {
+                if !commands::rollout::run_policy_test(&path, json) {
+                    std::process::exit(1);
+                }
+            }
+            PolicyAction::Simulate {
+                path,
+                session_dir,
+                json,
+            } => {
+                if !commands::rollout::run_policy_simulate(&path, session_dir.as_deref(), json) {
                     std::process::exit(1);
                 }
             }
@@ -1407,22 +1515,62 @@ fn main() {
         Commands::Allow {
             rule,
             target,
+            server,
+            schema_fingerprint,
             reason,
             ttl_hours,
+            list,
+            explain,
+            revoke,
+            diff,
             path,
             json,
         } => {
-            if !commands::allow::run_allow(
-                &path,
-                &rule,
-                target.as_deref(),
-                &reason,
+            if !commands::allow::run_allow_with_options(commands::allow::AllowCommandOptions {
+                path: &path,
+                rule: rule.as_deref(),
+                target: target.as_deref(),
+                server: server.as_deref(),
+                schema_fingerprint: schema_fingerprint.as_deref(),
+                reason: &reason,
                 ttl_hours,
+                list,
+                explain_id: explain.as_deref(),
+                revoke_id: revoke.as_deref(),
+                diff,
                 json,
-            ) {
+            }) {
                 std::process::exit(1);
             }
         }
+        Commands::Mcp { action } => match action {
+            McpAction::Inventory {
+                path,
+                workstation,
+                json,
+            } => {
+                if !commands::rollout::run_mcp_inventory(&path, workstation, json) {
+                    std::process::exit(1);
+                }
+            }
+            McpAction::Rollout {
+                path,
+                session_dir,
+                server,
+                stage,
+                json,
+            } => {
+                if !commands::rollout::run_mcp_rollout_report(
+                    &path,
+                    session_dir.as_deref(),
+                    stage.as_deref(),
+                    server.as_deref(),
+                    json,
+                ) {
+                    std::process::exit(1);
+                }
+            }
+        },
         Commands::McpServer { path } => {
             if !commands::mcp_server::run_mcp_server(&path) {
                 std::process::exit(1);
@@ -2052,11 +2200,13 @@ fn build_protected_broker(
     Some(broker)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_protect_stdio(
     server: &str,
     session: &str,
     pin_schema: Option<&str>,
     allow_tofu: bool,
+    observe: bool,
     max_memory_mb: Option<u64>,
     host: &str,
     command: Vec<String>,
@@ -2072,8 +2222,13 @@ fn run_protect_stdio(
     ) else {
         return false;
     };
+    broker = broker.with_observe_mode(observe);
 
-    if allow_tofu {
+    if observe {
+        eprintln!(
+            "[Arc Protect] ⚠️  OBSERVE MODE ACTIVE for '{server}' in session '{session}': policy decisions (would_allow / would_deny / would_require_approval) are recorded, but calls are NOT blocked or redacted."
+        );
+    } else if allow_tofu {
         eprintln!("[Arc Protect] WARNING: TOFU explicitly enabled for '{server}'; review the observed schema hash and pin it before managed use.");
     } else {
         eprintln!("[Arc Protect] Supervising MCP server '{server}' in session '{session}' (schema pin required)");
@@ -3183,13 +3338,30 @@ fn run_shield_check(
     let eco = parse_ecosystem(ecosystem);
 
     let (osv_name, osv_version) = split_package_version(package);
-    let verdict = if age_days.is_none() && downloads.is_none() {
-        firewall
-            .inspect_package_live(eco, osv_name, dangerous_scripts)
-            .verdict
-    } else {
-        firewall.inspect_package(eco, osv_name, age_days, downloads, dangerous_scripts)
-    };
+    let (verdict, provenance_source, cache_age_secs, confidence_known) =
+        if age_days.is_none() && downloads.is_none() {
+            let insp = firewall.inspect_package_live(eco, osv_name, dangerous_scripts);
+            let src_label = match insp.source {
+                arc_firewall::registry::RegistryMetadataSource::Live => "live",
+                arc_firewall::registry::RegistryMetadataSource::Cache => "cache",
+                arc_firewall::registry::RegistryMetadataSource::HeuristicFallback => {
+                    "heuristic_fallback"
+                }
+            };
+            (
+                insp.verdict,
+                src_label,
+                insp.cache_age_secs,
+                insp.confidence_known,
+            )
+        } else {
+            (
+                firewall.inspect_package(eco, osv_name, age_days, downloads, dangerous_scripts),
+                "caller_supplied_simulation",
+                None,
+                true,
+            )
+        };
     let suggestion = verdict.suggested_action(ecosystem);
 
     // FR-PKG-005: Run OSV/EPSS vulnerability scan via vexa-sca native integration.
@@ -3287,6 +3459,12 @@ fn run_shield_check(
             },
         ));
 
+        let provenance_json = serde_json::json!({
+            "source": provenance_source,
+            "cache_age_secs": cache_age_secs,
+            "confidence": if confidence_known { "known" } else { "unknown" },
+        });
+
         let json_output = match &verdict {
             arc_firewall::slopsquat::SlopsquatVerdict::Permitted { reason } => {
                 serde_json::json!({
@@ -3294,6 +3472,7 @@ fn run_shield_check(
                     "ecosystem": format!("{eco:?}").to_lowercase(),
                     "status": "permitted",
                     "reason": reason,
+                    "provenance": provenance_json,
                     "suggested_action": null,
                     "metrics": {
                         "age_days": age_days,
@@ -3310,6 +3489,7 @@ fn run_shield_check(
                     "status": "blocked",
                     "gate": gate,
                     "reason": reason,
+                    "provenance": provenance_json,
                     "suggested_action": suggestion,
                     "metrics": {
                         "age_days": age_days,
@@ -3330,6 +3510,7 @@ fn run_shield_check(
                     "status": "review",
                     "gate": gate,
                     "reason": reason,
+                    "provenance": provenance_json,
                     "containment_recommendation": containment_recommendation,
                     "suggested_action": suggestion,
                     "metrics": {
@@ -3359,7 +3540,12 @@ fn run_shield_check(
     } else if let Some(dl) = downloads {
         println!("Simulation Input:   Monthly Downloads: {dl}");
     } else {
-        println!("Package Baseline:   Seeded heuristic; live registry metadata not fetched");
+        println!(
+            "Provenance Source:  {} (cache_age_secs: {:?}, confidence: {})",
+            provenance_source,
+            cache_age_secs,
+            if confidence_known { "known" } else { "unknown" }
+        );
     }
     println!("Dangerous Scripts:  {dangerous_scripts}");
     println!("----------------------------------------------------------");
