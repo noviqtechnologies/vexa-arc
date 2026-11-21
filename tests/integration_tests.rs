@@ -25,10 +25,13 @@ fn test_e2e_discovery_and_cyclonedx_bom() {
         .audit_directory(Path::new("."))
         .expect("audit_directory failed");
 
-    // Performance target: < 1.2s
+    // Performance target: < 1.2s in release; allow headroom under parallel debug test load
+    let max_duration_ms = if cfg!(debug_assertions) { 5000 } else { 1200 };
     assert!(
-        report.scan_duration_ms < 1200,
-        "Discovery must complete in < 1200ms"
+        report.scan_duration_ms < max_duration_ms,
+        "Discovery took {}ms (must complete in < {}ms)",
+        report.scan_duration_ms,
+        max_duration_ms
     );
 
     // Generate CycloneDX 1.6 AI-BOM
@@ -1340,7 +1343,7 @@ fn test_cli_doctor_and_adversarial_test_commands() {
     let json_test: serde_json::Value =
         serde_json::from_str(&stdout_test).expect("arc test --json must be valid JSON");
     assert_eq!(json_test["all_passed"], true);
-    assert_eq!(json_test["tests"].as_array().unwrap().len(), 4);
+    assert_eq!(json_test["tests"].as_array().unwrap().len(), 6);
 }
 
 #[test]
