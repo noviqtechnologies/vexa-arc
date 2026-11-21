@@ -746,17 +746,36 @@ mod tests {
             fs::write(temp_dir.join("src").join(format!("file_{i}.txt")), "hello").unwrap();
         }
 
-        let rep = scanner
-            .audit_directory_bounded(&temp_dir, 3, std::time::Duration::from_secs(5))
+        // Verify OS-heavy directories are excluded regardless of filesystem read_dir order.
+        let exclusion_rep = scanner
+            .audit_directory_bounded(&temp_dir, 100, std::time::Duration::from_secs(5))
             .expect("Bounded scan must succeed");
-        assert!(rep.truncated, "Should report truncation when file cap hit");
         assert!(
-            rep.agent_skills.is_empty(),
+            exclusion_rep.agent_skills.is_empty(),
             "AppData should be excluded from discovery"
         );
         assert!(
-            rep.excluded_paths.iter().any(|p| p.ends_with("AppData")),
+            exclusion_rep
+                .excluded_paths
+                .iter()
+                .any(|p| p.ends_with("AppData")),
             "AppData must appear in excluded_paths"
+        );
+        assert!(
+            exclusion_rep
+                .excluded_paths
+                .iter()
+                .any(|p| p.ends_with("Library")),
+            "Library must appear in excluded_paths"
+        );
+
+        // Verify bounded scan stops and reports truncation when max_files is reached.
+        let bounded_rep = scanner
+            .audit_directory_bounded(&temp_dir.join("src"), 3, std::time::Duration::from_secs(5))
+            .expect("Bounded scan must succeed");
+        assert!(
+            bounded_rep.truncated,
+            "Should report truncation when file cap hit"
         );
 
         let _ = fs::remove_dir_all(&temp_dir);
