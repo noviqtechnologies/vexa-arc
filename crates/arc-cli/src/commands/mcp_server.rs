@@ -144,19 +144,63 @@ fn handle_tool_call(name: &str, args: &Value, default_root: &Path) -> Value {
                 .unwrap_or_else(|| PackageFirewall::detect_ecosystem(default_root));
             let fw = PackageFirewall::new();
             let (name, ver) = crate::split_package_version(pkg);
-            let verdict = fw.inspect_package(eco, name, None, None, false);
-            let osv = ver.map(|v| {
-                let scanner = OsvPackageScanner::default();
-                scanner
-                    .scan_package(name, v, ecosystem_to_osv_str(eco))
-                    .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
-                    .unwrap_or_else(|e| json!({ "error": e }))
-            });
+            let insp = fw.inspect_package_live(eco, name, false);
+            let provenance_source = match insp.source {
+                arc_firewall::registry::RegistryMetadataSource::Live => "live",
+                arc_firewall::registry::RegistryMetadataSource::Cache => "cache",
+                arc_firewall::registry::RegistryMetadataSource::HeuristicFallback => {
+                    "heuristic_fallback"
+                }
+            };
+            let verdict = insp.verdict;
+            let (osv_json, osv_blocks) = match ver {
+                Some(v) => {
+                    let scanner = OsvPackageScanner::default();
+                    match scanner.scan_package(name, v, ecosystem_to_osv_str(eco)) {
+                        Ok(r) => {
+                            let blocks = !r.advisory_available || r.should_block();
+                            (serde_json::to_value(&r).unwrap_or(Value::Null), blocks)
+                        }
+                        Err(e) => (
+                            json!({
+                                "status": "incomplete",
+                                "advisory_available": false,
+                                "error": e
+                            }),
+                            true,
+                        ),
+                    }
+                }
+                None => (
+                    json!({
+                        "status": "not_scanned_no_version",
+                        "advisory_available": false,
+                        "error": null
+                    }),
+                    false,
+                ),
+            };
+            let status = if verdict.is_blocked() || osv_blocks {
+                "blocked"
+            } else if matches!(
+                verdict,
+                arc_firewall::slopsquat::SlopsquatVerdict::Review { .. }
+            ) {
+                "review"
+            } else {
+                "permitted"
+            };
             ok_tool_result(json!({
                 "package": pkg,
                 "ecosystem": format!("{eco:?}").to_lowercase(),
+                "status": status,
+                "provenance": {
+                    "source": provenance_source,
+                    "cache_age_secs": insp.cache_age_secs,
+                    "confidence": if insp.confidence_known { "known" } else { "unknown" },
+                },
                 "verdict": verdict,
-                "osv": osv,
+                "osv": osv_json,
             }))
         }
         "sca_audit" => {

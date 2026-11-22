@@ -1047,10 +1047,50 @@ pub fn poll_device_token(
     })?
 }
 
+/// Snapshot of the local Cloud Console event spool and sync state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudTelemetryStatus {
+    pub enrolled: bool,
+    pub offline: bool,
+    pub api_base_url: String,
+    pub spool_file: String,
+    pub queued_events: usize,
+    pub last_sync_at: Option<String>,
+    pub seconds_since_last_sync: Option<u64>,
+}
+
+/// Inspects the local Cloud Console spool (`arc_cloud_queue.jsonl`) and credentials state.
+pub fn get_cloud_telemetry_status() -> CloudTelemetryStatus {
+    let dir = crate::default_spool_dir();
+    let spool_path = dir.join("arc_cloud_queue.jsonl");
+    let queued_events = fs::read_to_string(&spool_path)
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    let stamp_path = dir.join("last_sync_at");
+    let now_secs = Utc::now().timestamp().max(0) as u64;
+    let (last_sync_at, seconds_since_last_sync) = fs::read_to_string(&stamp_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|prev| {
+            let iso = chrono::DateTime::from_timestamp(prev as i64, 0).map(|dt| dt.to_rfc3339());
+            (iso, Some(now_secs.saturating_sub(prev)))
+        })
+        .unwrap_or((None, None));
+    CloudTelemetryStatus {
+        enrolled: VexaCloudAuth::get_token().is_some(),
+        offline: VexaCloudAuth::is_offline(),
+        api_base_url: VexaCloudAuth::resolve_api_base_url(None),
+        spool_file: spool_path.display().to_string(),
+        queued_events,
+        last_sync_at,
+        seconds_since_last_sync,
+    }
+}
+
 /// Spawns a detached, windowless `arc telemetry flush --quiet` child process if:
 /// - Offline mode is NOT active,
 /// - Cloud credentials exist, and
-/// - At least `cooldown_secs` (60s) have elapsed since the last background sync.
+/// - At least `cooldown_secs` have elapsed since the last background sync.
 ///
 /// Never blocks the caller (<1ms on hook hot path) and works across Windows, macOS, and Linux.
 pub fn maybe_spawn_background_flush(cooldown_secs: u64) -> bool {

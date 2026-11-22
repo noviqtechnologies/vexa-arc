@@ -557,10 +557,11 @@ jobs:
     runs-on: ubuntu-latest # also supports macos-latest and windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: noviqtechnologies/vexa-arc@v1.2.5
+      - uses: noviqtechnologies/vexa-arc@v1.3.0
         with:
           fail-on: high
           fail-on-secrets: 'true'
+          fail-on-unpinned-mcp: 'false'
           run-sca: 'true'
           run-policy-test: 'true'
           comment-pr: 'true'

@@ -6,7 +6,7 @@ branding:
 
 inputs:
   version:
-    description: 'Vexa Arc release tag to use (e.g. v1.2.5, latest, or source to build from checkout)'
+    description: 'Vexa Arc release tag to use (e.g. v1.3.0, latest, or source to build from checkout)'
     required: false
     default: 'latest'
   path:
@@ -21,6 +21,10 @@ inputs:
     description: 'Fail the check if leaked secrets are detected (true/false)'
     required: false
     default: 'true'
+  fail-on-unpinned-mcp:
+    description: 'Fail the check if unpinned MCP servers are detected (true/false)'
+    required: false
+    default: 'false'
   run-sca:
     description: 'Run dependency SCA check (true/false)'
     required: false
@@ -118,6 +122,7 @@ runs:
         INPUT_PATH: ${{ inputs.path }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_FAIL_ON_SECRETS: ${{ inputs.fail-on-secrets }}
+        INPUT_FAIL_ON_UNPINNED_MCP: ${{ inputs.fail-on-unpinned-mcp }}
         INPUT_RUN_SCA: ${{ inputs.run-sca }}
         INPUT_RUN_POLICY_TEST: ${{ inputs.run-policy-test }}
         RUNNER_TEMP_DIR: ${{ runner.temp }}
@@ -125,6 +130,9 @@ runs:
         MD_OUT="${RUNNER_TEMP_DIR}/arc-pr-report.md"
         JSON_OUT="${RUNNER_TEMP_DIR}/arc-pr-report.json"
         ARGS=(ci-report --path "$INPUT_PATH" --markdown-out "$MD_OUT" --json-out "$JSON_OUT" --fail-on-secrets "$INPUT_FAIL_ON_SECRETS")
+        if [ "$INPUT_FAIL_ON_UNPINNED_MCP" = "true" ]; then
+          ARGS+=(--fail-on-unpinned-mcp)
+        fi
         if [ "$INPUT_RUN_SCA" = "true" ]; then
           ARGS+=(--sca)
         fi

@@ -230,6 +230,7 @@ mod tests {
             overall_risk_band: arc_core::mcp_profile::RiskBand::Low,
             total_assets: 1,
             scanned_locations: vec![PathBuf::from("c:/project")],
+            not_installed_locations: vec![],
             unscanned_locations: vec![],
             excluded_paths: vec![],
             permission_errors: vec![],

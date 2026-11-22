@@ -1838,6 +1838,9 @@ fn test_phase2_session_observability_and_storage_resolution_matrix() {
     let session_name = "p2-test-eval-session";
     // 2a. Event 1: read .env (introduces PRIVATE_DATA taint)
     let out_eval1 = Command::new(arc_bin)
+        .current_dir(&custom_session_dir)
+        .env("HOME", &custom_session_dir)
+        .env("USERPROFILE", &custom_session_dir)
         .args([
             "intercept",
             "eval",
@@ -1860,6 +1863,9 @@ fn test_phase2_session_observability_and_storage_resolution_matrix() {
 
     // 2b. Event 2: untrusted prompt
     let out_eval2 = Command::new(arc_bin)
+        .current_dir(&custom_session_dir)
+        .env("HOME", &custom_session_dir)
+        .env("USERPROFILE", &custom_session_dir)
         .args([
             "intercept",
             "eval",
@@ -1880,6 +1886,9 @@ fn test_phase2_session_observability_and_storage_resolution_matrix() {
 
     // 2c. Event 3: egress shell command (triggers Lethal Trifecta deny)
     let out_eval3 = Command::new(arc_bin)
+        .current_dir(&custom_session_dir)
+        .env("HOME", &custom_session_dir)
+        .env("USERPROFILE", &custom_session_dir)
         .args([
             "intercept",
             "eval",
@@ -1912,6 +1921,8 @@ fn test_phase2_session_observability_and_storage_resolution_matrix() {
     // 3. Session DAG Inspection (arc session dag)
     // 3a. JSON inspection
     let out_dag_json = Command::new(arc_bin)
+        .env("HOME", &custom_session_dir)
+        .env("USERPROFILE", &custom_session_dir)
         .args([
             "session",
             "dag",
@@ -1931,6 +1942,8 @@ fn test_phase2_session_observability_and_storage_resolution_matrix() {
 
     // 3b. Human-readable text inspection (auto-picks latest session)
     let out_dag_txt = Command::new(arc_bin)
+        .env("HOME", &custom_session_dir)
+        .env("USERPROFILE", &custom_session_dir)
         .args([
             "session",
             "dag",

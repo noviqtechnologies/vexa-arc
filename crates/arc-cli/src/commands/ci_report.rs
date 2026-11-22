@@ -29,6 +29,8 @@ pub struct CiReport {
     pub unpinned_mcp_servers: Vec<String>,
     pub agent_skills_count: usize,
     pub sca: Option<ScaAuditResult>,
+    pub checks_enforced: Vec<String>,
+    pub advisory_warnings: Vec<String>,
     pub passed: bool,
     pub failure_reasons: Vec<String>,
 }
@@ -81,6 +83,7 @@ pub fn generate_ci_report(
     run_sca: bool,
     fail_on: Option<&str>,
     fail_on_secrets: bool,
+    fail_on_unpinned_mcp: bool,
 ) -> Result<CiReport, String> {
     if !path.exists() || !path.is_dir() {
         return Err(format!(
@@ -158,15 +161,47 @@ pub fn generate_ci_report(
         None
     };
 
+    let mut checks_enforced = vec!["unicode_anomalies".to_string()];
+    if fail_on_secrets {
+        checks_enforced.push("secrets".to_string());
+    }
+    if fail_on_unpinned_mcp {
+        checks_enforced.push("unpinned_mcp_servers".to_string());
+    }
+    if run_sca {
+        checks_enforced.push(format!("sca(fail_on={})", fail_on.unwrap_or("high")));
+    }
+
     let mut failure_reasons = Vec::new();
+    let mut advisory_warnings = Vec::new();
     if fail_on_secrets && !secrets.is_empty() {
         failure_reasons.push(format!("Detected {} leaked secret(s)", secrets.len()));
+    } else if !secrets.is_empty() {
+        advisory_warnings.push(format!(
+            "Detected {} leaked secret(s) (not gated: --fail-on-secrets=false)",
+            secrets.len()
+        ));
     }
     if !unicode_anomalies.is_empty() {
         failure_reasons.push(format!(
             "Detected hidden/Trojan-Source Unicode in {} agent instruction file(s)",
             unicode_anomalies.len()
         ));
+    }
+    if !unpinned_mcp_servers.is_empty() {
+        if fail_on_unpinned_mcp {
+            failure_reasons.push(format!(
+                "Detected {} unpinned MCP server(s): {}",
+                unpinned_mcp_servers.len(),
+                unpinned_mcp_servers.join(", ")
+            ));
+        } else {
+            advisory_warnings.push(format!(
+                "{} unpinned MCP server(s) detected (advisory only; pass --fail-on-unpinned-mcp to gate): {}",
+                unpinned_mcp_servers.len(),
+                unpinned_mcp_servers.join(", ")
+            ));
+        }
     }
     if let Some(ref sca_res) = sca {
         if sca_res.should_fail {
@@ -189,6 +224,8 @@ pub fn generate_ci_report(
         unpinned_mcp_servers,
         agent_skills_count: audit.agent_skills.len(),
         sca,
+        checks_enforced,
+        advisory_warnings,
         passed,
         failure_reasons,
     })
@@ -492,6 +529,16 @@ pub fn render_markdown_report(report: &CiReport) -> String {
         ));
     }
 
+    md.push_str(&format!(
+        "\n**Enforced Gate Checks:** `{}`\n",
+        report.checks_enforced.join("`, `")
+    ));
+    if !report.advisory_warnings.is_empty() {
+        md.push_str("\n### Advisory Warnings (Not Gated)\n");
+        for w in &report.advisory_warnings {
+            md.push_str(&format!("- {w}\n"));
+        }
+    }
     if !report.failure_reasons.is_empty() {
         md.push_str("\n### Gate Failures\n");
         for r in &report.failure_reasons {
@@ -509,13 +556,20 @@ pub fn run_ci_report(
     run_sca: bool,
     fail_on: Option<&str>,
     fail_on_secrets: bool,
+    fail_on_unpinned_mcp: bool,
     markdown_out: Option<&Path>,
     json_out: Option<&Path>,
     json: bool,
     upload: bool,
     api_url: Option<&str>,
 ) -> bool {
-    let report = match generate_ci_report(path, run_sca, fail_on, fail_on_secrets) {
+    let report = match generate_ci_report(
+        path,
+        run_sca,
+        fail_on,
+        fail_on_secrets,
+        fail_on_unpinned_mcp,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[Arc CI] {e}");
@@ -578,10 +632,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("README.md"), "clean repo\n").unwrap();
 
-        let clean = generate_ci_report(&dir, false, None, true).unwrap();
+        let clean = generate_ci_report(&dir, false, None, true, false).unwrap();
         assert!(clean.passed);
         assert!(clean.secrets.is_empty());
         assert!(clean.unicode_anomalies.is_empty());
+        assert!(clean.advisory_warnings.is_empty());
 
         std::fs::write(dir.join(".env"), "AWS_KEY=AKIAIOSFODNN7EXAMPLE\n").unwrap();
         std::fs::write(
@@ -595,11 +650,31 @@ mod tests {
         )
         .unwrap();
 
-        let dirty = generate_ci_report(&dir, false, None, true).unwrap();
+        let dirty = generate_ci_report(&dir, false, None, true, false).unwrap();
         assert!(!dirty.passed);
         assert_eq!(dirty.secrets.len(), 1);
         assert_eq!(dirty.unicode_anomalies.len(), 1);
         assert_eq!(dirty.unpinned_mcp_servers, vec!["github".to_string()]);
+        assert!(
+            dirty
+                .advisory_warnings
+                .iter()
+                .any(|w| w.contains("unpinned MCP")),
+            "Advisory warning must explicitly call out unpinned MCP servers when not gated"
+        );
+
+        // Now test strict --fail-on-unpinned-mcp on a directory with ONLY an unpinned MCP server
+        let _ = std::fs::remove_file(dir.join(".env"));
+        let _ = std::fs::remove_file(dir.join(".cursorrules"));
+        let gated_mcp = generate_ci_report(&dir, false, None, true, true).unwrap();
+        assert!(!gated_mcp.passed);
+        assert!(gated_mcp
+            .checks_enforced
+            .contains(&"unpinned_mcp_servers".to_string()));
+        assert!(gated_mcp
+            .failure_reasons
+            .iter()
+            .any(|r| r.contains("unpinned MCP server")));
 
         let md = render_markdown_report(&dirty);
         assert!(md.contains("<!-- vexa-arc-pr-report -->"));

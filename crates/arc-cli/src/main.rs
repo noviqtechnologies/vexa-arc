@@ -126,9 +126,9 @@ enum Commands {
         /// Event ID or UUID to inspect (or 'latest' for the most recent event)
         event_id: String,
 
-        /// Host session identifier
-        #[arg(short, long, default_value = "default-session")]
-        session: String,
+        /// Host session identifier (auto-discovers most recent session if omitted)
+        #[arg(short, long)]
+        session: Option<String>,
 
         /// Custom session storage directory
         #[arg(long)]
@@ -296,6 +296,10 @@ enum Commands {
         /// Fail if any leaked secrets are detected (default: true)
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         fail_on_secrets: bool,
+
+        /// Fail if any unpinned MCP servers are detected (default: false)
+        #[arg(long, default_value_t = false)]
+        fail_on_unpinned_mcp: bool,
 
         /// Write rendered Markdown PR report to file
         #[arg(long)]
@@ -538,6 +542,21 @@ enum McpAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Read-only inspection of an MCP stdio server's tools/list schema to compute its JCS SHA-256 pin
+    InspectSchema {
+        /// Logical MCP server name (used in the output policy snippet)
+        #[arg(long, default_value = "mcp-server")]
+        server: String,
+
+        /// Output schema fingerprint and tool list as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// MCP server command and arguments (e.g. `-- npx -y @modelcontextprotocol/server-github`)
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -629,7 +648,7 @@ enum SessionAction {
 enum HostAction {
     /// Install Vexa Arc proxy wrapper into host agent config
     Install {
-        /// Target host (claude-code, cursor)
+        /// Target host (claude-code, cursor, codex-cli, gemini-cli, windsurf)
         #[arg(long, default_value = "claude-code")]
         host: String,
 
@@ -640,7 +659,7 @@ enum HostAction {
 
     /// Check host integration status and detect config bypasses (FR-MCP-005)
     Status {
-        /// Target host (claude-code, cursor)
+        /// Target host (claude-code, cursor, codex-cli, gemini-cli, windsurf)
         #[arg(long, default_value = "claude-code")]
         host: String,
 
@@ -655,7 +674,7 @@ enum HostAction {
 
     /// Uninstall Vexa Arc proxy wrapper and restore original config
     Uninstall {
-        /// Target host (claude-code, cursor)
+        /// Target host (claude-code, cursor, codex-cli, gemini-cli, windsurf)
         #[arg(long, default_value = "claude-code")]
         host: String,
 
@@ -1329,7 +1348,7 @@ fn main() {
         } => {
             if !run_trace(
                 &event_id,
-                &session,
+                session.as_deref(),
                 session_dir.as_deref(),
                 project_local,
                 export.as_deref(),
@@ -1570,6 +1589,15 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            McpAction::InspectSchema {
+                server,
+                json,
+                command,
+            } => {
+                if !run_mcp_inspect_schema(&server, json, &command) {
+                    std::process::exit(1);
+                }
+            }
         },
         Commands::McpServer { path } => {
             if !commands::mcp_server::run_mcp_server(&path) {
@@ -1581,6 +1609,7 @@ fn main() {
             sca,
             fail_on,
             fail_on_secrets,
+            fail_on_unpinned_mcp,
             markdown_out,
             json_out,
             json,
@@ -1592,6 +1621,7 @@ fn main() {
                 sca,
                 fail_on.as_deref(),
                 fail_on_secrets,
+                fail_on_unpinned_mcp,
                 markdown_out.as_deref(),
                 json_out.as_deref(),
                 json,
@@ -1844,8 +1874,27 @@ fn run_sca_fix_cmd(
                         " Remediations:  {} package update(s)",
                         res.remediations_count
                     );
+                    println!(" Verification:  {}", res.verification_status);
+                    println!(
+                        " Lockfile:      {}",
+                        if res.lockfile_updated {
+                            "updated (--ignore-scripts)"
+                        } else {
+                            "not updated"
+                        }
+                    );
                     if !res.patched_files.is_empty() {
                         println!(" Patched Files: {}", res.patched_files.join(", "));
+                    }
+                    if res.remaining_findings_count > 0 {
+                        println!(
+                            " ⚠ Unresolved:  {} remaining advisory(ies): {}",
+                            res.remaining_findings_count,
+                            res.remaining_advisories.join(", ")
+                        );
+                    }
+                    for w in &res.warnings {
+                        println!(" ⚠ Warning:     {w}");
                     }
                     println!(
                         "───────────────────────────────────────────────────────────────────────"
@@ -1881,20 +1930,50 @@ fn run_telemetry(action: TelemetryAction) -> bool {
             arc_telemetry::run_collector(&dir, &endpoint).is_ok()
         }
         TelemetryAction::Status { json } => {
-            let enabled = std::env::var("ARC_PILOT_TELEMETRY").ok().as_deref() == Some("local");
+            let pilot_enabled =
+                std::env::var("ARC_PILOT_TELEMETRY").ok().as_deref() == Some("local");
+            let collector_endpoint = std::env::var("ARC_TELEMETRY_ENDPOINT")
+                .unwrap_or_else(|_| "127.0.0.1:39741".to_string());
+            let cloud = arc_telemetry::get_cloud_telemetry_status();
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "enabled": enabled,
-                        "collector_endpoint": std::env::var("ARC_TELEMETRY_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:39741".to_string()),
+                        "enabled": pilot_enabled,
+                        "pilot_collector": {
+                            "enabled": pilot_enabled,
+                            "collector_endpoint": collector_endpoint,
+                            "spool_directory_configured": dir.exists(),
+                            "spool_directory": dir.display().to_string(),
+                        },
+                        "cloud_sync": cloud,
+                        "collector_endpoint": collector_endpoint,
                         "spool_directory_configured": dir.exists(),
                         "spool_directory": dir.display().to_string(),
                     })
                 );
             } else {
-                println!("Telemetry enabled: {enabled}");
-                println!("Spool directory: {}", dir.display());
+                println!("Cloud Console Sync:");
+                println!("  Enrolled:       {}", cloud.enrolled);
+                println!("  Offline mode:   {}", cloud.offline);
+                println!("  API endpoint:   {}", cloud.api_base_url);
+                println!("  Queued events:  {}", cloud.queued_events);
+                println!(
+                    "  Last flush:     {}",
+                    cloud.last_sync_at.as_deref().unwrap_or("never")
+                );
+                println!("  Spool file:     {}", cloud.spool_file);
+                if cloud.queued_events > 0 {
+                    println!(
+                        "  Tip: run `arc telemetry flush` to upload queued events immediately."
+                    );
+                }
+                println!("Local Pilot UDP Collector:");
+                println!(
+                    "  Enabled:        {pilot_enabled} (set ARC_PILOT_TELEMETRY=local to enable)"
+                );
+                println!("  Endpoint:       {collector_endpoint}");
+                println!("  Spool dir:      {}", dir.display());
             }
             true
         }
@@ -2436,6 +2515,38 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
                 "External terminal commands and direct network egress",
             ],
         ),
+        "codex-cli" | "codex" => (
+            &[
+                "PreToolUse (Bash, file read/write, MCP tool calls)",
+                "PostToolUse (tool results & taint tracking)",
+            ],
+            &[
+                "Unwrapped MCP stdio/HTTP servers",
+                "External terminal commands and direct network egress",
+            ],
+        ),
+        "gemini-cli" | "gemini" => (
+            &[
+                "BeforeTool (shell, file read/write, web fetch, MCP tool calls)",
+                "AfterTool (tool results & taint tracking)",
+            ],
+            &[
+                "Unwrapped MCP stdio/HTTP servers",
+                "External terminal commands and direct network egress",
+            ],
+        ),
+        "windsurf" => (
+            &[
+                "pre_run_command (shell execution)",
+                "pre_read_code / pre_write_code (file reads & writes)",
+                "pre_mcp_tool_use / post_mcp_tool_use (MCP calls)",
+            ],
+            &[
+                "Direct editor writes outside Cascade hooks",
+                "Unwrapped MCP stdio/HTTP servers",
+                "External terminal commands and direct network egress",
+            ],
+        ),
         _ => (&[], &[]),
     };
 
@@ -2520,9 +2631,61 @@ fn run_host_uninstall(host: &str, workspace: Option<&Path>) -> bool {
                 false
             }
         },
-        "codex-cli" | "codex" => CodexCliAdapter::uninstall_integration(root).is_ok(),
-        "gemini-cli" | "gemini" => GeminiCliAdapter::uninstall_integration(root).is_ok(),
-        "windsurf" => WindsurfAdapter::uninstall_integration(root).is_ok(),
+        "codex-cli" | "codex" => match CodexCliAdapter::uninstall_integration(root) {
+            Ok(modified) => {
+                if modified {
+                    println!(
+                        "[Arc Host] Codex CLI integration removed from {}",
+                        root.display()
+                    );
+                } else {
+                    println!(
+                        "[Arc Host] No Arc hook found in Codex CLI config (was not installed)"
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to remove Codex CLI integration: {e}");
+                false
+            }
+        },
+        "gemini-cli" | "gemini" => match GeminiCliAdapter::uninstall_integration(root) {
+            Ok(modified) => {
+                if modified {
+                    println!(
+                        "[Arc Host] Gemini CLI integration removed from {}",
+                        root.display()
+                    );
+                } else {
+                    println!(
+                        "[Arc Host] No Arc hook found in Gemini CLI config (was not installed)"
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to remove Gemini CLI integration: {e}");
+                false
+            }
+        },
+        "windsurf" => match WindsurfAdapter::uninstall_integration(root) {
+            Ok(modified) => {
+                if modified {
+                    println!(
+                        "[Arc Host] Windsurf integration removed from {}",
+                        root.display()
+                    );
+                } else {
+                    println!("[Arc Host] No Arc hook found in Windsurf config (was not installed)");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to remove Windsurf integration: {e}");
+                false
+            }
+        },
         _ => {
             eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
             false
@@ -2542,12 +2705,42 @@ fn run_shield_run(command: Vec<String>, show_recommendation: bool, fail_on_risk:
     }
 
     let firewall = PackageFirewall::new();
+    let osv_scanner = OsvPackageScanner::default();
     let mut all_safe = true;
 
     println!("\n[Arc Shield Run] Advisory check (command not executed): {cmd_str}");
     for (eco, pkg_name) in &pkgs {
         let inspection = firewall.inspect_package_live(*eco, pkg_name, false);
         let verdict = inspection.verdict;
+        // Also extract an exact version if the raw command included one (e.g. lodash@4.17.19 or lodash==4.17.19)
+        let exact_version = command.iter().find_map(|tok| {
+            let trimmed = tok.trim_matches(|c| c == '"' || c == '\'');
+            let (name, ver) = split_package_version(trimmed);
+            if name.eq_ignore_ascii_case(pkg_name) {
+                ver.map(|v| v.to_string())
+            } else {
+                None
+            }
+        });
+        let osv_block = exact_version.as_deref().and_then(|v| {
+            let osv_eco = ecosystem_to_osv_str(*eco);
+            match osv_scanner.scan_package(pkg_name, v, osv_eco) {
+                Ok(r) if !r.advisory_available => Some(format!(
+                    "OSV advisory check incomplete for {pkg_name}@{v} (fail-closed)"
+                )),
+                Ok(r) if r.should_block() => Some(format!(
+                    "ARC-SCA-001: {} OSV finding(s) for {} ({})",
+                    r.findings.len(),
+                    r.package_purl,
+                    r.findings
+                        .first()
+                        .map(|f| f.remediation_message.as_str())
+                        .unwrap_or("vulnerable version")
+                )),
+                Ok(_) => None,
+                Err(e) => Some(format!("OSV scan failed for {pkg_name}@{v}: {e}")),
+            }
+        });
         match &verdict {
             SlopsquatVerdict::Blocked { gate, reason } => {
                 println!("  🛑 BLOCKED  {pkg_name} ({eco:?}) — {gate}: {reason}");
@@ -2577,7 +2770,18 @@ fn run_shield_run(command: Vec<String>, show_recommendation: bool, fail_on_risk:
                 }
             }
             SlopsquatVerdict::Permitted { reason } => {
-                println!("  ✅ PERMITTED {pkg_name} ({eco:?}) — {reason}");
+                if let Some(ref osv_reason) = osv_block {
+                    println!("  🛑 BLOCKED  {pkg_name} ({eco:?}) — {osv_reason}");
+                    all_safe = false;
+                } else {
+                    println!("  ✅ PERMITTED {pkg_name} ({eco:?}) — {reason}");
+                }
+            }
+        }
+        if !matches!(verdict, SlopsquatVerdict::Permitted { .. }) {
+            if let Some(ref osv_reason) = osv_block {
+                println!("  🛑 OSV      {pkg_name} ({eco:?}) — {osv_reason}");
+                all_safe = false;
             }
         }
     }
@@ -2586,7 +2790,7 @@ fn run_shield_run(command: Vec<String>, show_recommendation: bool, fail_on_risk:
 
 fn run_trace(
     event_id: &str,
-    session_id: &str,
+    session_id: Option<&str>,
     session_dir: Option<&Path>,
     project_local: bool,
     export: Option<&Path>,
@@ -2600,11 +2804,25 @@ fn run_trace(
         }
     };
 
-    let dag = match SessionTaintDag::load_from_dir(&dir, session_id) {
+    let resolved_session = match session_id {
+        Some(id) => id.to_string(),
+        None => match find_latest_session_in_dir(&dir) {
+            Some(latest) => latest,
+            None => {
+                eprintln!(
+                    "Error: No sessions found in storage: {} (pass --session <id> or run an intercepted action first)",
+                    dir.display()
+                );
+                return false;
+            }
+        },
+    };
+
+    let dag = match SessionTaintDag::load_from_dir(&dir, &resolved_session) {
         Ok(Some(d)) => d,
         Ok(None) => {
             eprintln!(
-                "Error: Session '{session_id}' not found in storage: {}",
+                "Error: Session '{resolved_session}' not found in storage: {}",
                 dir.display()
             );
             return false;
@@ -2630,7 +2848,7 @@ fn run_trace(
         println!(
             "{}",
             serde_json::json!({
-                "session_id": session_id,
+                "session_id": resolved_session,
                 "current_taints": format!("{:?}", dag.current_taints),
                 "matched_event": matched_node,
                 "causal_graph_size": dag.causal_nodes.len(),
@@ -2939,14 +3157,54 @@ fn run_audit(path: &Path, workstation: bool, output_json: bool, bom_file: Option
         let scanner = DiscoveryScanner::new();
         match scanner.audit_workstation() {
             Ok(report) => {
+                if let Some(bom_path) = bom_file {
+                    let bom = generate_cyclonedx_1_6_bom(&report);
+                    match serde_json::to_string_pretty(&bom) {
+                        Ok(bom_str) => {
+                            if let Err(e) = std::fs::write(bom_path, bom_str) {
+                                eprintln!("Error writing AI-BOM to '{}': {e}", bom_path.display());
+                                return false;
+                            }
+                            if !output_json {
+                                println!(
+                                    "[Arc Audit] CycloneDX 1.6 AI-BOM exported to {}",
+                                    bom_path.display()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error serializing CycloneDX AI-BOM: {e}");
+                            return false;
+                        }
+                    }
+                }
                 if output_json {
                     let json_str = serde_json::to_string_pretty(&report).unwrap_or_default();
                     println!("{json_str}");
                 } else {
-                    println!("  Scanned Roots:  {}", report.scanned_locations.len());
-                    println!("  Unscanned:      {}", report.unscanned_locations.len());
-                    println!("  Total Assets:   {}", report.total_assets);
-                    println!("  Overall Risk:   {:?}", report.overall_risk_band);
+                    println!("  Scanned Roots:   {}", report.scanned_locations.len());
+                    println!(
+                        "  Not Installed:   {} (absent host config directories)",
+                        report.not_installed_locations.len()
+                    );
+                    println!(
+                        "  Skipped/Errors:  {} (budget/depth/permission limits)",
+                        report.unscanned_locations.len()
+                    );
+                    println!("  Total Assets:    {}", report.total_assets);
+                    println!("  Overall Risk:    {:?}", report.overall_risk_band);
+                    if !report.not_installed_locations.is_empty() {
+                        println!("  Absent Host Paths:");
+                        for p in &report.not_installed_locations {
+                            println!("    - {}", p.display());
+                        }
+                    }
+                    if !report.unscanned_locations.is_empty() {
+                        println!("  Skipped/Unscanned Paths:");
+                        for p in &report.unscanned_locations {
+                            println!("    - {}", p.display());
+                        }
+                    }
                     println!("[Arc Audit] Workstation audit complete.");
                 }
                 return true;
@@ -3439,7 +3697,11 @@ fn run_shield_check(
             |r| {
                 serde_json::json!({
                     "status": osv_status,
+                    "advisory_source": r.advisory_source,
+                    "queried_at": r.queried_at,
+                    "package_purl": r.package_purl,
                     "advisory_available": r.advisory_available,
+                    "error": r.error,
                     "finding_count": r.findings.len(),
                     "has_critical_or_high": r.has_critical_or_high,
                     "has_high_epss": r.has_high_epss,
@@ -3467,20 +3729,49 @@ fn run_shield_check(
 
         let json_output = match &verdict {
             arc_firewall::slopsquat::SlopsquatVerdict::Permitted { reason } => {
-                serde_json::json!({
-                    "package": package,
-                    "ecosystem": format!("{eco:?}").to_lowercase(),
-                    "status": "permitted",
-                    "reason": reason,
-                    "provenance": provenance_json,
-                    "suggested_action": null,
-                    "metrics": {
-                        "age_days": age_days,
-                        "monthly_downloads": downloads,
-                        "dangerous_scripts": dangerous_scripts
-                    },
-                    "osv": osv_json,
-                })
+                if osv_outcome.blocks() {
+                    let block_reason = match &osv_outcome {
+                        OsvOutcome::Incomplete(e) => {
+                            format!("OSV advisory check incomplete (fail-closed): {e}")
+                        }
+                        OsvOutcome::Scanned(r) => format!(
+                            "Blocked by OSV vulnerability check ({} finding(s) for {})",
+                            r.findings.len(),
+                            r.package_purl
+                        ),
+                        OsvOutcome::NoVersion => "Blocked by OSV vulnerability check".to_string(),
+                    };
+                    serde_json::json!({
+                        "package": package,
+                        "ecosystem": format!("{eco:?}").to_lowercase(),
+                        "status": "blocked",
+                        "gate": "ARC-SCA-001",
+                        "reason": block_reason,
+                        "provenance": provenance_json,
+                        "suggested_action": osv_result.and_then(|r| r.findings.first().map(|f| f.remediation_message.clone())),
+                        "metrics": {
+                            "age_days": age_days,
+                            "monthly_downloads": downloads,
+                            "dangerous_scripts": dangerous_scripts
+                        },
+                        "osv": osv_json,
+                    })
+                } else {
+                    serde_json::json!({
+                        "package": package,
+                        "ecosystem": format!("{eco:?}").to_lowercase(),
+                        "status": "permitted",
+                        "reason": reason,
+                        "provenance": provenance_json,
+                        "suggested_action": null,
+                        "metrics": {
+                            "age_days": age_days,
+                            "monthly_downloads": downloads,
+                            "dangerous_scripts": dangerous_scripts
+                        },
+                        "osv": osv_json,
+                    })
+                }
             }
             arc_firewall::slopsquat::SlopsquatVerdict::Blocked { gate, reason } => {
                 serde_json::json!({
@@ -3789,7 +4080,7 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
                         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
                 });
             let _ = arc_telemetry::spool_arc_event(&cloud_tel, repo_name.as_deref());
-            let _ = arc_telemetry::maybe_spawn_background_flush(60);
+            let _ = arc_telemetry::maybe_spawn_background_flush(2);
             response = adapter.encode(verdict);
             break;
         }
@@ -4565,6 +4856,158 @@ fn parse_schema_fingerprint(schema_input: Option<&str>) -> Result<Option<[u8; 32
     ))
 }
 
+/// Performs a read-only stdio MCP handshake (`initialize` + `tools/list`, never calling any tool)
+/// to compute the canonical JCS SHA-256 schema pin required by `SignedOrganization` policies.
+fn run_mcp_inspect_schema(server: &str, json: bool, command: &[String]) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    if command.is_empty() {
+        eprintln!("[Arc MCP] Error: MCP server command is empty.");
+        return false;
+    }
+
+    let mut child = match Command::new(&command[0])
+        .args(&command[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[Arc MCP] Failed to spawn '{}': {e}", command[0]);
+            return false;
+        }
+    };
+
+    let result = (|| -> Result<(String, Vec<String>), String> {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to open child stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to open child stdout".to_string())?;
+
+        let init_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "vexa-arc-inspect-schema", "version": env!("CARGO_PKG_VERSION") }
+            }
+        });
+        let notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let list_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        });
+
+        writeln!(stdin, "{init_req}").map_err(|e| format!("Write initialize failed: {e}"))?;
+        writeln!(stdin, "{notif}").map_err(|e| format!("Write initialized failed: {e}"))?;
+        writeln!(stdin, "{list_req}").map_err(|e| format!("Write tools/list failed: {e}"))?;
+        let _ = stdin.flush();
+        drop(stdin);
+
+        let reader = BufReader::new(stdout);
+        for (idx, line) in reader.lines().enumerate() {
+            if idx > 128 {
+                break;
+            }
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            if val.get("id").and_then(|v| v.as_i64()) == Some(2) {
+                if let Some(err) = val.get("error") {
+                    return Err(format!("MCP server returned error for tools/list: {err}"));
+                }
+                let tools = val
+                    .get("result")
+                    .and_then(|r| r.get("tools"))
+                    .ok_or_else(|| "tools/list response missing result.tools array".to_string())?;
+                let tools_bytes = serde_json::to_vec(tools)
+                    .map_err(|e| format!("Serialize tools failed: {e}"))?;
+                let hash = arc_core::compute_jcs_schema_hash(&tools_bytes)
+                    .map_err(|e| format!("Failed to compute JCS SHA-256 hash: {e}"))?;
+                let hex_hash = hex::encode(hash);
+                let tool_names: Vec<String> = tools
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| {
+                                t.get("name").and_then(|n| n.as_str()).map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok((hex_hash, tool_names));
+            }
+        }
+        Err("MCP server closed stdout without returning a tools/list response".to_string())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match result {
+        Ok((sha256, tools)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "server": server,
+                        "schema_sha256": sha256,
+                        "tool_count": tools.len(),
+                        "tools": tools,
+                        "policy_snippet": {
+                            "mcp_schema_pins": {
+                                server: sha256
+                            }
+                        }
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                println!("\n[Arc MCP] Read-Only Schema Inspection for '{server}'");
+                println!("  Tools Discovered: {}", tools.len());
+                if !tools.is_empty() {
+                    println!("  Tool Names:       {}", tools.join(", "));
+                }
+                println!("  JCS SHA-256 Pin:  {sha256}");
+                println!("\n  Add to Signed Organization Policy (`mcp_schema_pins`):");
+                println!("    \"{server}\": \"{sha256}\"");
+                println!("\n  Or pass locally (when no signed org policy is active):");
+                println!(
+                    "    arc protect stdio --server {server} --pin-schema {sha256} -- {}",
+                    command.join(" ")
+                );
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("[Arc MCP] Schema inspection failed: {e}");
+            false
+        }
+    }
+}
+
 fn resolve_schema_pin(
     policy: &PolicyConfig,
     server: &str,
@@ -4580,7 +5023,12 @@ fn resolve_schema_pin(
             );
         }
         let fingerprint = policy.mcp_schema_pins.get(server).ok_or_else(|| {
-            format!("signed organization policy has no schema pin for MCP server '{server}'")
+            format!(
+                "signed organization policy has no schema pin for MCP server '{server}'. \
+                 Compute its read-only JCS SHA-256 pin with: \
+                 `arc mcp inspect-schema --server {server} -- <command> [args...]` \
+                 and add it to your organization's signed policy `mcp_schema_pins`."
+            )
         })?;
         let managed_pin = parse_schema_fingerprint(Some(fingerprint))?
             .ok_or_else(|| format!("signed organization policy pin for '{server}' is empty"))?;
@@ -5045,7 +5493,27 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
         }
     };
 
-    let evaluator = PolicyEvaluator::default();
+    let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let policy_cfg = match PolicyConfig::try_load_with_precedence(Some(&project_dir)) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "error": format!("Policy load error (failing closed): {err}"),
+                    "session_id": session,
+                    "success": false,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
+                );
+            } else {
+                eprintln!("Error: Policy load error (failing closed): {err}");
+            }
+            return false;
+        }
+    };
+    let evaluator = PolicyEvaluator::new(policy_cfg);
 
     if opts.reset {
         if let Err(err) = evaluator.clear_session_state(Some(&storage_dir), session) {
@@ -5241,7 +5709,7 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
             });
         let _ = arc_telemetry::spool_arc_event(&cloud_tel, repo_name.as_deref());
-        let _ = arc_telemetry::maybe_spawn_background_flush(60);
+        let _ = arc_telemetry::maybe_spawn_background_flush(2);
     }
 
     if opts.json {

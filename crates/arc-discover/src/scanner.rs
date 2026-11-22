@@ -54,6 +54,8 @@ pub struct AuditReport {
     #[serde(default)]
     pub scanned_locations: Vec<PathBuf>,
     #[serde(default)]
+    pub not_installed_locations: Vec<PathBuf>,
+    #[serde(default)]
     pub unscanned_locations: Vec<PathBuf>,
     #[serde(default)]
     pub excluded_paths: Vec<PathBuf>,
@@ -132,6 +134,9 @@ pub fn get_workstation_roots() -> Vec<PathBuf> {
             roots.push(userprofile.join(".claude"));
             roots.push(userprofile.join(".vscode"));
             roots.push(userprofile.join(".windsurf"));
+            roots.push(userprofile.join(".codex"));
+            roots.push(userprofile.join(".gemini"));
+            roots.push(userprofile.join(".cline"));
         }
     }
 
@@ -158,6 +163,9 @@ pub fn get_workstation_roots() -> Vec<PathBuf> {
             roots.push(home.join(".claude"));
             roots.push(home.join(".vscode"));
             roots.push(home.join(".windsurf"));
+            roots.push(home.join(".codex"));
+            roots.push(home.join(".gemini"));
+            roots.push(home.join(".cline"));
         }
     }
 
@@ -258,6 +266,7 @@ impl DiscoveryScanner {
             overall_risk_band: highest_band,
             total_assets,
             scanned_locations,
+            not_installed_locations: Vec::new(),
             unscanned_locations,
             excluded_paths,
             permission_errors,
@@ -274,6 +283,7 @@ impl DiscoveryScanner {
         let mut model_assets = Vec::new();
         let mut exposed_secrets = Vec::new();
         let mut scanned_locations = Vec::new();
+        let mut not_installed_locations = Vec::new();
         let mut unscanned_locations = Vec::new();
         let mut excluded_paths = Vec::new();
         let mut permission_errors = Vec::new();
@@ -300,7 +310,7 @@ impl DiscoveryScanner {
                     &mut permission_errors,
                 );
             } else {
-                unscanned_locations.push(root);
+                not_installed_locations.push(root);
             }
         }
 
@@ -326,6 +336,7 @@ impl DiscoveryScanner {
             overall_risk_band: highest_band,
             total_assets,
             scanned_locations,
+            not_installed_locations,
             unscanned_locations,
             excluded_paths,
             permission_errors,

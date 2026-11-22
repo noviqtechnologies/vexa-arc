@@ -147,7 +147,7 @@ arc ci-report --sca --upload
 
 ### Local Stdio MCP Server (`arc mcp-server`)
 
-For agents without native hook integrations (Codex CLI, Gemini CLI, Windsurf, Cline, VS Code Copilot), register `arc mcp-server` as a stdio MCP server in your client config to expose `scan_secrets`, `check_package`, `sca_audit`, and `audit_ai_assets`:
+For agents without native hook integrations (e.g. Cline, VS Code Copilot) — or alongside native hooks in Claude Code, Cursor, Codex CLI, Gemini CLI, and Windsurf — register `arc mcp-server` as a stdio MCP server in your client config to expose `scan_secrets`, `check_package`, `sca_audit`, and `audit_ai_assets`:
 
 ```json
 {
@@ -165,7 +165,7 @@ For agents without native hook integrations (Codex CLI, Gemini CLI, Windsurf, Cl
 Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON report covering leaked secrets, hidden Unicode/Trojan-Source characters in agent rule files (`CLAUDE.md`, `.cursorrules`, `.mdc`), unpinned MCP servers, and optional SCA vulnerability counts:
 
 ```bash
-arc ci-report --sca --fail-on high --markdown-out arc-pr-report.md --json-out arc-pr-report.json
+arc ci-report --sca --fail-on high --fail-on-unpinned-mcp --markdown-out arc-pr-report.md --json-out arc-pr-report.json
 ```
 
 For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.1.0`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
@@ -987,15 +987,15 @@ arc host uninstall --host cursor
 
 > [!TIP]
 > **Native Stdin Intercept Hook (`arc intercept hook`):**
-> Claude Code and Cursor communicate directly with `arc intercept hook --host <claude-code|cursor>` over standard I/O using their native hook schemas. Any execution error or malformed payload exits with code `2`, safely failing closed to prevent unauthorized actions.
+> Claude Code, Cursor, Codex CLI, Gemini CLI, and Windsurf communicate directly with `arc intercept hook --host <claude-code|cursor|codex-cli|gemini-cli|windsurf>` over standard I/O using their native hook schemas. Any execution error or malformed payload exits with code `2`, safely failing closed to prevent unauthorized actions.
 
-### Editors Without Native Hook APIs (Windsurf, Cline)
+### Editors Without Native Hook APIs (Cline, VS Code Copilot)
 
-Some AI coding environments (e.g. Windsurf, Cline) do not currently provide documented pre-execution hook APIs for intercepting internal editor commands, file reads, or shell tasks before they execute.
+Some AI coding environments (e.g. Cline, VS Code Copilot) do not currently provide documented pre-execution hook APIs for intercepting internal editor commands, file reads, or shell tasks before they execute.
 
 In these environments:
-- **MCP Brokering (`arc protect stdio`):** An explicitly launched stdio server can be wrapped via `arc protect stdio --server <NAME> -- <COMMAND>`. The CLI obtains managed pins from verified `.arc/signed_policy.json`; outside managed policy, supply `--pin-schema <HASH>`. `--allow-tofu` is development/bootstrap only and is rejected when signed organization policy is active. This wrapper does not stop users/agents from launching an unwrapped server or using another transport. It redacts supported secrets, ingests results into the taint tracker, and applies process-lifecycle/memory controls; these do not sandbox filesystem access or network egress.
-- **Direct Editor Terminal / File Writes:** Cursor's installed hooks mediate selected shell, MCP, and read events, but there is no configured pre-file-write event; direct editor writes bypass ARC-AST-001 and file-write DLP. Writes through scripts/processes also exceed the scanner's mediated `FileWrite` path. Windsurf and Cline have no native adapters here; only MCP traffic explicitly wrapped by `arc protect stdio` is mediated.
+- **MCP Brokering (`arc protect stdio`) & Schema Pinning (`arc mcp inspect-schema`):** An explicitly launched stdio server can be wrapped via `arc protect stdio --server <NAME> -- <COMMAND>`. To bootstrap a verified JCS SHA-256 schema pin for a `SignedOrganization` policy without executing any tools, run `arc mcp inspect-schema --server <NAME> -- <COMMAND>`. Outside managed policy, supply `--pin-schema <HASH>`. `--allow-tofu` is development/bootstrap only and is rejected when signed organization policy is active.
+- **Direct Editor Terminal / File Writes:** Cursor's installed hooks mediate selected shell, MCP, and read events, but there is no configured pre-file-write event (`bypass_risk: true`); direct editor writes bypass ARC-AST-001 and file-write DLP. Writes through scripts/processes also exceed the scanner's mediated `FileWrite` path. Cline and VS Code Copilot have no native adapters here; only MCP traffic explicitly wrapped by `arc protect stdio` is mediated.
 
 ### Generic Model Context Protocol (MCP) JSON-RPC
 

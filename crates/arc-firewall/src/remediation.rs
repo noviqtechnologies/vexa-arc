@@ -282,16 +282,193 @@ pub struct ScratchDiffResult {
     pub manifest_type: String,
     pub remediations_count: usize,
     pub patched_files: Vec<String>,
+    pub lockfile_updated: bool,
+    /// `"verified_clean"` (0 remaining advisories & lockfile updated if present),
+    /// `"partial"` (unresolved advisories remain or lockfile not updated),
+    /// or `"unverified"` (post-patch scan unavailable).
+    pub verification_status: String,
+    pub remaining_findings_count: usize,
+    pub remaining_advisories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub diff: String,
 }
 
-/// Executes a dry-run scratch patch: copies manifests into an ephemeral directory in
-/// OS temp, applies in-place fixes, generates unified git diff output, and cleans up immediately.
+fn manifest_type_to_osv_ecosystem(manifest_type: &ManifestType) -> Option<&'static str> {
+    match manifest_type {
+        ManifestType::NpmPackageLock | ManifestType::YarnLock | ManifestType::PnpmLock => {
+            Some("npm")
+        }
+        ManifestType::RustCargoLock => Some("crates.io"),
+        ManifestType::PythonRequirements => Some("PyPI"),
+        other => {
+            let dbg = format!("{other:?}").to_lowercase();
+            if dbg.contains("python") || dbg.contains("poetry") || dbg.contains("pip") {
+                Some("PyPI")
+            } else if dbg.contains("go") {
+                Some("Go")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn parse_simple_semver(v: &str) -> Option<(u64, u64, u64)> {
+    let cleaned = v.trim().trim_start_matches(['v', '^', '~', '=', '>', '<']);
+    let core = cleaned.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Validates each remediation's `target_version` against OSV and advances past
+/// intermediate versions that still have known advisories (e.g., `lodash@4.18.0 -> 4.18.1`).
+pub(crate) async fn refine_remediations_against_osv(
+    manifest_type: &ManifestType,
+    remediations: &mut [vexa_sca::types::RemediationAction],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(ecosystem) = manifest_type_to_osv_ecosystem(manifest_type) else {
+        return warnings;
+    };
+
+    let scanner = vexa_sca::scanner::vuln_scanner::VulnScanner::new(Some(
+        vexa_sca::scanner::cache::VulnCache::default(),
+    ));
+
+    for rem in remediations.iter_mut() {
+        let Some(mut candidate) = rem.target_version.clone() else {
+            continue;
+        };
+        let initial_major = parse_simple_semver(&candidate).map(|t| t.0);
+        let mut hops = 0;
+        const MAX_HOPS: usize = 5;
+
+        while hops < MAX_HOPS {
+            let graph =
+                crate::osv_scanner::build_single_package_graph(&rem.package, &candidate, ecosystem);
+            let Ok(scan) = scanner.scan_graph(&graph).await else {
+                warnings.push(format!(
+                    "Could not verify target {}@{} against OSV (scan error)",
+                    rem.package, candidate
+                ));
+                break;
+            };
+            if scan.advisory_status.is_service_unavailable() {
+                warnings.push(format!(
+                    "Could not verify target {}@{} against OSV (service unavailable)",
+                    rem.package, candidate
+                ));
+                break;
+            }
+            if scan.vulnerabilities.is_empty() {
+                break;
+            }
+
+            let cur_tuple = parse_simple_semver(&candidate);
+            let mut next_candidates: Vec<(String, (u64, u64, u64))> = scan
+                .vulnerabilities
+                .iter()
+                .flat_map(|v| v.fixed_in.iter())
+                .filter_map(|fv| {
+                    let parsed = parse_simple_semver(fv)?;
+                    if cur_tuple.is_none_or(|c| parsed > c) {
+                        Some((fv.clone(), parsed))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            next_candidates.sort_by_key(|(_, parsed)| *parsed);
+            next_candidates.dedup_by(|a, b| a.1 == b.1);
+
+            // Prefer lowest same-major fix, falling back to lowest overall fix
+            let chosen = next_candidates
+                .iter()
+                .find(|(_, parsed)| initial_major.is_some_and(|m| parsed.0 == m))
+                .or_else(|| next_candidates.first())
+                .map(|(s, _)| s.clone());
+
+            match chosen {
+                Some(next_ver) if next_ver != candidate => {
+                    candidate = next_ver;
+                    hops += 1;
+                }
+                _ => {
+                    warnings.push(format!(
+                        "Target {}@{} still has {} advisory(ies) with no higher fixed_in version",
+                        rem.package,
+                        candidate,
+                        scan.vulnerabilities.len()
+                    ));
+                    break;
+                }
+            }
+        }
+        rem.target_version = Some(candidate);
+    }
+
+    warnings
+}
+
+/// Cross-OS safe lockfile regeneration without executing untrusted lifecycle scripts.
+fn regenerate_lockfile_in_dir(dir: &Path, manifest_type: &ManifestType) -> (bool, Option<String>) {
+    let (exe_unix, exe_win, args): (&str, &str, &[&str]) = match manifest_type {
+        ManifestType::NpmPackageLock => (
+            "npm",
+            "npm.cmd",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ],
+        ),
+        ManifestType::PnpmLock => (
+            "pnpm",
+            "pnpm.cmd",
+            &["install", "--lockfile-only", "--ignore-scripts"],
+        ),
+        ManifestType::YarnLock => ("yarn", "yarn.cmd", &["install", "--mode=update-lockfile"]),
+        ManifestType::RustCargoLock => ("cargo", "cargo.exe", &["generate-lockfile"]),
+        _ => return (false, None),
+    };
+
+    let exe = if cfg!(windows) { exe_win } else { exe_unix };
+    match Command::new(exe).args(args).current_dir(dir).output() {
+        Ok(out) if out.status.success() => (true, None),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            (
+                false,
+                Some(format!(
+                    "Lockfile regeneration via `{exe}` failed (exit {:?}): {}",
+                    out.status.code(),
+                    stderr.lines().next().unwrap_or("unknown error")
+                )),
+            )
+        }
+        Err(e) => (
+            false,
+            Some(format!(
+                "Lockfile regeneration skipped (`{exe}` unavailable): {e}"
+            )),
+        ),
+    }
+}
+
+/// Executes a dry-run scratch patch: copies manifests and lockfiles into an ephemeral directory in
+/// OS temp, refines target versions against OSV, applies fixes, regenerates the lockfile safely
+/// (`--ignore-scripts`), re-scans the patched directory, generates diff output, and cleans up.
 pub async fn run_scratch_diff(
     project_dir: &Path,
 ) -> Result<ScratchDiffResult, ScaRemediationError> {
     let scan_opts = ScanOptions::default();
-    let scan_out = scan_project(project_dir, scan_opts)
+    let mut scan_out = scan_project(project_dir, scan_opts)
         .await
         .map_err(ScaRemediationError::ScanError)?;
 
@@ -300,9 +477,18 @@ pub async fn run_scratch_diff(
             manifest_type: format!("{:?}", scan_out.manifest_type),
             remediations_count: 0,
             patched_files: Vec::new(),
+            lockfile_updated: false,
+            verification_status: "verified_clean".to_string(),
+            remaining_findings_count: 0,
+            remaining_advisories: Vec::new(),
+            warnings: Vec::new(),
             diff: "No vulnerable packages require automated patching.".to_string(),
         });
     }
+
+    // Refine remediation targets so we never propose upgrading into another vulnerable version
+    let mut warnings =
+        refine_remediations_against_osv(&scan_out.manifest_type, &mut scan_out.remediations).await;
 
     let scratch_id = format!("arc-scratch-{}", Uuid::new_v4());
     let scratch_dir = std::env::temp_dir().join(scratch_id);
@@ -329,6 +515,13 @@ pub async fn run_scratch_diff(
         }
     }
 
+    let had_lockfile = copied_files.iter().any(|f| {
+        matches!(
+            f.as_str(),
+            "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "Cargo.lock"
+        )
+    });
+
     // For Cargo workspaces, copy member crate manifests to preserve dependency tree
     let root_cargo = project_dir.join("Cargo.toml");
     if root_cargo.is_file() {
@@ -347,6 +540,55 @@ pub async fn run_scratch_diff(
         false,
     )
     .map_err(ScaRemediationError::PatchError)?;
+
+    // Regenerate lockfile safely (no lifecycle scripts) so the dependency graph reflects the patch
+    let (lockfile_updated, lock_warn) =
+        regenerate_lockfile_in_dir(&scratch_dir, &scan_out.manifest_type);
+    if let Some(w) = lock_warn {
+        warnings.push(w);
+    }
+
+    // Re-scan the patched scratch directory to verify zero unresolved advisories remain
+    let (verification_status, remaining_findings_count, remaining_advisories) =
+        match scan_project(&scratch_dir, ScanOptions::default()).await {
+            Ok(post_scan) => {
+                if post_scan
+                    .scan_result
+                    .advisory_status
+                    .is_service_unavailable()
+                {
+                    warnings.push(
+                        "Post-patch verification scan could not reach OSV; proposal is unverified."
+                            .to_string(),
+                    );
+                    ("unverified".to_string(), 0, Vec::new())
+                } else {
+                    let remaining: Vec<String> = post_scan
+                        .scan_result
+                        .vulnerabilities
+                        .iter()
+                        .map(|v| format!("{} ({}@{})", v.id, v.package, v.version))
+                        .collect();
+                    let count = remaining.len();
+                    let status = if count == 0 && (!had_lockfile || lockfile_updated) {
+                        "verified_clean".to_string()
+                    } else {
+                        if had_lockfile && !lockfile_updated {
+                            warnings.push(
+                                "Lockfile was not updated; re-scan reflects prior lockfile graph."
+                                    .to_string(),
+                            );
+                        }
+                        "partial".to_string()
+                    };
+                    (status, count, remaining)
+                }
+            }
+            Err(e) => {
+                warnings.push(format!("Post-patch re-scan failed: {e}"));
+                ("unverified".to_string(), 0, Vec::new())
+            }
+        };
 
     // Compute diff between original and scratch
     let mut full_diff = String::new();
@@ -376,6 +618,11 @@ pub async fn run_scratch_diff(
         manifest_type: format!("{:?}", scan_out.manifest_type),
         remediations_count: scan_out.remediations.len(),
         patched_files,
+        lockfile_updated,
+        verification_status,
+        remaining_findings_count,
+        remaining_advisories,
+        warnings,
         diff: if full_diff.is_empty() {
             "Manifest already satisfied or no direct lockfile modifications required.".to_string()
         } else {
@@ -922,7 +1169,7 @@ pub async fn run_worktree_pr_creation(
 
     // 3. Scan project for remediations
     let scan_opts = ScanOptions::default();
-    let scan_out = scan_project(repo_dir, scan_opts)
+    let mut scan_out = scan_project(repo_dir, scan_opts)
         .await
         .map_err(ScaRemediationError::ScanError)?;
 
@@ -940,6 +1187,10 @@ pub async fn run_worktree_pr_creation(
         });
     }
 
+    // Refine target versions against OSV so we never upgrade into another vulnerable version
+    let _refine_warnings =
+        refine_remediations_against_osv(&scan_out.manifest_type, &mut scan_out.remediations).await;
+
     // 4. Create detached worktree
     let mut worktree = DisposableWorktree::create(repo_dir, &divergence.remote_ref)?;
 
@@ -951,6 +1202,41 @@ pub async fn run_worktree_pr_creation(
         false,
     )
     .map_err(ScaRemediationError::PatchError)?;
+
+    // 5b. Regenerate lockfile safely (--ignore-scripts) and re-scan the patched worktree
+    let (lockfile_updated, lock_warn) =
+        regenerate_lockfile_in_dir(&worktree.worktree_dir, &scan_out.manifest_type);
+    let post_scan = scan_project(&worktree.worktree_dir, ScanOptions::default())
+        .await
+        .map_err(ScaRemediationError::ScanError)?;
+    if !post_scan
+        .scan_result
+        .advisory_status
+        .is_service_unavailable()
+        && !post_scan.scan_result.vulnerabilities.is_empty()
+    {
+        let remaining: Vec<String> = post_scan
+            .scan_result
+            .vulnerabilities
+            .iter()
+            .map(|v| format!("{} ({}@{})", v.id, v.package, v.version))
+            .collect();
+        let lock_note = if lockfile_updated {
+            String::new()
+        } else {
+            format!(
+                " (lockfile not updated: {})",
+                lock_warn.as_deref().unwrap_or("unavailable")
+            )
+        };
+        worktree.cleanup();
+        return Err(ScaRemediationError::PatchError(format!(
+            "Refusing to open incomplete remediation PR: {} vulnerability(ies) remain after patching{}: {}",
+            remaining.len(),
+            lock_note,
+            remaining.join(", ")
+        )));
+    }
 
     // 6. Optional test execution
     if options.run_tests {

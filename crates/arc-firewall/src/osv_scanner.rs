@@ -130,8 +130,19 @@ pub struct PackageScanResult {
     pub package: String,
     /// Version that was scanned.
     pub version: String,
-    /// Whether the advisory database was reachable (or served from cache).
+    /// OSV ecosystem string (e.g. `npm`, `PyPI`, `crates.io`, `Go`).
+    pub ecosystem: String,
+    /// Package URL (PURL) coordinate queried against OSV.
+    pub package_purl: String,
+    /// Advisory data source queried (e.g. `osv.dev`).
+    pub advisory_source: String,
+    /// RFC 3339 UTC timestamp of when the lookup completed.
+    pub queried_at: String,
+    /// Whether the advisory database was reachable (or served from cache) and actually queried.
     pub advisory_available: bool,
+    /// Optional error/diagnostic detail when advisory lookup could not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// All vulnerability findings for this package, sorted by severity (highest first).
     pub findings: Vec<PackageVulnFinding>,
     /// True if any finding is CRITICAL or HIGH severity.
@@ -140,6 +151,32 @@ pub struct PackageScanResult {
     pub has_high_epss: bool,
     /// True if any finding is reachable from project entry points.
     pub has_reachable: bool,
+}
+
+/// Formats a canonical Package URL (PURL) for reporting and auditability.
+pub fn format_package_purl(ecosystem: &str, name: &str, version: &str) -> String {
+    let purl_type = match ecosystem {
+        "npm" => "npm",
+        "PyPI" | "pypi" => "pypi",
+        "crates.io" | "cargo" => "cargo",
+        "Go" | "go" => "golang",
+        other => other,
+    };
+    format!("pkg:{purl_type}/{name}@{version}")
+}
+
+/// Builds a synthetic 1-dependency [`DepGraph`] so `vexa_sca::VulnScanner::scan_graph`
+/// (which skips `DepGraph::root_pkg`) actually queries `name@version` against OSV.
+pub(crate) fn build_single_package_graph(name: &str, version: &str, ecosystem: &str) -> DepGraph {
+    let root = PkgInfo::new("__arc_shield_root__", "0.0.0", ecosystem);
+    let pkg = PkgInfo::new(name, version, ecosystem);
+    let mgr = PkgManagerInfo {
+        name: ecosystem.to_string(),
+        version: "0".to_string(),
+    };
+    let mut graph = DepGraph::new(root, mgr);
+    graph.add_pkg(pkg);
+    graph
 }
 
 impl PackageScanResult {
@@ -210,13 +247,8 @@ impl OsvPackageScanner {
         version: &str,
         ecosystem: &str,
     ) -> Result<PackageScanResult, String> {
-        let pkg = PkgInfo::new(name, version, ecosystem);
-        let mgr = PkgManagerInfo {
-            name: ecosystem.to_string(),
-            version: "0".to_string(),
-        };
-        let mut graph = DepGraph::new(pkg.clone(), mgr);
-        graph.add_pkg(pkg);
+        let graph = build_single_package_graph(name, version, ecosystem);
+        let package_purl = format_package_purl(ecosystem, name, version);
 
         // Build a minimal single-threaded Tokio runtime for the async scan.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -228,12 +260,42 @@ impl OsvPackageScanner {
             .block_on(self.scanner.scan_graph(&graph))
             .map_err(|e| format!("OSV scan error: {e}"))?;
 
+        let queried_at = chrono::Utc::now().to_rfc3339();
+
+        // Guard: if the underlying graph produced 0 scanned packages, never silently
+        // report a clean "advisory_available: true" verdict.
+        if scan_result.scanned_packages_count == 0 {
+            return Ok(PackageScanResult {
+                package: name.to_string(),
+                version: version.to_string(),
+                ecosystem: ecosystem.to_string(),
+                package_purl,
+                advisory_source: "osv.dev".to_string(),
+                queried_at,
+                advisory_available: false,
+                error: Some(format!(
+                    "OSV scanner evaluated 0 packages for {name}@{version} ({ecosystem})"
+                )),
+                findings: vec![],
+                has_critical_or_high: false,
+                has_high_epss: false,
+                has_reachable: false,
+            });
+        }
+
         // Generate remediations for matched vulnerabilities.
         let remediations = vexa_sca::scanner::remediator::Remediator::generate_remediation(
             &scan_result.vulnerabilities,
         );
 
         let advisory_available = !scan_result.advisory_status.is_service_unavailable();
+        let error = if advisory_available {
+            None
+        } else {
+            Some(format!(
+                "Advisory service unavailable for {name}@{version} ({ecosystem})"
+            ))
+        };
 
         let mut findings: Vec<PackageVulnFinding> = scan_result
             .vulnerabilities
@@ -262,7 +324,12 @@ impl OsvPackageScanner {
         Ok(PackageScanResult {
             package: name.to_string(),
             version: version.to_string(),
+            ecosystem: ecosystem.to_string(),
+            package_purl,
+            advisory_source: "osv.dev".to_string(),
+            queried_at,
             advisory_available,
+            error,
             findings,
             has_critical_or_high,
             has_high_epss,
@@ -394,6 +461,50 @@ mod tests {
         assert_eq!(ecosystem_to_osv_str(arc_core::event::Ecosystem::Go), "Go");
     }
 
+    #[test]
+    fn test_single_package_graph_includes_target_pkg() {
+        let graph = build_single_package_graph("lodash", "4.17.19", "npm");
+        let pkgs = graph.get_all_pkgs();
+        assert_eq!(
+            pkgs.len(),
+            1,
+            "Single-package graph must yield exactly 1 non-root package for OSV scanning"
+        );
+        assert_eq!(pkgs[0].name, "lodash");
+        assert_eq!(pkgs[0].version, "4.17.19");
+        assert_eq!(pkgs[0].ecosystem, "npm");
+        assert_eq!(
+            format_package_purl("npm", "lodash", "4.17.19"),
+            "pkg:npm/lodash@4.17.19"
+        );
+    }
+
+    /// Regression test (P0): lodash@4.17.19 MUST return OSV advisories and block
+    /// whenever OSV is reachable (or cached), never silently returning permitted.
+    #[test]
+    fn test_scan_vulnerable_lodash_4_17_19_detected() {
+        let sc = scanner();
+        let result = sc
+            .scan_package("lodash", "4.17.19", "npm")
+            .expect("scan should not return Err");
+        assert_eq!(result.package_purl, "pkg:npm/lodash@4.17.19");
+        assert_eq!(result.advisory_source, "osv.dev");
+        if result.advisory_available {
+            assert!(
+                !result.findings.is_empty(),
+                "lodash@4.17.19 must return OSV findings when advisory database is available"
+            );
+            assert!(
+                result.has_critical_or_high,
+                "lodash@4.17.19 must have CRITICAL/HIGH findings"
+            );
+            assert!(
+                result.should_block(),
+                "lodash@4.17.19 must be blocked by OsvPackageScanner"
+            );
+        }
+    }
+
     /// FR-PKG-006: `PackageScanResult::aggregate_jsonrpc_error` returns None for
     /// a clean scan and Some for a scan with findings.
     #[test]
@@ -401,7 +512,12 @@ mod tests {
         let clean = PackageScanResult {
             package: "clean".to_string(),
             version: "1.0.0".to_string(),
+            ecosystem: "npm".to_string(),
+            package_purl: "pkg:npm/clean@1.0.0".to_string(),
+            advisory_source: "osv.dev".to_string(),
+            queried_at: "2026-01-01T00:00:00Z".to_string(),
             advisory_available: true,
+            error: None,
             findings: vec![],
             has_critical_or_high: false,
             has_high_epss: false,
