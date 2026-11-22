@@ -731,9 +731,10 @@ mod tests {
             .audit_workstation()
             .expect("Workstation audit must succeed");
         assert_eq!(report.scanned_path, Path::new("workstation://"));
-        // Workstation audit should report roots (either scanned or unscanned)
-        let total_reported_locations =
-            report.scanned_locations.len() + report.unscanned_locations.len();
+        // Workstation audit should report roots (scanned, not-installed, or unscanned)
+        let total_reported_locations = report.scanned_locations.len()
+            + report.not_installed_locations.len()
+            + report.unscanned_locations.len();
         assert!(
             total_reported_locations > 0,
             "Must report inspected workstation roots"
