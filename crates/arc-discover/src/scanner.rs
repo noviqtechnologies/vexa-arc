@@ -838,38 +838,39 @@ impl DiscoveryScanner {
 
 /// Cross-platform check for symlinks and Windows NTFS reparse points (junctions/mount points).
 fn is_entry_symlink_or_reparse(entry: &ignore::DirEntry) -> bool {
-    if entry.path_is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
+        if entry.path_is_symlink() {
+            return true;
+        }
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if let Ok(meta) = entry.metadata() {
-            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-                return true;
-            }
-        }
+        entry
+            .metadata()
+            .map(|meta| (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+            .unwrap_or(false)
     }
-    false
+    #[cfg(not(windows))]
+    {
+        entry.path_is_symlink()
+    }
 }
 
 fn is_path_symlink_or_reparse(path: &Path) -> bool {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
     };
-    if meta.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
-        }
+        meta.file_type().is_symlink()
+            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
     }
-    false
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
 }
 
 /// High-signal local secret and AI/IDE config files that are frequently listed in `.gitignore`.
