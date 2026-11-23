@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 rust-version = "1.97.0"
 authors = ["Vexa Arc Core Team <contact@vexasec.io>"]
@@ -34,6 +34,7 @@ thiserror = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+ignore = "0.4"
 libc = "0.2"
 vexa-sca = { git = "https://github.com/noviqtechnologies/vexa-sca", tag = "v1.5.0" }
 vexa-core = { git = "https://github.com/noviqtechnologies/vexa-sca", tag = "v1.5.0" }

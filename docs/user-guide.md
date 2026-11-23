@@ -98,7 +98,7 @@ To ensure clarity across security, DevOps, and AI development teams, the table b
 
 ### First-Run Onboarding (`arc init`, `arc auth`, & `arc allow`)
 
-Run `arc init` in your repository root to create `.arc/policy.json`, install hooks for detected hosts (`claude-code`, `cursor`, `codex-cli`, `gemini-cli`, `windsurf`, or `--host all`), auto-register `arc mcp-server` in `.cursor/mcp.json` / `.mcp.json`, install Secure-at-Inception directives (`.cursor/rules/vexa-arc-security.mdc` / `CLAUDE.md` / `.windsurfrules`), and run an immediate AI asset + secret discovery scan:
+Run `arc init` in your repository root to create `.arc/policy.json`, install hooks for detected hosts (`claude-code`, `cursor`, `codex-cli`, `gemini-cli`, `windsurf`, or `--host all`), auto-register `arc mcp-server` in `.cursor/mcp.json` / `.mcp.json`, install Secure-at-Inception directives (`.cursor/rules/vexa-arc-security.mdc` / `CLAUDE.md` / `.windsurfrules`), and run an immediate deterministic AI asset + secret discovery scan. Discovery respects `.gitignore` and optional `.arcignore` rules across Windows, macOS, and Linux while still checking high-signal local files (`.env*`, IDE MCP configs, and agent rules) even when gitignored; repeated `arc init` runs exclude Vexa Arc's own self-managed entries from the baseline `AI Assets` summary and render `N+ finding(s)` if a large monorepo reaches the 5,000-file quick-scan cap (run `arc audit` for an unbounded full scan):
 
 ```bash
 # Standard enforcement (with IDE confirmation prompts for Lethal Trifecta)

@@ -340,7 +340,7 @@ Implements Pillar 3 human authorization primitives:
 
 ## 6. Asset Discovery & CycloneDX v1.6 AI-BOM (`arc-discover`)
 
-- `DiscoveryScanner::audit_directory(&Path) -> AuditReport`: Walks directory structures, parses `.cursor/mcp.json`, `.claude.json`, Claude Desktop configs, Windsurf configs, agent skills (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`, `.cursor/rules/*.mdc`, `.prompt.md`), and model checkpoints (`.gguf`, `.safetensors`, `.onnx`, `.pt`, `.bin`).
+- `DiscoveryScanner::audit_directory(&Path) -> AuditReport` / `audit_directory_bounded(&Path, max_files, max_duration) -> AuditReport`: Walks directory structures deterministically (`ignore::WalkBuilder` with sorted entry order, `.gitignore` + `.arcignore` support, symlink/Windows reparse-point guards, and OS-heavy directory exclusions), explicitly checks high-signal local files (`.env*`, IDE MCP configs, `.cursor/rules/*.mdc`) even when gitignored, inspects candidate files in parallel across CPU cores via `std::thread::scope`, and parses `.cursor/mcp.json`, `.claude.json`, Claude Desktop configs, Windsurf configs, agent skills (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`, `.cursor/rules/*.mdc`, `.prompt.md`), and model checkpoints (`.gguf`, `.safetensors`, `.onnx`, `.pt`, `.bin`). `AuditReport` tracks `files_scanned` and `truncated` for unambiguous partial-scan reporting.
 - `generate_cyclonedx_1_6_bom(&AuditReport) -> CycloneDxBom`: Serializes to official CycloneDX v1.6 specification with `machine-learning-model` components, `data` components for skills, and `services` for MCP servers.
 
 ---

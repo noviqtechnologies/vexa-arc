@@ -1,4 +1,4 @@
-use arc_discover::scanner::DiscoveryScanner;
+use arc_discover::scanner::{AuditReport, DiscoveryScanner};
 use arc_hooks::claude_code::ClaudeCodeAdapter;
 use arc_hooks::codex_cli::CodexCliAdapter;
 use arc_hooks::cursor::CursorAdapter;
@@ -345,7 +345,9 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
         if !json {
             eprintln!("[Arc Init] Running quick discovery scan...");
         }
-        match scanner.audit_directory_bounded(path, 5_000, std::time::Duration::from_secs(5)) {
+        // Use a deterministic sorted file cap (5,000 non-ignored files) with a generous
+        // runaway safety timeout so repeated `arc init` runs always report identical counts.
+        match scanner.audit_directory_bounded(path, 5_000, std::time::Duration::from_secs(30)) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[Arc Init] Discovery scan failed: {e}");
@@ -353,6 +355,11 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
             }
         }
     };
+
+    // Exclude Vexa Arc's own self-managed MCP entry and directive file from the baseline
+    // AI Assets summary so first and repeated `arc init` runs report identical project counts.
+    let (mcp_server_count, agent_skill_count, model_asset_count) =
+        summarize_project_discovery(&audit_report);
 
     if json {
         println!(
@@ -369,10 +376,11 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
                 "directives_installed": directives_installed,
                 "warnings": hook_warnings,
                 "discovery": {
-                    "mcp_servers": audit_report.mcp_servers.len(),
-                    "agent_skills": audit_report.agent_skills.len(),
-                    "model_assets": audit_report.model_assets.len(),
+                    "mcp_servers": mcp_server_count,
+                    "agent_skills": agent_skill_count,
+                    "model_assets": model_asset_count,
                     "exposed_secrets": audit_report.exposed_secrets.len(),
+                    "files_scanned": audit_report.files_scanned,
                     "overall_risk_band": format!("{:?}", audit_report.overall_risk_band).to_lowercase(),
                     "scan_duration_ms": audit_report.scan_duration_ms,
                     "truncated": audit_report.truncated,
@@ -425,19 +433,16 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     }
     println!(
         "AI Assets:       {} MCP server(s), {} rule/skill file(s), {} model(s)",
-        audit_report.mcp_servers.len(),
-        audit_report.agent_skills.len(),
-        audit_report.model_assets.len()
+        mcp_server_count, agent_skill_count, model_asset_count
     );
     println!(
-        "Exposed Secrets: {} finding(s) (scan took {} ms{})",
-        audit_report.exposed_secrets.len(),
-        audit_report.scan_duration_ms,
-        if audit_report.truncated {
-            "; quick-scan capped — run `arc audit` for full scan"
-        } else {
-            ""
-        }
+        "Exposed Secrets: {}",
+        format_exposed_secrets_line(
+            audit_report.exposed_secrets.len(),
+            audit_report.files_scanned,
+            audit_report.scan_duration_ms,
+            audit_report.truncated,
+        )
     );
     for w in &hook_warnings {
         println!("[WARN] {w}");
@@ -449,6 +454,41 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     println!("=======================================================\n");
 
     true
+}
+
+/// Counts discovered project AI assets excluding Vexa Arc's own self-managed MCP entry
+/// (`vexa-arc`) and directive file (`vexa-arc-security.mdc`) so baseline counts stay
+/// identical across repeated `arc init` runs.
+fn summarize_project_discovery(report: &AuditReport) -> (usize, usize, usize) {
+    let mcp_servers = report
+        .mcp_servers
+        .iter()
+        .filter(|s| s.name != "vexa-arc")
+        .count();
+    let agent_skills = report
+        .agent_skills
+        .iter()
+        .filter(|s| !s.name.eq_ignore_ascii_case("vexa-arc-security.mdc"))
+        .count();
+    let model_assets = report.model_assets.len();
+    (mcp_servers, agent_skills, model_assets)
+}
+
+/// Formats the `Exposed Secrets:` summary line, rendering a lower-bound `N+` indicator
+/// whenever a bounded quick-scan was capped so partial results are never mistaken for totals.
+fn format_exposed_secrets_line(
+    count: usize,
+    files_scanned: usize,
+    duration_ms: u64,
+    truncated: bool,
+) -> String {
+    if truncated {
+        format!(
+            "{count}+ finding(s) (partial scan: {files_scanned} files in {duration_ms} ms; capped — run `arc audit` for full scan)"
+        )
+    } else {
+        format!("{count} finding(s) (scanned {files_scanned} files in {duration_ms} ms)")
+    }
 }
 
 #[cfg(test)]
@@ -494,6 +534,49 @@ mod tests {
         // Second call is idempotent
         let second_dirs = install_secure_at_inception_directives(&dir, true, true, false);
         assert!(second_dirs.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_exposed_secrets_distinguishes_complete_and_truncated_scans() {
+        let complete = format_exposed_secrets_line(4, 120, 45, false);
+        assert_eq!(complete, "4 finding(s) (scanned 120 files in 45 ms)");
+
+        let partial = format_exposed_secrets_line(9, 5000, 310, true);
+        assert_eq!(
+            partial,
+            "9+ finding(s) (partial scan: 5000 files in 310 ms; capped — run `arc audit` for full scan)"
+        );
+    }
+
+    #[test]
+    fn summarize_project_discovery_excludes_vexa_arc_self_managed_entries() {
+        let dir = std::env::temp_dir().join(format!("arc_init_baseline_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join(".cursor")).unwrap();
+        std::fs::write(
+            dir.join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"user-mcp":{"command":"node","args":["srv.js"]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "# Team Rules\n").unwrap();
+
+        // Install Arc's own MCP server and directive file
+        upsert_mcp_server_config(&dir.join(".cursor").join("mcp.json"), "arc").unwrap();
+        upsert_mcp_server_config(&dir.join(".mcp.json"), "arc").unwrap();
+        install_secure_at_inception_directives(&dir, true, true, false);
+
+        let scanner = DiscoveryScanner::new();
+        let report = scanner.audit_directory(&dir).unwrap();
+        // Raw report sees user-mcp + 2 vexa-arc entries, and CLAUDE.md + vexa-arc-security.mdc
+        assert_eq!(report.mcp_servers.len(), 3);
+        assert_eq!(report.agent_skills.len(), 2);
+
+        // Baseline summary for `arc init` excludes Arc's own managed entries
+        let (mcps, skills, models) = summarize_project_discovery(&report);
+        assert_eq!(mcps, 1);
+        assert_eq!(skills, 1);
+        assert_eq!(models, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

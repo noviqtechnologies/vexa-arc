@@ -1,10 +1,14 @@
 use arc_core::mcp_profile::{compute_jcs_schema_hash, Mcp3DCapabilityProfile, RiskBand};
 use arc_dlp::detector::SecretScanEngine;
+use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredMcpServer {
@@ -63,6 +67,8 @@ pub struct AuditReport {
     pub permission_errors: Vec<String>,
     #[serde(default)]
     pub truncated: bool,
+    #[serde(default)]
+    pub files_scanned: usize,
 }
 
 #[derive(Default)]
@@ -227,10 +233,28 @@ impl DiscoveryScanner {
 
         scanned_locations.push(root.to_path_buf());
 
-        self.scan_recursive(
+        let candidate_files = self.collect_candidate_files(
             root,
-            0,
             &mut budget,
+            &mut scanned_locations,
+            &mut unscanned_locations,
+            &mut excluded_paths,
+            &mut permission_errors,
+        );
+
+        let inspect_timed_out = self.inspect_files_parallel(
+            &candidate_files,
+            budget.deadline,
+            &mut mcp_servers,
+            &mut agent_skills,
+            &mut model_assets,
+            &mut exposed_secrets,
+        );
+        if inspect_timed_out {
+            budget.truncated = true;
+        }
+
+        sort_report_vectors(
             &mut mcp_servers,
             &mut agent_skills,
             &mut model_assets,
@@ -271,6 +295,7 @@ impl DiscoveryScanner {
             excluded_paths,
             permission_errors,
             truncated: budget.truncated,
+            files_scanned: budget.files_scanned,
         })
     }
 
@@ -289,6 +314,7 @@ impl DiscoveryScanner {
         let mut permission_errors = Vec::new();
 
         let roots = get_workstation_roots();
+        let mut all_candidate_files = Vec::new();
         for root in roots {
             if budget.is_exhausted() {
                 unscanned_locations.push(root);
@@ -296,23 +322,42 @@ impl DiscoveryScanner {
             }
             if root.exists() && root.is_dir() {
                 scanned_locations.push(root.clone());
-                self.scan_recursive(
+                let mut files = self.collect_candidate_files(
                     &root,
-                    0,
                     &mut budget,
-                    &mut mcp_servers,
-                    &mut agent_skills,
-                    &mut model_assets,
-                    &mut exposed_secrets,
                     &mut scanned_locations,
                     &mut unscanned_locations,
                     &mut excluded_paths,
                     &mut permission_errors,
                 );
+                all_candidate_files.append(&mut files);
             } else {
                 not_installed_locations.push(root);
             }
         }
+
+        let inspect_timed_out = self.inspect_files_parallel(
+            &all_candidate_files,
+            budget.deadline,
+            &mut mcp_servers,
+            &mut agent_skills,
+            &mut model_assets,
+            &mut exposed_secrets,
+        );
+        if inspect_timed_out {
+            budget.truncated = true;
+        }
+
+        sort_report_vectors(
+            &mut mcp_servers,
+            &mut agent_skills,
+            &mut model_assets,
+            &mut exposed_secrets,
+            &mut scanned_locations,
+            &mut unscanned_locations,
+            &mut excluded_paths,
+            &mut permission_errors,
+        );
 
         let elapsed = start.elapsed().as_millis() as u64;
         let mut highest_band = RiskBand::Low;
@@ -341,82 +386,149 @@ impl DiscoveryScanner {
             excluded_paths,
             permission_errors,
             truncated: budget.truncated,
+            files_scanned: budget.files_scanned,
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn scan_recursive(
+    /// Walks `root` deterministically using `.gitignore` / `.arcignore` + OS-heavy directory
+    /// exclusions, then ensures high-signal security/AI config files (such as gitignored `.env`
+    /// files and IDE MCP configs) are still included without duplication.
+    fn collect_candidate_files(
         &self,
-        current: &Path,
-        depth: usize,
+        root: &Path,
         budget: &mut ScanBudget,
-        mcp_servers: &mut Vec<DiscoveredMcpServer>,
-        agent_skills: &mut Vec<DiscoveredAgentSkill>,
-        model_assets: &mut Vec<DiscoveredModelAsset>,
-        exposed_secrets: &mut Vec<ExposedSecretFinding>,
         scanned_locations: &mut Vec<PathBuf>,
         unscanned_locations: &mut Vec<PathBuf>,
         excluded_paths: &mut Vec<PathBuf>,
         permission_errors: &mut Vec<String>,
-    ) {
-        if depth > 10 || budget.is_exhausted() {
-            unscanned_locations.push(current.to_path_buf());
-            return;
-        }
+    ) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let excluded_shared: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let excluded_for_filter = Arc::clone(&excluded_shared);
 
-        let entries = match fs::read_dir(current) {
-            Ok(e) => e,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::PermissionDenied {
-                    permission_errors
-                        .push(format!("Permission denied accessing {}", current.display()));
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .hidden(false) // Discover dotfiles (.cursor, .mcp.json, .env, .cursorrules, etc.)
+            .git_ignore(true)
+            .git_global(false) // Keep scans reproducible across machines
+            .git_exclude(true)
+            .require_git(false) // Honor .gitignore even outside a .git repository
+            .add_custom_ignore_filename(".arcignore")
+            .max_depth(Some(11))
+            .follow_links(false)
+            .sort_by_file_name(Ord::cmp)
+            .filter_entry(move |entry| {
+                // Never filter out the scan root itself
+                if entry.depth() == 0 {
+                    return true;
                 }
-                return;
-            }
-        };
 
-        for entry in entries.flatten() {
+                let path = entry.path();
+                if is_entry_symlink_or_reparse(entry) {
+                    if let Ok(mut ex) = excluded_for_filter.lock() {
+                        ex.push(path.to_path_buf());
+                    }
+                    return false;
+                }
+
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                if is_dir {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name == ".git" || vexa_core::fs_guard::is_os_heavy_dir(name) {
+                        if let Ok(mut ex) = excluded_for_filter.lock() {
+                            ex.push(path.to_path_buf());
+                        }
+                        return false;
+                    }
+                }
+
+                true
+            });
+
+        for result in builder.build() {
             if budget.is_exhausted() {
-                unscanned_locations.push(entry.path());
-                return;
+                if let Ok(entry) = result {
+                    unscanned_locations.push(entry.into_path());
+                }
+                break;
             }
 
-            let path = entry.path();
-            if vexa_core::fs_guard::is_symlink_or_reparse_point(&entry) {
-                excluded_paths.push(path);
+            let entry = match result {
+                Ok(e) => e,
+                Err(err) => {
+                    if let Some(io_err) = err.io_error() {
+                        if io_err.kind() == io::ErrorKind::PermissionDenied {
+                            permission_errors.push(format!("Permission denied: {err}"));
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            if entry.depth() == 0 {
                 continue;
             }
 
-            let Ok(ft) = entry.file_type() else {
+            let Some(ft) = entry.file_type() else {
                 continue;
             };
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            // Skip heavy OS, package-cache, build, and VCS directories across Windows/macOS/Linux
-            if ft.is_dir() && vexa_core::fs_guard::is_os_heavy_dir(file_name) {
-                excluded_paths.push(path);
-                continue;
-            }
-
+            let path = entry.into_path();
             if ft.is_dir() {
-                scanned_locations.push(path.clone());
-                self.scan_recursive(
-                    &path,
-                    depth + 1,
-                    budget,
-                    mcp_servers,
-                    agent_skills,
-                    model_assets,
-                    exposed_secrets,
-                    scanned_locations,
-                    unscanned_locations,
-                    excluded_paths,
-                    permission_errors,
-                );
+                scanned_locations.push(path);
             } else if ft.is_file() {
                 budget.files_scanned += 1;
+                seen.insert(path.clone());
+                files.push(path);
+            }
+        }
+
+        if let Ok(mut ex) = excluded_shared.lock() {
+            excluded_paths.append(&mut *ex);
+        }
+
+        // Security invariant: high-signal local files (.env*, IDE MCP configs, agent rules)
+        // are commonly listed in .gitignore, so we still inspect them explicitly unless the
+        // scan budget has already been exhausted.
+        if !budget.is_exhausted() {
+            collect_high_signal_gitignored_files(root, &mut seen, &mut files, budget);
+        }
+
+        files
+    }
+
+    /// Inspects collected candidate files across available CPU cores using scoped threads.
+    /// Returns `true` if a bounded `deadline` was exceeded before all files were inspected.
+    fn inspect_files_parallel(
+        &self,
+        files: &[PathBuf],
+        deadline: Option<std::time::Instant>,
+        mcp_servers: &mut Vec<DiscoveredMcpServer>,
+        agent_skills: &mut Vec<DiscoveredAgentSkill>,
+        model_assets: &mut Vec<DiscoveredModelAsset>,
+        exposed_secrets: &mut Vec<ExposedSecretFinding>,
+    ) -> bool {
+        if files.is_empty() {
+            return false;
+        }
+
+        let thread_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(files.len())
+            .max(1);
+
+        if thread_count <= 1 || files.len() < 32 {
+            for path in files {
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() >= dl {
+                        return true;
+                    }
+                }
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 self.inspect_file(
-                    &path,
+                    path,
                     file_name,
                     mcp_servers,
                     agent_skills,
@@ -424,7 +536,56 @@ impl DiscoveryScanner {
                     exposed_secrets,
                 );
             }
+            return false;
         }
+
+        let timed_out = AtomicBool::new(false);
+        let chunk_size = files.len().div_ceil(thread_count);
+        let partial_results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = files
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let timed_out_ref = &timed_out;
+                    scope.spawn(move || {
+                        let mut local_mcp = Vec::new();
+                        let mut local_skills = Vec::new();
+                        let mut local_models = Vec::new();
+                        let mut local_secrets = Vec::new();
+                        for path in chunk {
+                            if let Some(dl) = deadline {
+                                if timed_out_ref.load(Ordering::Relaxed)
+                                    || std::time::Instant::now() >= dl
+                                {
+                                    timed_out_ref.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            self.inspect_file(
+                                path,
+                                file_name,
+                                &mut local_mcp,
+                                &mut local_skills,
+                                &mut local_models,
+                                &mut local_secrets,
+                            );
+                        }
+                        (local_mcp, local_skills, local_models, local_secrets)
+                    })
+                })
+                .collect();
+
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+
+        for (mut m, mut s, mut mo, mut sec) in partial_results {
+            mcp_servers.append(&mut m);
+            agent_skills.append(&mut s);
+            model_assets.append(&mut mo);
+            exposed_secrets.append(&mut sec);
+        }
+
+        timed_out.load(Ordering::Relaxed)
     }
 
     fn inspect_file(
@@ -675,6 +836,149 @@ impl DiscoveryScanner {
     }
 }
 
+/// Cross-platform check for symlinks and Windows NTFS reparse points (junctions/mount points).
+fn is_entry_symlink_or_reparse(entry: &ignore::DirEntry) -> bool {
+    if entry.path_is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if let Ok(meta) = entry.metadata() {
+            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_path_symlink_or_reparse(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// High-signal local secret and AI/IDE config files that are frequently listed in `.gitignore`.
+/// Checking these explicitly ensures `.gitignore`-aware walking stays fast without blinding
+/// secret/MCP discovery to local `.env` or `.cursor/mcp.json` files.
+fn collect_high_signal_gitignored_files(
+    root: &Path,
+    seen: &mut HashSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+    budget: &mut ScanBudget,
+) {
+    const RELATIVE_CANDIDATES: &[&str] = &[
+        ".env",
+        ".env.local",
+        ".env.development",
+        ".env.development.local",
+        ".env.production",
+        ".env.production.local",
+        ".env.staging",
+        ".env.test",
+        ".env.test.local",
+        ".mcp.json",
+        "mcp.json",
+        "mcp_config.json",
+        ".claude.json",
+        "claude_desktop_config.json",
+        ".cursorrules",
+        ".windsurfrules",
+        "CLAUDE.md",
+        "AGENT.md",
+        ".cursor/mcp.json",
+        ".cursor/.env",
+        ".claude/mcp.json",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+        ".github/copilot-instructions.md",
+    ];
+
+    for rel in RELATIVE_CANDIDATES {
+        if budget.is_exhausted() {
+            return;
+        }
+        let candidate = root.join(rel);
+        if seen.contains(&candidate) || is_path_symlink_or_reparse(&candidate) {
+            continue;
+        }
+        if candidate.is_file() {
+            budget.files_scanned += 1;
+            seen.insert(candidate.clone());
+            files.push(candidate);
+        }
+    }
+
+    // Also inspect `.cursor/rules/*.mdc` if `.cursor/` is gitignored
+    let cursor_rules_dir = root.join(".cursor").join("rules");
+    if cursor_rules_dir.is_dir() && !is_path_symlink_or_reparse(&cursor_rules_dir) {
+        if let Ok(entries) = fs::read_dir(&cursor_rules_dir) {
+            let mut rule_paths: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("mdc"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            rule_paths.sort();
+            for p in rule_paths {
+                if budget.is_exhausted() {
+                    return;
+                }
+                if seen.contains(&p) || is_path_symlink_or_reparse(&p) || !p.is_file() {
+                    continue;
+                }
+                budget.files_scanned += 1;
+                seen.insert(p.clone());
+                files.push(p);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sort_report_vectors(
+    mcp_servers: &mut [DiscoveredMcpServer],
+    agent_skills: &mut [DiscoveredAgentSkill],
+    model_assets: &mut [DiscoveredModelAsset],
+    exposed_secrets: &mut [ExposedSecretFinding],
+    scanned_locations: &mut [PathBuf],
+    unscanned_locations: &mut [PathBuf],
+    excluded_paths: &mut [PathBuf],
+    permission_errors: &mut [String],
+) {
+    mcp_servers.sort_by(|a, b| a.source_file.cmp(&b.source_file).then(a.name.cmp(&b.name)));
+    agent_skills.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
+    model_assets.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
+    exposed_secrets.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.detector.cmp(&b.detector))
+            .then(a.snippet.cmp(&b.snippet))
+    });
+    scanned_locations.sort();
+    unscanned_locations.sort();
+    excluded_paths.sort();
+    permission_errors.sort();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1142,155 @@ mod tests {
         assert!(
             bounded_rep.truncated,
             "Should report truncation when file cap hit"
+        );
+        assert_eq!(bounded_rep.files_scanned, 3);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_gitignore_arcignore_and_high_signal_env_preserved() {
+        let scanner = DiscoveryScanner::new();
+        let temp_dir =
+            std::env::temp_dir().join(format!("vexa_arc_gitignore_{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(temp_dir.join("dist")).unwrap();
+        fs::create_dir_all(temp_dir.join("custom_ignored")).unwrap();
+        fs::create_dir_all(temp_dir.join("src")).unwrap();
+        fs::create_dir_all(temp_dir.join(".cursor")).unwrap();
+
+        let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
+        let fake_gh = format!("{}{}", "ghp_", "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8");
+
+        // .gitignore ignores dist/, .env, and .cursor/
+        fs::write(temp_dir.join(".gitignore"), "dist/\n.env\n.cursor/\n").unwrap();
+        // .arcignore ignores custom_ignored/
+        fs::write(temp_dir.join(".arcignore"), "custom_ignored/\n").unwrap();
+
+        // Ignored build/custom files should NOT be scanned
+        fs::write(
+            temp_dir.join("dist").join("bundle.js"),
+            format!("const k = '{fake_aws}';"),
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("custom_ignored").join("dump.txt"),
+            format!("token={fake_gh}"),
+        )
+        .unwrap();
+
+        // Gitignored .env and .cursor/mcp.json MUST still be discovered (security invariant)
+        fs::write(temp_dir.join(".env"), format!("AWS_KEY={fake_aws}\n")).unwrap();
+        fs::write(
+            temp_dir.join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"demo":{"command":"node","args":["srv.js"]}}}"#,
+        )
+        .unwrap();
+
+        // Regular tracked source file
+        fs::write(
+            temp_dir.join("src").join("app.rs"),
+            format!("const GH: &str = \"{fake_gh}\";"),
+        )
+        .unwrap();
+
+        let report = scanner
+            .audit_directory(&temp_dir)
+            .expect("Gitignore-aware audit must succeed");
+
+        // dist/ and custom_ignored/ must be skipped
+        assert!(
+            !report
+                .exposed_secrets
+                .iter()
+                .any(|f| f.file_path.to_string_lossy().contains("dist")),
+            "dist/ must be ignored via .gitignore"
+        );
+        assert!(
+            !report
+                .exposed_secrets
+                .iter()
+                .any(|f| f.file_path.to_string_lossy().contains("custom_ignored")),
+            "custom_ignored/ must be ignored via .arcignore"
+        );
+
+        // Both .env (gitignored high-signal) and src/app.rs must be detected, with no duplicates
+        assert_eq!(report.exposed_secrets.len(), 2);
+        assert!(report
+            .exposed_secrets
+            .iter()
+            .any(|f| f.file_path.ends_with(".env")));
+        assert!(report
+            .exposed_secrets
+            .iter()
+            .any(|f| f.file_path.ends_with("app.rs")));
+
+        // Gitignored .cursor/mcp.json must still be discovered
+        assert_eq!(report.mcp_servers.len(), 1);
+        assert_eq!(report.mcp_servers[0].name, "demo");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_bounded_and_parallel_scan_determinism() {
+        let scanner = DiscoveryScanner::new();
+        let temp_dir =
+            std::env::temp_dir().join(format!("vexa_arc_determ_{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(temp_dir.join("src")).unwrap();
+
+        let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
+        // Create 50 files (>32 threshold so parallel inspection runs) with secrets in deterministic slots
+        for i in 0..50 {
+            let content = if i % 5 == 0 {
+                format!("key_{i}={fake_aws}\n")
+            } else {
+                format!("// clean file {i}\n")
+            };
+            fs::write(temp_dir.join("src").join(format!("f_{i:02}.txt")), content).unwrap();
+        }
+
+        // Full parallel scan: two consecutive runs must match identically
+        let full_1 = scanner.audit_directory(&temp_dir).unwrap();
+        let full_2 = scanner.audit_directory(&temp_dir).unwrap();
+        assert_eq!(full_1.files_scanned, 50);
+        assert_eq!(full_1.files_scanned, full_2.files_scanned);
+        assert_eq!(full_1.exposed_secrets.len(), 10);
+        assert_eq!(
+            full_1
+                .exposed_secrets
+                .iter()
+                .map(|s| &s.file_path)
+                .collect::<Vec<_>>(),
+            full_2
+                .exposed_secrets
+                .iter()
+                .map(|s| &s.file_path)
+                .collect::<Vec<_>>()
+        );
+
+        // Bounded scan with file cap: two consecutive runs must report the exact same count and paths
+        let cap_1 = scanner
+            .audit_directory_bounded(&temp_dir, 20, std::time::Duration::from_secs(30))
+            .unwrap();
+        let cap_2 = scanner
+            .audit_directory_bounded(&temp_dir, 20, std::time::Duration::from_secs(30))
+            .unwrap();
+        assert!(cap_1.truncated);
+        assert!(cap_2.truncated);
+        assert_eq!(cap_1.files_scanned, 20);
+        assert_eq!(cap_1.files_scanned, cap_2.files_scanned);
+        assert_eq!(cap_1.exposed_secrets.len(), cap_2.exposed_secrets.len());
+        assert_eq!(
+            cap_1
+                .exposed_secrets
+                .iter()
+                .map(|s| &s.file_path)
+                .collect::<Vec<_>>(),
+            cap_2
+                .exposed_secrets
+                .iter()
+                .map(|s| &s.file_path)
+                .collect::<Vec<_>>()
         );
 
         let _ = fs::remove_dir_all(&temp_dir);

@@ -235,6 +235,7 @@ mod tests {
             excluded_paths: vec![],
             permission_errors: vec![],
             truncated: false,
+            files_scanned: 1,
         };
 
         let bom = generate_cyclonedx_1_6_bom(&report);

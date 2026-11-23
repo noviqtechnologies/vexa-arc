@@ -1,6 +1,6 @@
-# Vexa Arc — Compatibility & Enforcement Matrix (v1.4.0)
+# Vexa Arc — Compatibility & Enforcement Matrix (v1.4.1)
 
-This matrix reflects the verified capabilities in `crates/` for **Vexa Arc v1.4.0** across **Windows**, **macOS**, and **Linux**.
+This matrix reflects the verified capabilities in `crates/` for **Vexa Arc v1.4.1** across **Windows**, **macOS**, and **Linux**.
 
 > [!IMPORTANT]
 > **Enforcement Boundary:** Vexa Arc is **not** endpoint detection and response (EDR) or an OS-wide network firewall. Runtime enforcement applies **only** to configured host hooks and explicitly brokered MCP paths (`arc protect`). Unmanaged processes, direct editor writes outside hooks, and unbrokered network requests are not intercepted.

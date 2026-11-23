@@ -2,6 +2,18 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.4.1] - 2026-11-23
+
+### Discovery Performance, Determinism & `arc init` UX
+- **`.gitignore` / `.arcignore`-Aware Parallel Discovery (`arc-discover`):**
+  - Upgraded `DiscoveryScanner` to use deterministic sorted `.gitignore` and `.arcignore` traversal (`ignore::WalkBuilder`) with cross-platform symlink and Windows NTFS reparse-point guards, OS-heavy directory exclusions, and multi-core file inspection via `std::thread::scope`.
+  - Preserved security coverage for high-signal local files (`.env*`, IDE MCP configs, `.cursor/rules/*.mdc`, `CLAUDE.md`) even when listed in `.gitignore`, deduplicated and sorted deterministically.
+  - Added `files_scanned` to `AuditReport` for transparent scan coverage reporting.
+- **Deterministic & Idempotent `arc init` Baseline (`arc-cli`):**
+  - Replaced flaky 5-second wall-clock quick-scan cutoffs with a deterministic sorted 5,000-file cap (and 30-second runaway safety guard) so repeated `arc init` runs report consistent finding counts.
+  - Excluded Vexa Arc's own self-managed MCP entry (`vexa-arc`) and directive (`vexa-arc-security.mdc`) from the baseline `AI Assets` summary so first and subsequent `arc init` runs agree.
+  - Formatted capped quick-scans unambiguously as `N+ finding(s)` with scanned file count, and added `files_scanned` to `arc init --json`.
+
 ## [1.4.0] - 2026-11-23
 
 ### Security & Runtime Fixes (P0)
