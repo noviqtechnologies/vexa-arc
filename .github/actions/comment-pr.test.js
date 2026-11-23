@@ -458,6 +458,7 @@ async function run() {
   assert.ok(installPs1.includes("@refs/tags/$Tag"), "install.ps1 must pin exact release tag identity");
   assert.ok(installPs1.includes("cosign") && installPs1.includes("attestation verify"), "install.ps1 must enforce signature/provenance verification");
   assert.strictEqual(/^\s*overwrite:\s*true\b/m.test(releaseYml), false, "release.yml must not overwrite published releases");
+  assert.strictEqual(/^\s*if:.*\bsecrets\./m.test(releaseYml), false, "release.yml must not reference secrets.* directly in step if: expressions");
 
   console.log("comment-pr.test.js: all assertions (including Phase 0 & P1 installer security gates) passed");
 }
