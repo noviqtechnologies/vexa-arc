@@ -1369,7 +1369,7 @@ mod tests {
         .await
         .unwrap();
         let mut resp1 = String::new();
-        s1.read_to_string(&mut resp1).await.unwrap();
+        BufReader::new(&mut s1).read_line(&mut resp1).await.unwrap();
         assert!(resp1.starts_with("HTTP/1.1 403 Forbidden"), "resp1={resp1}");
 
         // 2. DNS rebinding Host header is rejected with 403
@@ -1380,16 +1380,17 @@ mod tests {
         .await
         .unwrap();
         let mut resp2 = String::new();
-        s2.read_to_string(&mut resp2).await.unwrap();
+        BufReader::new(&mut s2).read_line(&mut resp2).await.unwrap();
         assert!(resp2.starts_with("HTTP/1.1 403 Forbidden"), "resp2={resp2}");
 
         // 3. 3rd request within 1 minute hits rate limit (429)
+        // Use BufReader::read_line so macOS/BSD TCP RST after unread client bytes never causes ECONNRESET on EOF.
         let mut s3 = TcpStream::connect(proxy_addr).await.unwrap();
-        s3.write_all(b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}")
-            .await
-            .unwrap();
+        let _ = s3
+            .write_all(b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}")
+            .await;
         let mut resp3 = String::new();
-        s3.read_to_string(&mut resp3).await.unwrap();
+        BufReader::new(&mut s3).read_line(&mut resp3).await.unwrap();
         assert!(
             resp3.starts_with("HTTP/1.1 429 Too Many Requests"),
             "resp3={resp3}"
