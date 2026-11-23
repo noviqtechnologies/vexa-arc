@@ -172,11 +172,56 @@ For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.1.
 
 ### Remote Streamable HTTP / SSE MCP Proxy (`arc protect http`)
 
-For remote hosted MCP servers (e.g., Linear, Notion, Sentry, GitHub remote MCP) that do not run over local stdio, start a loopback forward proxy enforcing the same JCS schema pinning, Lethal Trifecta taint tracking, and invisible-Unicode response sanitization:
+For remote hosted MCP servers (e.g., Linear, Notion, Sentry, GitHub remote MCP) that do not run over local stdio, start a loopback forward proxy enforcing JCS schema pinning, Lethal Trifecta taint tracking, and invisible-Unicode response sanitization:
 
 ```bash
+# Default loopback-only mode (127.0.0.1:8787, inbound Authorization stripped by default):
 arc protect http --server linear --target https://mcp.linear.app/sse --listen 127.0.0.1:8787 --allow-tofu
+
+# Non-loopback binding is HARD-REJECTED unless explicit authenticated TLS mode is configured:
+arc protect http \
+  --server linear \
+  --target https://mcp.linear.app/sse \
+  --listen 0.0.0.0:8443 \
+  --allow-non-loopback \
+  --auth-token "$ARC_PROXY_AUTH_TOKEN" \
+  --tls-cert /etc/arc/tls/fullchain.pem \
+  --tls-key /etc/arc/tls/privkey.pem \
+  --upstream-auth-token "$LINEAR_MCP_TOKEN"
 ```
+
+**Security guarantees enforced by `arc protect http`:**
+* **Loopback-only by default:** Any non-loopback address (`0.0.0.0`, `::`, LAN/public IP, or IPv4-mapped IPv6) is rejected before socket bind unless `--allow-non-loopback`, `--auth-token` (`>= 16` chars, constant-time verified), `--tls-cert`, and `--tls-key` are all provided.
+* **Safe credential forwarding:** Inbound `Authorization` headers are **stripped by default**. Use `--upstream-auth-token` (`ARC_UPSTREAM_AUTH_TOKEN`) to inject a dedicated upstream bearer token, or explicitly opt into `--forward-inbound-auth` (the proxy's own `--auth-token` is never forwarded upstream).
+* **DoS & DNS-rebinding defenses:** Enforces `Host` and `Origin` header validation, header count/size limits, `--max-body-bytes` (default 2 MiB), `--max-connections` (default 64), `--rate-limit-per-minute` per IP (default 120), request/TLS/upstream timeouts, and redacted error responses.
+
+### Anchored Organization Policy Trust, Key Rotation & Revocation (`arc policy`)
+
+Endpoints **never** trust a signing key supplied by a policy sync server response. Administrators provision an out-of-band Ed25519 root key first:
+
+```bash
+# 1. One-command Team workstation onboarding (Device Flow login + anchored root key + hooks + policy sync):
+arc setup --root-key root-2026:<64-hex-ed25519-pubkey>
+
+# Or bootstrap administrator root trust anchor standalone (writes integrity-protected .arc/policy-state.json atomically):
+arc policy trust-init --root-key root-2026:<64-hex-ed25519-pubkey>
+
+# 2. Sync and verify signed organization policy against the anchored root key(s):
+arc policy sync
+
+# 3. Apply an offline or server-delivered signed KeyRotationEnvelope authorized by an active root key:
+arc policy rotate-key --envelope ./rotation-2026-q4.json
+```
+
+* `policy-state.json` stores `active_keys`, permanent `revoked_key_ids`, monotonic `min_sequence` and `rotation_sequence`, and a canonical SHA-256 `state_sha256` integrity digest.
+* Any local tampering, rollback, expired envelope, untrusted key, or revoked key causes fail-closed rejection.
+
+### Mandatory Installer Signature & Provenance Verification
+
+The shell (`install.sh`), PowerShell (`install.ps1`), and npm (`@vexasec/arc`) installers require **both** SHA-256 checksum matching and cryptographic publisher verification before extracting `arc`:
+* **`cosign verify-blob`** against `checksums.txt.bundle`, pinned to the exact release workflow and tag (`https://github.com/noviqtechnologies/vexa-arc/.github/workflows/release.yml@refs/tags/<TAG>`) and GitHub Actions OIDC issuer (`https://token.actions.githubusercontent.com`), **or**
+* **`gh attestation verify`** against the downloaded archive pinned to `--repo noviqtechnologies/vexa-arc`, `--signer-workflow`, and `--source-ref refs/tags/<TAG>`.
+* If neither `cosign` nor `gh` is available, or if the bundle/signature/tag does not match, installation fails closed. Silent downgrades from a newer installed version are also rejected unless `ARC_ALLOW_DOWNGRADE=1` is set.
 
 ### Windows (x64 / ARM64)
 

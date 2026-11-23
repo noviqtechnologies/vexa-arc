@@ -151,6 +151,150 @@ function extractBinary(zipPath, destDir, binName) {
   return extractedBin;
 }
 
+function expectedCertificateIdentity(tag) {
+  validateVersionTag(tag);
+  return `https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${tag}`;
+}
+
+function parseSemverTuple(tag) {
+  validateVersionTag(tag);
+  const core = tag.replace(/^v/, "").split("-")[0];
+  return core.split(".").map((n) => parseInt(n, 10));
+}
+
+function checkVersionRollback(requestedTag, installedTag, allowDowngrade = false) {
+  if (!installedTag || allowDowngrade) return true;
+  const req = parseSemverTuple(requestedTag);
+  const inst = parseSemverTuple(installedTag);
+  for (let i = 0; i < 3; i++) {
+    if (req[i] < inst[i]) {
+      throw new Error(
+        `Rollback rejected: installed version ${installedTag} is newer than requested ${requestedTag} (set ARC_ALLOW_DOWNGRADE=1 to override)`
+      );
+    }
+    if (req[i] > inst[i]) return true;
+  }
+  return true;
+}
+
+function verifyEd25519Signature(dataBuf, signatureBuf, publicKeyPem) {
+  if (!publicKeyPem || !publicKeyPem.includes("BEGIN PUBLIC KEY")) {
+    throw new Error("Invalid or missing Ed25519 release public key PEM; failing closed");
+  }
+  if (!Buffer.isBuffer(signatureBuf) || signatureBuf.length !== 64) {
+    throw new Error(
+      `Invalid Ed25519 signature length (${signatureBuf ? signatureBuf.length : 0} bytes, expected 64); failing closed`
+    );
+  }
+  const ok = crypto.verify(null, dataBuf, publicKeyPem, signatureBuf);
+  if (!ok) {
+    throw new Error("Ed25519 release signature verification failed; failing closed");
+  }
+  return true;
+}
+
+function resolveReleasePublicKeyPem(overridePem) {
+  if (overridePem && overridePem.trim()) return overridePem.trim();
+  if (process.env.ARC_RELEASE_PUBLIC_KEY_PEM && process.env.ARC_RELEASE_PUBLIC_KEY_PEM.trim()) {
+    return process.env.ARC_RELEASE_PUBLIC_KEY_PEM.trim();
+  }
+  if (process.env.ARC_RELEASE_PUBLIC_KEY_FILE && fs.existsSync(process.env.ARC_RELEASE_PUBLIC_KEY_FILE)) {
+    return fs.readFileSync(process.env.ARC_RELEASE_PUBLIC_KEY_FILE, "utf8").trim();
+  }
+  return null;
+}
+
+function verifyPublisherSignature({
+  checksumsPath,
+  bundlePath,
+  ed25519SigPath,
+  archivePath,
+  tag,
+  publicKeyPem = null,
+  spawnFn = spawnSync,
+}) {
+  const certIdentity = expectedCertificateIdentity(tag);
+  const oidcIssuer = "https://token.actions.githubusercontent.com";
+
+  // 1. Prefer Cosign keyless Sigstore verification against checksums.txt.bundle
+  const cosignProbe = spawnFn("cosign", ["version"], { stdio: "pipe" });
+  if (!cosignProbe.error && cosignProbe.status === 0) {
+    if (!bundlePath || !fs.existsSync(bundlePath) || fs.statSync(bundlePath).size === 0) {
+      throw new Error(
+        `Missing or empty signature bundle checksums.txt.bundle for ${tag}; failing closed`
+      );
+    }
+    const res = spawnFn(
+      "cosign",
+      [
+        "verify-blob",
+        "--bundle",
+        bundlePath,
+        "--certificate-identity",
+        certIdentity,
+        "--certificate-oidc-issuer",
+        oidcIssuer,
+        checksumsPath,
+      ],
+      { stdio: "pipe", encoding: "utf8" }
+    );
+    if (res.error || res.status !== 0) {
+      const detail = (res.stderr || res.error?.message || "unknown error").trim();
+      throw new Error(
+        `Cosign publisher signature verification failed for ${tag}: ${detail}`
+      );
+    }
+    return { verifier: "cosign", identity: certIdentity };
+  }
+
+  // 2. Fallback to GitHub CLI SLSA provenance verification against the archive
+  const ghProbe = spawnFn("gh", ["--version"], { stdio: "pipe" });
+  if (!ghProbe.error && ghProbe.status === 0) {
+    const res = spawnFn(
+      "gh",
+      [
+        "attestation",
+        "verify",
+        archivePath,
+        "--repo",
+        REPO,
+        "--signer-workflow",
+        `${REPO}/.github/workflows/release.yml`,
+        "--source-ref",
+        `refs/tags/${tag}`,
+      ],
+      { stdio: "pipe", encoding: "utf8" }
+    );
+    if (res.error || res.status !== 0) {
+      const detail = (res.stderr || res.error?.message || "unknown error").trim();
+      throw new Error(
+        `GitHub SLSA provenance attestation verification failed for ${tag}: ${detail}`
+      );
+    }
+    return { verifier: "gh-attestation", identity: certIdentity };
+  }
+
+  // 3. Zero-dependency native Node.js Ed25519 verification against pinned release public key
+  const pem = resolveReleasePublicKeyPem(publicKeyPem);
+  if (pem) {
+    if (!ed25519SigPath || !fs.existsSync(ed25519SigPath)) {
+      throw new Error(
+        `Missing Ed25519 signature file checksums.txt.ed25519.sig for ${tag}; failing closed`
+      );
+    }
+    verifyEd25519Signature(
+      fs.readFileSync(checksumsPath),
+      fs.readFileSync(ed25519SigPath),
+      pem
+    );
+    return { verifier: "ed25519-native", identity: "pinned-release-key" };
+  }
+
+  throw new Error(
+    `Mandatory publisher signature verification requires 'cosign', 'gh' (GitHub CLI), or a pinned Ed25519 release public key (ARC_RELEASE_PUBLIC_KEY_PEM/FILE); none was found. Failing closed.`
+  );
+}
+
 async function ensureBinary() {
   const version = resolveVersion();
   const { target, bin } = getPlatformTarget();
@@ -164,9 +308,11 @@ async function ensureBinary() {
   const baseUrl = `https://github.com/${REPO}/releases/download/${version}`;
   process.stderr.write(`[arc] Downloading ${archiveName}...\n`);
 
-  const [archiveBuf, checksumsBuf] = await Promise.all([
+  const [archiveBuf, checksumsBuf, bundleBuf, ed25519SigBuf] = await Promise.all([
     downloadBuffer(`${baseUrl}/${archiveName}`),
     downloadBuffer(`${baseUrl}/checksums.txt`),
+    downloadBuffer(`${baseUrl}/checksums.txt.bundle`).catch(() => null),
+    downloadBuffer(`${baseUrl}/checksums.txt.ed25519.sig`).catch(() => null),
   ]);
 
   verifyArchiveChecksum(
@@ -175,12 +321,26 @@ async function ensureBinary() {
     checksumsBuf.toString("utf8")
   );
 
-  const tmpZip = path.join(os.tmpdir(), `${archiveName}.${process.pid}.zip`);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vexa-arc-npm-"));
+  const tmpZip = path.join(tmpDir, archiveName);
+  const tmpChecksums = path.join(tmpDir, "checksums.txt");
+  const tmpBundle = path.join(tmpDir, "checksums.txt.bundle");
+  const tmpEdSig = path.join(tmpDir, "checksums.txt.ed25519.sig");
   fs.writeFileSync(tmpZip, archiveBuf);
+  fs.writeFileSync(tmpChecksums, checksumsBuf);
+  if (bundleBuf) fs.writeFileSync(tmpBundle, bundleBuf);
+  if (ed25519SigBuf) fs.writeFileSync(tmpEdSig, ed25519SigBuf);
   try {
+    verifyPublisherSignature({
+      checksumsPath: tmpChecksums,
+      bundlePath: bundleBuf ? tmpBundle : null,
+      ed25519SigPath: ed25519SigBuf ? tmpEdSig : null,
+      archivePath: tmpZip,
+      tag: version,
+    });
     return extractBinary(tmpZip, cacheDir, bin);
   } finally {
-    fs.rmSync(tmpZip, { force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
@@ -203,5 +363,9 @@ module.exports = {
   getPlatformTarget,
   getCacheDir,
   verifyArchiveChecksum,
+  expectedCertificateIdentity,
+  checkVersionRollback,
+  verifyEd25519Signature,
+  verifyPublisherSignature,
   extractBinary,
 };

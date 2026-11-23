@@ -2,6 +2,23 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.4.2] - 2026-11-23
+
+### Security & Trust-Plane Hardening (P0/P1)
+- **Hardened HTTP MCP Proxy (`arc-hooks`, `arc-cli`):**
+  - Enforced loopback-only binding by default (`127.0.0.0/8`, `::1`); hard-rejects `0.0.0.0`, `::`, LAN/public, and IPv4-mapped IPv6 addresses before socket bind unless `--allow-non-loopback`, `--auth-token` (`>= 16` chars, constant-time verified), and native `rustls` TLS (`--tls-cert` + `--tls-key`) are all configured.
+  - Added `Host` and `Origin` validation (DNS rebinding / CSRF defense), header count/size bounds, configurable body/connection/rate limits, read/TLS/upstream timeouts, redacted error responses, and default `Strip` credential forwarding.
+- **Anchored Policy Trust Root, Key Rotation & Revocation (`arc-policy-engine`, `arc-cli`):**
+  - Removed server-supplied `trusted_key` trust substitution in `run_policy_sync`.
+  - Added integrity-protected `PolicyTrustStore` (`state_sha256`, monotonic `min_sequence` and `rotation_sequence`, permanent `revoked_key_ids`, symlink-rejecting atomic writes) and domain-separated `KeyRotationEnvelope` (`VEXA-ARC-KEY-ROTATION-V1\0`).
+  - Added `arc policy trust-init --root-key <id:hex>`, `arc policy rotate-key --envelope <file>`, and `arc setup --root-key <id:hex>` for one-command anchored workstation onboarding.
+- **Mandatory Installer Verification & Immutable Releases (`install.sh`, `install.ps1`, `npm/bin/arc.js`, `release.yml`):**
+  - Made publisher authenticity mandatory and fail-closed via tag-pinned Cosign (`@refs/tags/<TAG>`), `gh attestation verify`, or zero-dependency native Ed25519 verification (`ARC_RELEASE_PUBLIC_KEY_PEM`/`FILE`), with cross-OS POSIX `awk` / PowerShell / Node rollback protection.
+  - Removed `overwrite: true` from `release.yml` for immutable releases.
+- **Enriched Audit Telemetry & Metadata Cleanup (`arc-telemetry`, `SECURITY.md`, `COMPATIBILITY_MATRIX.md`, `docs/`):**
+  - Added `actor`, `arc_version`, `policy_revision`, `policy_source`, `execution_status`, and `correlation_id` to runtime/cloud audit events and `policy_health` to workstation heartbeats.
+  - Updated `SECURITY.md` supported versions (`1.4.x` / `1.3.x`), standardized reporting email to `contact@vexasec.io`, narrowed compatibility claims accurately, synced `docs/product-tiers.md`, and added cross-OS live-host verification harnesses (`scripts/verify-live-hosts.{ps1,sh}`).
+
 ## [1.4.1] - 2026-11-23
 
 ### Discovery Performance, Determinism & `arc init` UX

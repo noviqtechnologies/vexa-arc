@@ -6,9 +6,9 @@ Vexa Arc follows semantic versioning and provides security updates for the follo
 
 | Version | Supported          | Security Maintenance Level |
 | ------- | ------------------ | --------------------------- |
-| 1.2.x   | :white_check_mark: | Active security updates     |
-| 1.0.x   | :white_check_mark: | Security fixes only         |
-| < 1.0.0 | :x:                | Deprecated / Not maintained |
+| 1.4.x   | :white_check_mark: | Active security updates     |
+| 1.3.x   | :white_check_mark: | Security fixes only         |
+| < 1.3.0 | :x:                | Deprecated / Not maintained |
 
 ---
 
@@ -18,8 +18,9 @@ The Vexa Arc team is committed to ensuring the safety of autonomous agent workfl
 
 ### Reporting Channels
 
-1. **Email Disclosure:** Send details to [contact@vexasec.io](mailto:security@vexasec.io)
-2. **PGP Encryption:** If reporting sensitive details or reproduction exploits, request our PGP public key via the contact email.
+1. **GitHub Security Advisory (Preferred):** Submit a private vulnerability report at [GitHub Security Advisories](https://github.com/noviqtechnologies/vexa-arc/security/advisories/new)
+2. **Email Disclosure:** Send details to [contact@vexasec.io](mailto:contact@vexasec.io)
+3. **PGP Encryption:** If reporting sensitive details or reproduction exploits, request our PGP public key via `contact@vexasec.io`.
 
 ### What to Include
 

@@ -3347,3 +3347,391 @@ fn test_v14_mcp_inventory_contracts_reflect_all_five_host_installers() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_p0_http_proxy_cli_rejects_non_loopback_without_auth_and_tls() {
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let temp_dir =
+        std::env::temp_dir().join(format!("arc_p0_http_proxy_cli_{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // 1. IPv4 wildcard 0.0.0.0 rejected by default
+    let out_v4 = Command::new(arc_bin)
+        .args([
+            "protect",
+            "http",
+            "--server",
+            "github",
+            "--target",
+            "http://127.0.0.1:9",
+            "--listen",
+            "0.0.0.0:8787",
+            "--allow-tofu",
+        ])
+        .current_dir(&temp_dir)
+        .output()
+        .expect("run protect http 0.0.0.0");
+    assert!(!out_v4.status.success());
+    let stderr_v4 = String::from_utf8_lossy(&out_v4.stderr);
+    assert!(
+        stderr_v4.contains("Refusing to bind non-loopback"),
+        "expected non-loopback refusal, got: {stderr_v4}"
+    );
+
+    // 2. IPv6 wildcard [::] rejected by default
+    let out_v6 = Command::new(arc_bin)
+        .args([
+            "protect",
+            "http",
+            "--server",
+            "github",
+            "--target",
+            "http://127.0.0.1:9",
+            "--listen",
+            "[::]:8787",
+            "--allow-tofu",
+        ])
+        .current_dir(&temp_dir)
+        .output()
+        .expect("run protect http [::]");
+    assert!(!out_v6.status.success());
+    assert!(String::from_utf8_lossy(&out_v6.stderr).contains("Refusing to bind non-loopback"));
+
+    // 3. --allow-non-loopback + auth token WITHOUT TLS still rejected
+    let out_no_tls = Command::new(arc_bin)
+        .args([
+            "protect",
+            "http",
+            "--server",
+            "github",
+            "--target",
+            "http://127.0.0.1:9",
+            "--listen",
+            "0.0.0.0:8787",
+            "--allow-tofu",
+            "--allow-non-loopback",
+            "--auth-token",
+            "arc-proxy-secret-token-2026",
+        ])
+        .current_dir(&temp_dir)
+        .output()
+        .expect("run protect http without TLS");
+    assert!(!out_no_tls.status.success());
+    assert!(String::from_utf8_lossy(&out_no_tls.stderr).contains("without TLS"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_p0_two_endpoint_signed_policy_sync_rotation_revocation_rollback_and_offline() {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let root_dir = std::env::temp_dir().join(format!("arc_p0_team_sync_{}", uuid::Uuid::now_v7()));
+    let ep_a = root_dir.join("endpoint-a");
+    let ep_b = root_dir.join("endpoint-b");
+    fs::create_dir_all(&ep_a).unwrap();
+    fs::create_dir_all(&ep_b).unwrap();
+
+    // Generate 3 real Ed25519 keypairs: Root A, Root B (rotation target), Attacker K
+    let kp_a = Ed25519KeyPair::from_seed_unchecked(&[0x11; 32]).unwrap();
+    let pub_a = hex::encode(kp_a.public_key().as_ref());
+    let kp_b = Ed25519KeyPair::from_seed_unchecked(&[0x22; 32]).unwrap();
+    let pub_b = hex::encode(kp_b.public_key().as_ref());
+    let kp_attacker = Ed25519KeyPair::from_seed_unchecked(&[0x99; 32]).unwrap();
+    let pub_attacker = hex::encode(kp_attacker.public_key().as_ref());
+
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let exp_ms = now_ms + 3_600_000;
+
+    let sign_policy = |kp: &Ed25519KeyPair,
+                       key_id: &str,
+                       seq: u64,
+                       expires_at: u64,
+                       cfg: &arc_policy_engine::PolicyConfig|
+     -> serde_json::Value {
+        let payload = serde_json::to_value(cfg).unwrap();
+        let doc = serde_json::json!({
+            "format_version": 1,
+            "algorithm": "Ed25519",
+            "key_id": key_id,
+            "sequence": seq,
+            "issued_at_unix_ms": now_ms.saturating_sub(1_000),
+            "expires_at_unix_ms": expires_at,
+            "payload": payload,
+        });
+        let canonical = serde_jcs::to_vec(&doc).unwrap();
+        let mut msg = b"VEXA-ARC-POLICY-V1\0".to_vec();
+        msg.extend_from_slice(&canonical);
+        let sig = hex::encode(kp.sign(&msg).as_ref());
+        serde_json::json!({
+            "format_version": 1,
+            "algorithm": "Ed25519",
+            "key_id": key_id,
+            "sequence": seq,
+            "issued_at_unix_ms": now_ms.saturating_sub(1_000),
+            "expires_at_unix_ms": expires_at,
+            "payload": payload,
+            "signature": sig,
+        })
+    };
+
+    let sign_rotation = |kp: &Ed25519KeyPair,
+                         auth_kid: &str,
+                         rot_seq: u64,
+                         add_keys: BTreeMap<String, String>,
+                         revoke_key_ids: Vec<String>|
+     -> serde_json::Value {
+        let doc = serde_json::json!({
+            "format_version": 1,
+            "algorithm": "Ed25519",
+            "authorizing_key_id": auth_kid,
+            "rotation_sequence": rot_seq,
+            "issued_at_unix_ms": now_ms.saturating_sub(1_000),
+            "expires_at_unix_ms": exp_ms,
+            "add_keys": add_keys,
+            "revoke_key_ids": revoke_key_ids,
+        });
+        let canonical = serde_jcs::to_vec(&doc).unwrap();
+        let mut msg = b"VEXA-ARC-KEY-ROTATION-V1\0".to_vec();
+        msg.extend_from_slice(&canonical);
+        let sig = hex::encode(kp.sign(&msg).as_ref());
+        serde_json::json!({
+            "format_version": 1,
+            "algorithm": "Ed25519",
+            "authorizing_key_id": auth_kid,
+            "rotation_sequence": rot_seq,
+            "issued_at_unix_ms": now_ms.saturating_sub(1_000),
+            "expires_at_unix_ms": exp_ms,
+            "add_keys": add_keys,
+            "revoke_key_ids": revoke_key_ids,
+            "signature": sig,
+        })
+    };
+
+    // Start local mock control plane serving dynamic JSON bundles
+    let current_bundle = Arc::new(Mutex::new(serde_json::json!({})));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_addr = listener.local_addr().unwrap();
+    let bundle_ref = Arc::clone(&current_bundle);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let body = bundle_ref.lock().unwrap().to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+    let api_url = format!("http://{api_addr}/sca/v1");
+
+    // 1. Bootstrap BOTH endpoints out-of-band with admin root key A
+    for ep in [&ep_a, &ep_b] {
+        let init_out = Command::new(arc_bin)
+            .args([
+                "policy",
+                "trust-init",
+                "--root-key",
+                &format!("root-a:{pub_a}"),
+                "--path",
+                ep.to_str().unwrap(),
+            ])
+            .env_remove("ARC_POLICY_TRUSTED_PUBLIC_KEYS")
+            .env_remove("ARC_POLICY_MIN_SEQUENCE")
+            .output()
+            .expect("trust-init");
+        assert!(
+            init_out.status.success(),
+            "trust-init failed: {}",
+            String::from_utf8_lossy(&init_out.stderr)
+        );
+    }
+
+    let sync_ep = |ep: &std::path::Path, offline: bool| {
+        let mut cmd = Command::new(arc_bin);
+        cmd.args([
+            "policy",
+            "sync",
+            "--path",
+            ep.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+        ])
+        .env("VEXA_API_KEY", "test-team-token")
+        .env_remove("ARC_POLICY_TRUSTED_PUBLIC_KEYS")
+        .env_remove("ARC_POLICY_MIN_SEQUENCE");
+        if offline {
+            cmd.env("ARC_OFFLINE", "1");
+        } else {
+            cmd.env_remove("ARC_OFFLINE");
+            cmd.env_remove("VEXA_FIREWALL_OFFLINE");
+        }
+        cmd.output().expect("policy sync")
+    };
+
+    // 2. Publish signed policy #1 (enforce + protect_destructive_commands) -> BOTH endpoints sync & match
+    let org_cfg = arc_policy_engine::PolicyConfig {
+        mode: arc_policy_engine::PolicyMode::Enforce,
+        protect_destructive_commands: true,
+        ..Default::default()
+    };
+    let env_a1 = sign_policy(&kp_a, "root-a", 1, exp_ms, &org_cfg);
+    *current_bundle.lock().unwrap() = serde_json::json!({
+        "sequence": 1,
+        "signed_envelope": env_a1,
+    });
+    for ep in [&ep_a, &ep_b] {
+        let out = sync_ep(ep, false);
+        assert!(
+            out.status.success(),
+            "sync #1 failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // 3. Local project policy with mode=observe CANNOT weaken signed org policy on endpoint-a
+    let weak_local = arc_policy_engine::PolicyConfig {
+        mode: arc_policy_engine::PolicyMode::Observe,
+        protect_destructive_commands: false,
+        ..Default::default()
+    };
+    fs::write(
+        ep_a.join(".arc").join("policy.json"),
+        serde_json::to_string_pretty(&weak_local).unwrap(),
+    )
+    .unwrap();
+
+    let mut hook_child = Command::new(arc_bin)
+        .args(["intercept", "hook", "--host", "cursor"])
+        .current_dir(&ep_a)
+        .env_remove("ARC_POLICY_TRUSTED_PUBLIC_KEYS")
+        .env_remove("ARC_POLICY_MIN_SEQUENCE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let payload = serde_json::json!({
+            "hook_event_name": "beforeShellExecution",
+            "conversation_id": "team-e2e-1",
+            "command": "rm -rf /tmp/prod",
+            "cwd": ep_a.to_string_lossy()
+        });
+        hook_child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+    }
+    let hook_out = hook_child.wait_with_output().unwrap();
+    assert_eq!(
+        hook_out.status.code(),
+        Some(2),
+        "signed org enforce policy must override local observe policy"
+    );
+
+    // 4. Compromised server injects attacker key + higher sequence #5 -> BOTH endpoints REJECT
+    let env_evil = sign_policy(&kp_attacker, "attacker-k", 5, exp_ms, &weak_local);
+    *current_bundle.lock().unwrap() = serde_json::json!({
+        "trusted_key": format!("attacker-k:{pub_attacker}"),
+        "sequence": 5,
+        "signed_envelope": env_evil,
+    });
+    for ep in [&ep_a, &ep_b] {
+        let out = sync_ep(ep, false);
+        assert!(
+            !out.status.success(),
+            "endpoint must reject unanchored attacker key even when server supplies trusted_key"
+        );
+    }
+
+    // 5. Legitimate A-authorized key rotation adds key B + policy #2 signed by B -> BOTH endpoints accept
+    let mut add_b = BTreeMap::new();
+    add_b.insert("root-b".to_string(), pub_b.clone());
+    let rot_add_b = sign_rotation(&kp_a, "root-a", 1, add_b, vec![]);
+    let env_b2 = sign_policy(&kp_b, "root-b", 2, exp_ms, &org_cfg);
+    *current_bundle.lock().unwrap() = serde_json::json!({
+        "sequence": 2,
+        "key_rotations": [rot_add_b],
+        "signed_envelope": env_b2,
+    });
+    for ep in [&ep_a, &ep_b] {
+        let out = sync_ep(ep, false);
+        assert!(
+            out.status.success(),
+            "A-authorized rotation to B failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // 6. Rollback to sequence #1 -> REJECTED
+    *current_bundle.lock().unwrap() = serde_json::json!({
+        "sequence": 1,
+        "signed_envelope": env_a1,
+    });
+    assert!(!sync_ep(&ep_a, false).status.success());
+
+    // 7. Expired policy #3 -> REJECTED
+    let env_expired = sign_policy(&kp_b, "root-b", 3, now_ms.saturating_sub(500), &org_cfg);
+    *current_bundle.lock().unwrap() = serde_json::json!({
+        "sequence": 3,
+        "signed_envelope": env_expired,
+    });
+    assert!(!sync_ep(&ep_a, false).status.success());
+
+    // 8. B-authorized rotation revokes key A; subsequent policy #4 signed by A -> REJECTED
+    let rot_revoke_a = sign_rotation(
+        &kp_b,
+        "root-b",
+        2,
+        BTreeMap::new(),
+        vec!["root-a".to_string()],
+    );
+    let env_b3 = sign_policy(&kp_b, "root-b", 3, exp_ms, &org_cfg);
+    *current_bundle.lock().unwrap() = serde_json::json!({
+        "sequence": 3,
+        "key_rotations": [rot_revoke_a],
+        "signed_envelope": env_b3,
+    });
+    assert!(sync_ep(&ep_a, false).status.success());
+
+    let env_a4 = sign_policy(&kp_a, "root-a", 4, exp_ms, &org_cfg);
+    *current_bundle.lock().unwrap() = serde_json::json!({
+        "sequence": 4,
+        "signed_envelope": env_a4,
+    });
+    let rev_out = sync_ep(&ep_a, false);
+    assert!(!rev_out.status.success());
+    assert!(String::from_utf8_lossy(&rev_out.stderr).contains("revoked"));
+
+    // 9. Offline mode fails sync cleanly without corrupting active signed policy
+    assert!(!sync_ep(&ep_a, true).status.success());
+    assert!(ep_a.join(".arc").join("signed_policy.json").exists());
+
+    // 10. Tampering .arc/policy-state.json causes fail-closed integrity rejection
+    let state_path = ep_a.join(".arc").join("policy-state.json");
+    let mut tampered: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    tampered["min_sequence"] = serde_json::json!(0);
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let sync_after_tamper = sync_ep(&ep_a, false);
+    assert!(!sync_after_tamper.status.success());
+    assert!(String::from_utf8_lossy(&sync_after_tamper.stderr).contains("integrity check failed"));
+
+    let _ = fs::remove_dir_all(&root_dir);
+}

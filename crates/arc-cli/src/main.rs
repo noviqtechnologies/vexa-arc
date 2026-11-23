@@ -191,6 +191,10 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
 
+        /// Optional administrator-provisioned Ed25519 root key (`key-id:hex-pubkey`) to anchor signed policy sync
+        #[arg(long, env = "ARC_POLICY_TRUSTED_PUBLIC_KEYS")]
+        root_key: Option<String>,
+
         /// Output setup summary as JSON
         #[arg(long)]
         json: bool,
@@ -475,7 +479,33 @@ enum TelemetryAction {
 
 #[derive(Subcommand)]
 enum PolicyAction {
-    /// Fetch, verify (Ed25519 + JCS), and pin the organization's signed policy bundle
+    /// Bootstrap an administrator-provisioned Ed25519 root trust anchor (.arc/policy-state.json)
+    TrustInit {
+        /// Comma-separated root public keys in `key-id:hex-pubkey` format
+        #[arg(long, env = "ARC_POLICY_TRUSTED_PUBLIC_KEYS")]
+        root_key: String,
+        /// Initial minimum signed-policy sequence number (default: 0)
+        #[arg(long, default_value_t = 0)]
+        min_sequence: u64,
+        /// Project directory where .arc/policy-state.json will be written
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Overwrite an existing trust store (administrator re-bootstrap only)
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Apply a signed, old-root-authorized key rotation or revocation envelope
+    RotateKey {
+        /// Path to the signed KeyRotationEnvelope JSON file
+        #[arg(long)]
+        envelope: PathBuf,
+        /// Project directory containing .arc/policy-state.json
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Fetch, verify (Ed25519 + JCS) against anchored root keys, and pin the organization's signed policy bundle
     Sync {
         /// Project directory where .arc/signed_policy.json will be written
         #[arg(short, long, default_value = ".")]
@@ -750,6 +780,50 @@ enum ProtectAction {
         /// Host agent client name (e.g. claude-code, cursor, windsurf, custom-mcp)
         #[arg(long, default_value = "custom-mcp")]
         host: String,
+
+        /// Explicitly allow binding to a non-loopback address (requires --auth-token, --tls-cert, --tls-key)
+        #[arg(long)]
+        allow_non_loopback: bool,
+
+        /// Client authentication bearer token (>= 16 chars; mandatory for non-loopback)
+        #[arg(long, env = "ARC_PROXY_AUTH_TOKEN")]
+        auth_token: Option<String>,
+
+        /// PEM-encoded TLS certificate chain path (mandatory for non-loopback)
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+
+        /// PEM-encoded TLS private key path (mandatory for non-loopback)
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+
+        /// Allowed Host header values (repeatable)
+        #[arg(long = "allowed-host")]
+        allowed_hosts: Vec<String>,
+
+        /// Allowed Origin header values (repeatable)
+        #[arg(long = "allowed-origin")]
+        allowed_origins: Vec<String>,
+
+        /// Explicitly forward inbound Authorization header to upstream (default: stripped)
+        #[arg(long)]
+        forward_inbound_auth: bool,
+
+        /// Explicit static upstream bearer token to send to the remote MCP server
+        #[arg(long, env = "ARC_UPSTREAM_AUTH_TOKEN")]
+        upstream_auth_token: Option<String>,
+
+        /// Maximum HTTP request body size in bytes (default: 2097152)
+        #[arg(long, default_value_t = 2 * 1024 * 1024)]
+        max_body_bytes: usize,
+
+        /// Maximum concurrent client connections (default: 64)
+        #[arg(long, default_value_t = 64)]
+        max_connections: usize,
+
+        /// Maximum requests per minute per client IP (default: 120)
+        #[arg(long, default_value_t = 120)]
+        rate_limit_per_minute: usize,
     },
 }
 
@@ -1298,7 +1372,38 @@ fn main() {
                 pin_schema,
                 allow_tofu,
                 host,
+                allow_non_loopback,
+                auth_token,
+                tls_cert,
+                tls_key,
+                allowed_hosts,
+                allowed_origins,
+                forward_inbound_auth,
+                upstream_auth_token,
+                max_body_bytes,
+                max_connections,
+                rate_limit_per_minute,
             } => {
+                let cred_policy = if let Some(tok) = upstream_auth_token {
+                    arc_hooks::http_proxy::CredentialForwardingPolicy::StaticUpstreamToken(tok)
+                } else if forward_inbound_auth {
+                    arc_hooks::http_proxy::CredentialForwardingPolicy::ForwardInbound
+                } else {
+                    arc_hooks::http_proxy::CredentialForwardingPolicy::Strip
+                };
+                let proxy_cfg = arc_hooks::http_proxy::HttpProxyConfig {
+                    allow_non_loopback,
+                    auth_token,
+                    tls_cert_path: tls_cert,
+                    tls_key_path: tls_key,
+                    allowed_hosts,
+                    allowed_origins,
+                    credential_forwarding: cred_policy,
+                    max_body_bytes,
+                    max_connections,
+                    rate_limit_per_minute,
+                    ..Default::default()
+                };
                 if !run_protect_http(
                     &server,
                     &target,
@@ -1307,6 +1412,7 @@ fn main() {
                     pin_schema.as_deref(),
                     allow_tofu,
                     &host,
+                    proxy_cfg,
                 ) {
                     std::process::exit(1);
                 }
@@ -1376,6 +1482,21 @@ fn main() {
             }
         }
         Commands::Policy { action } => match action {
+            PolicyAction::TrustInit {
+                root_key,
+                min_sequence,
+                path,
+                force,
+            } => {
+                if !run_policy_trust_init(&path, &root_key, min_sequence, force) {
+                    std::process::exit(1);
+                }
+            }
+            PolicyAction::RotateKey { envelope, path } => {
+                if !run_policy_rotate_key(&path, &envelope) {
+                    std::process::exit(1);
+                }
+            }
             PolicyAction::Sync { path, api_url } => {
                 if !run_policy_sync(&path, api_url.as_deref()) {
                     std::process::exit(1);
@@ -1510,11 +1631,13 @@ fn main() {
         Commands::Setup {
             api_url,
             token,
+            root_key,
             json,
         } => {
             if !commands::setup::run_setup(
                 api_url.as_deref(),
                 token.as_deref(),
+                root_key.as_deref(),
                 json,
                 run_policy_sync,
             ) {
@@ -2002,7 +2125,118 @@ fn run_telemetry(action: TelemetryAction) -> bool {
     }
 }
 
+fn run_policy_trust_init(
+    project_dir: &Path,
+    root_key: &str,
+    min_sequence: u64,
+    force: bool,
+) -> bool {
+    let state_path = project_dir.join(".arc").join("policy-state.json");
+    if state_path.exists() && !force {
+        eprintln!(
+            "[Arc Policy] Trust anchor already exists at {}. Pass --force only for explicit administrator re-bootstrap.",
+            state_path.display()
+        );
+        return false;
+    }
+
+    let store =
+        match arc_policy_engine::PolicyTrustStore::from_root_keys_str(root_key, min_sequence) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[Arc Policy] Invalid root key specification: {e}");
+                return false;
+            }
+        };
+
+    if let Err(e) = store.save_atomic(&state_path) {
+        eprintln!("[Arc Policy] Failed to write trust anchor: {e}");
+        return false;
+    }
+
+    println!(
+        "[Arc Policy] Provisioned administrator root trust anchor ({} key(s), min_sequence={}) at {}",
+        store.active_keys.len(),
+        store.min_sequence,
+        state_path.display()
+    );
+    true
+}
+
+fn run_policy_rotate_key(project_dir: &Path, envelope_path: &Path) -> bool {
+    let state_path = project_dir.join(".arc").join("policy-state.json");
+    let mut store = match arc_policy_engine::PolicyTrustStore::load_verified(&state_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[Arc Policy] Failed to load verified trust anchor: {e}");
+            return false;
+        }
+    };
+
+    let env_json = match fs::read_to_string(envelope_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[Arc Policy] Failed to read key rotation envelope '{}': {e}",
+                envelope_path.display()
+            );
+            return false;
+        }
+    };
+
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    if let Err(e) = store.apply_key_rotation(&env_json, now_ms) {
+        eprintln!("[Arc Policy] Key rotation rejected: {e}");
+        return false;
+    }
+
+    if let Err(e) = store.save_atomic(&state_path) {
+        eprintln!("[Arc Policy] Failed to persist rotated trust state: {e}");
+        return false;
+    }
+
+    println!(
+        "[Arc Policy] Applied authorized key rotation #{} ({} active, {} revoked) to {}",
+        store.rotation_sequence,
+        store.active_keys.len(),
+        store.revoked_key_ids.len(),
+        state_path.display()
+    );
+    true
+}
+
+fn load_anchored_trust_store(
+    state_path: &Path,
+) -> Result<arc_policy_engine::PolicyTrustStore, String> {
+    if state_path.exists() {
+        return arc_policy_engine::PolicyTrustStore::load_verified(state_path);
+    }
+    if let Ok(env_keys) = std::env::var("ARC_POLICY_TRUSTED_PUBLIC_KEYS") {
+        let env_min = std::env::var("ARC_POLICY_MIN_SEQUENCE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        return arc_policy_engine::PolicyTrustStore::from_root_keys_str(&env_keys, env_min);
+    }
+    Err(
+        "No administrator-provisioned trust root found. Run `arc policy trust-init --root-key <key-id:hex>` or set ARC_POLICY_TRUSTED_PUBLIC_KEYS before syncing."
+            .to_string(),
+    )
+}
+
 fn run_policy_sync(project_dir: &Path, api_url: Option<&str>) -> bool {
+    let arc_dir = project_dir.join(".arc");
+    let state_path = arc_dir.join("policy-state.json");
+
+    // 1. Load trust strictly from administrator-provisioned anchor (NEVER from server response)
+    let mut trust_store = match load_anchored_trust_store(&state_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[Arc Policy] {e}");
+            return false;
+        }
+    };
+
     let bundle = match arc_telemetry::fetch_signed_policy_bundle(api_url) {
         Ok(b) => b,
         Err(e) => {
@@ -2011,74 +2245,51 @@ fn run_policy_sync(project_dir: &Path, api_url: Option<&str>) -> bool {
         }
     };
 
-    let Some(trusted_key) = bundle.get("trusted_key").and_then(|v| v.as_str()) else {
-        eprintln!("[Arc Policy] Server response missing trusted_key");
-        return false;
-    };
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+    // 2. Apply any server-delivered key rotation envelopes ONLY if cryptographically
+    //    authorized by an already-trusted active key in `trust_store`.
+    if let Some(rotations) = bundle.get("key_rotations").and_then(|v| v.as_array()) {
+        for (idx, rot_val) in rotations.iter().enumerate() {
+            let rot_json = serde_json::to_string(rot_val).unwrap_or_default();
+            if let Err(e) = trust_store.apply_key_rotation(&rot_json, now_ms) {
+                eprintln!("[Arc Policy] Key rotation #{idx} rejected: {e}");
+                return false;
+            }
+        }
+    }
+
     let Some(envelope) = bundle.get("signed_envelope") else {
         eprintln!("[Arc Policy] Server response missing signed_envelope");
         return false;
     };
-    let seq = bundle.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    let arc_dir = project_dir.join(".arc");
-    if let Err(e) = fs::create_dir_all(&arc_dir) {
-        eprintln!("[Arc Policy] Failed to create {}: {e}", arc_dir.display());
-        return false;
-    }
-    let state_path = arc_dir.join("policy-state.json");
-    let local_min_seq = if state_path.exists() {
-        fs::read_to_string(&state_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("min_sequence").and_then(|s| s.as_u64()))
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    if seq < local_min_seq {
-        eprintln!(
-            "[Arc Policy] Rollback rejected: server sequence {seq} < local min_sequence {local_min_seq}"
-        );
-        return false;
-    }
-
-    let keys = match arc_policy_engine::evaluator::parse_trusted_policy_keys(trusted_key) {
-        Ok(k) => k,
+    // 3. Verify signed policy strictly against anchored trust store (ignoring any server-supplied `trusted_key`)
+    let env_str = serde_json::to_string_pretty(envelope).unwrap_or_default();
+    let seq = match trust_store.verify_and_advance_policy(&env_str, now_ms) {
+        Ok((_, seq)) => seq,
         Err(e) => {
-            eprintln!("[Arc Policy] Invalid trusted_key from server: {e}");
+            eprintln!(
+                "[Arc Policy] Signature verification failed against anchored trust root: {e}"
+            );
             return false;
         }
     };
 
-    let env_str = serde_json::to_string_pretty(envelope).unwrap_or_default();
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    if let Err(e) =
-        arc_policy_engine::evaluator::parse_signed_policy(&env_str, &keys, local_min_seq, now_ms)
-    {
-        eprintln!("[Arc Policy] Signature verification failed: {e}");
-        return false;
-    }
-
+    // 4. Atomically persist verified signed policy and integrity-protected trust state
     let policy_path = arc_dir.join("signed_policy.json");
-    if let Err(e) = fs::write(&policy_path, env_str.as_bytes()) {
+    if let Err(e) = arc_policy_engine::atomic_write_bytes(&policy_path, env_str.as_bytes()) {
         eprintln!(
-            "[Arc Policy] Failed to write {}: {e}",
+            "[Arc Policy] Failed to atomically write {}: {e}",
             policy_path.display()
         );
         return false;
     }
-    let state_body = serde_json::json!({
-        "trusted_key": trusted_key,
-        "min_sequence": seq,
-        "synced_at": chrono::Utc::now().to_rfc3339(),
-    });
-    if let Err(e) = fs::write(
-        &state_path,
-        serde_json::to_string_pretty(&state_body).unwrap_or_default(),
-    ) {
-        eprintln!("[Arc Policy] Failed to write {}: {e}", state_path.display());
+    if let Err(e) = trust_store.save_atomic(&state_path) {
+        eprintln!(
+            "[Arc Policy] Failed to atomically write {}: {e}",
+            state_path.display()
+        );
         return false;
     }
 
@@ -2319,6 +2530,7 @@ fn run_protect_stdio(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_protect_http(
     server: &str,
     target: &str,
@@ -2327,6 +2539,7 @@ fn run_protect_http(
     pin_schema: Option<&str>,
     allow_tofu: bool,
     host: &str,
+    proxy_cfg: arc_hooks::http_proxy::HttpProxyConfig,
 ) -> bool {
     let Some(broker) = build_protected_broker(
         server,
@@ -2343,7 +2556,9 @@ fn run_protect_http(
     if allow_tofu {
         eprintln!("[Arc Protect HTTP] WARNING: TOFU explicitly enabled for '{server}'; schema hash will be saved to .arc/mcp-pins.lock.");
     }
-    if let Err(e) = arc_hooks::http_proxy::run_http_proxy(listen, target, broker) {
+    if let Err(e) =
+        arc_hooks::http_proxy::run_http_proxy_with_config(listen, target, broker, proxy_cfg)
+    {
         eprintln!("[Arc Protect HTTP] Proxy error: {e}");
         return false;
     }
@@ -4021,6 +4236,15 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
                 schema_pin_status: None,
                 latency_ms: started.elapsed().as_secs_f64() * 1000.0,
                 error_class: None,
+                policy_revision: evaluator.config.read().ok().map(|c| c.revision_hash()),
+                policy_source: evaluator
+                    .config
+                    .read()
+                    .ok()
+                    .and_then(|c| c.source)
+                    .map(|s| format!("{s:?}").to_ascii_lowercase()),
+                correlation_id: Some(event.event_id.to_string()),
+                ..Default::default()
             }
             .build(host, event.transport.as_deref());
             telemetry_event.phase = match event.phase {
@@ -4080,6 +4304,15 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
                 schema_pin_status: None,
                 latency_ms: started.elapsed().as_secs_f64() * 1000.0,
                 error_class: None,
+                policy_revision: evaluator.config.read().ok().map(|c| c.revision_hash()),
+                policy_source: evaluator
+                    .config
+                    .read()
+                    .ok()
+                    .and_then(|c| c.source)
+                    .map(|s| format!("{s:?}").to_ascii_lowercase()),
+                correlation_id: Some(event.event_id.to_string()),
+                ..Default::default()
             }
             .build(host, Some("native_hook"));
             cloud_tel.phase = "pre".to_string();
@@ -5709,6 +5942,15 @@ fn run_intercept_eval_with_opts(opts: InterceptEvalOptions) -> bool {
             schema_pin_status: None,
             latency_ms: 0.5,
             error_class: None,
+            policy_revision: evaluator.config.read().ok().map(|c| c.revision_hash()),
+            policy_source: evaluator
+                .config
+                .read()
+                .ok()
+                .and_then(|c| c.source)
+                .map(|s| format!("{s:?}").to_ascii_lowercase()),
+            correlation_id: Some(event.event_id.to_string()),
+            ..Default::default()
         }
         .build("cli_intercept", Some("cli"));
         cloud_tel.phase = "pre".to_string();

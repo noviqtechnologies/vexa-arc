@@ -163,8 +163,29 @@ pub fn build_workstation_heartbeat(project_dir: &Path) -> CloudArcHeartbeat {
             arc_policy_engine::evaluator::PolicySource::EmergencyDeny => "emergency_deny",
         })
         .unwrap_or("built_in_default");
+    let policy_health = match &policy_res {
+        Ok(_) => "healthy",
+        Err(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("expired") {
+                "expired"
+            } else if lower.contains("rollback") || lower.contains("below the managed minimum") {
+                "rollback_rejected"
+            } else if lower.contains("integrity")
+                || lower.contains("trust")
+                || lower.contains("revoked")
+                || lower.contains("signature")
+            {
+                "trust_invalid"
+            } else {
+                "parse_error"
+            }
+        }
+    };
     let active_policy_seq = read_active_policy_sequence(project_dir);
-    let signed_policy_synced = active_policy_seq > 0 && policy_source == "signed_organization";
+    let signed_policy_synced = active_policy_seq > 0
+        && policy_source == "signed_organization"
+        && policy_health == "healthy";
 
     let host_adapters = detect_installed_host_adapters(project_dir);
     let doctor_status = if !policy_ok {
@@ -185,18 +206,21 @@ pub fn build_workstation_heartbeat(project_dir: &Path) -> CloudArcHeartbeat {
         active_policy_seq,
         policy_source: policy_source.to_string(),
         signed_policy_synced,
+        policy_health: policy_health.to_string(),
         doctor_status: doctor_status.to_string(),
     }
 }
 
 /// One-command workstation onboarding:
 /// 1. Authenticate (OAuth Device Flow in browser, or `--token` for CI/headless) & persist `api_base_url`
-/// 2. Install IDE hooks & MCP server (`arc init` on `.`)
-/// 3. Sync signed organization policy (non-fatal if none published yet)
-/// 4. Send immediate endpoint posture heartbeat with real `active_policy_seq`
+/// 2. Optionally bootstrap administrator-provisioned Ed25519 root key (`--root-key`)
+/// 3. Install IDE hooks & MCP server (`arc init` on `.`)
+/// 4. Sync signed organization policy (non-fatal if none published yet)
+/// 5. Send immediate endpoint posture heartbeat with real `active_policy_seq` and `policy_health`
 pub fn run_setup(
     api_url: Option<&str>,
     token: Option<&str>,
+    root_key: Option<&str>,
     json: bool,
     sync_policy_fn: fn(&Path, Option<&str>) -> bool,
 ) -> bool {
@@ -281,8 +305,35 @@ pub fn run_setup(
         }
     }
 
-    // 2. Configure IDE hooks & MCP server on current directory
-    let init_ok = crate::commands::init::run_init(project_dir, "auto", false, false);
+    // 2. Configure IDE hooks, MCP server, directives & baseline discovery (without printing
+    //    the standalone `arc init` banner or corrupting `--json` stdout)
+    let init_result = crate::commands::init::execute_init(project_dir, "auto", false, json);
+    let init_ok = init_result.is_ok();
+    if let Err(ref e) = init_result {
+        if !json {
+            eprintln!("[Arc Setup] Warning: workspace initialization failed: {e}");
+        }
+    }
+
+    // 2.5. If administrator supplied `--root-key` (or ARC_POLICY_TRUSTED_PUBLIC_KEYS),
+    //      bootstrap `.arc/policy-state.json` atomically when no trust store exists yet.
+    if let Some(rk) = root_key.map(str::trim).filter(|s| !s.is_empty()) {
+        let state_path = project_dir.join(".arc").join("policy-state.json");
+        if !state_path.exists() {
+            match arc_policy_engine::PolicyTrustStore::from_root_keys_str(rk, 0) {
+                Ok(store) => {
+                    if let Err(e) = store.save_atomic(&state_path) {
+                        eprintln!("[Arc Setup] Failed to persist trust root: {e}");
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Arc Setup] Invalid --root-key specification: {e}");
+                    return false;
+                }
+            }
+        }
+    }
 
     // 3. Sync signed organization policy (non-fatal if org has not published one yet)
     let policy_synced = sync_policy_fn(project_dir, Some(&base_url));
@@ -293,6 +344,18 @@ pub fn run_setup(
     let heartbeat_ok = emit_cloud_heartbeat(&hb, Some(&base_url));
 
     if json {
+        let discovery_json = init_result.as_ref().ok().map(|s| {
+            serde_json::json!({
+                "mcp_servers": s.mcp_servers,
+                "agent_skills": s.agent_skills,
+                "model_assets": s.model_assets,
+                "exposed_secrets": s.exposed_secrets,
+                "files_scanned": s.files_scanned,
+                "overall_risk_band": s.overall_risk_band,
+                "scan_duration_ms": s.scan_duration_ms,
+                "truncated": s.truncated,
+            })
+        });
         println!(
             "{}",
             serde_json::json!({
@@ -305,18 +368,117 @@ pub fn run_setup(
                 "policy_synced": policy_synced,
                 "active_policy_seq": active_seq,
                 "heartbeat_ok": heartbeat_ok,
+                "discovery": discovery_json,
             })
         );
     } else {
         println!(
-            "✔ Workstation connected to {} (org: {}, policy seq #{}, heartbeat={})",
-            base_url,
-            authed_org.as_deref().unwrap_or("default"),
-            active_seq,
-            heartbeat_ok
+            "{}",
+            format_setup_summary(
+                &base_url,
+                authed_org.as_deref().unwrap_or("default"),
+                policy_synced,
+                active_seq,
+                heartbeat_ok,
+                init_result.as_ref().ok(),
+            )
         );
     }
     true
+}
+
+fn format_setup_summary(
+    base_url: &str,
+    org: &str,
+    policy_synced: bool,
+    active_seq: i64,
+    heartbeat_ok: bool,
+    init_summary: Option<&crate::commands::init::InitSummary>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("\n=======================================================\n");
+    out.push_str("               VEXA ARC SETUP COMPLETE                 \n");
+    out.push_str("=======================================================\n");
+    out.push_str(&format!(
+        "Cloud:           {} (org: {}, heartbeat: {})\n",
+        base_url,
+        org,
+        if heartbeat_ok { "connected" } else { "queued" }
+    ));
+
+    if let Some(s) = init_summary {
+        out.push_str(&format!(
+            "Scope:           {}\n",
+            if s.is_workstation_scope {
+                "workstation (home/root directory detected)"
+            } else {
+                "project"
+            }
+        ));
+        if policy_synced {
+            out.push_str(&format!(
+                "Policy:          signed organization policy (seq #{})\n",
+                active_seq
+            ));
+        } else {
+            out.push_str(&format!(
+                "Policy:          {} ({})\n",
+                s.policy_path.display(),
+                if s.policy_created {
+                    "created"
+                } else {
+                    "existing preserved"
+                }
+            ));
+        }
+        out.push_str(&format!(
+            "IDE Hooks:       {}\n",
+            if s.installed_hosts.is_empty() {
+                "none".to_string()
+            } else {
+                s.installed_hosts.join(", ")
+            }
+        ));
+        if !s.mcp_registered.is_empty() {
+            out.push_str(&format!(
+                "MCP Server:      registered in {}\n",
+                s.mcp_registered.join(", ")
+            ));
+        }
+        if !s.directives_installed.is_empty() {
+            out.push_str(&format!(
+                "Directives:      {}\n",
+                s.directives_installed.join(", ")
+            ));
+        }
+        out.push_str(&format!(
+            "AI Assets:       {} MCP server(s), {} rule/skill file(s), {} model(s)\n",
+            s.mcp_servers, s.agent_skills, s.model_assets
+        ));
+        out.push_str(&format!(
+            "Exposed Secrets: {}\n",
+            crate::commands::init::format_exposed_secrets_line(
+                s.exposed_secrets,
+                s.files_scanned,
+                s.scan_duration_ms,
+                s.truncated,
+            )
+        ));
+        for w in &s.hook_warnings {
+            out.push_str(&format!("[WARN] {w}\n"));
+        }
+    } else if policy_synced {
+        out.push_str(&format!(
+            "Policy:          signed organization policy (seq #{})\n",
+            active_seq
+        ));
+    }
+
+    out.push_str("\nNext steps:\n");
+    out.push_str("  • Run `arc audit` for full AI asset & MCP risk details\n");
+    out.push_str("  • Run `arc sca audit` to check dependencies for vulnerabilities\n");
+    out.push_str("=======================================================\n");
+    out
 }
 
 #[cfg(test)]
@@ -362,5 +524,45 @@ mod tests {
         assert_ne!(hb2.policy_source, "signed_organization");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn setup_summary_is_unified_and_does_not_recommend_arc_setup() {
+        let init_summary = crate::commands::init::InitSummary {
+            is_workstation_scope: false,
+            path: std::path::PathBuf::from("."),
+            policy_path: std::path::PathBuf::from("./.arc/policy.json"),
+            policy_created: false,
+            audit_mode: false,
+            installed_hosts: vec!["claude-code", "cursor"],
+            mcp_registered: vec![".cursor/mcp.json", ".mcp.json"],
+            directives_installed: vec![".cursor/rules/vexa-arc-security.mdc".to_string()],
+            hook_warnings: vec![],
+            mcp_servers: 0,
+            agent_skills: 0,
+            model_assets: 0,
+            exposed_secrets: 3,
+            files_scanned: 150,
+            overall_risk_band: "high".to_string(),
+            scan_duration_ms: 42,
+            truncated: false,
+        };
+
+        let out = format_setup_summary(
+            "https://api.vexa.example/v1",
+            "acme",
+            true,
+            2,
+            true,
+            Some(&init_summary),
+        );
+        assert!(out.contains("VEXA ARC SETUP COMPLETE"));
+        assert!(out.contains("signed organization policy (seq #2)"));
+        assert!(out.contains("3 finding(s) (scanned 150 files in 42 ms)"));
+        assert!(out.contains("Run `arc audit`"));
+        assert!(
+            !out.contains("Run `arc setup`"),
+            "arc setup output must not tell the user to run arc setup again"
+        );
     }
 }

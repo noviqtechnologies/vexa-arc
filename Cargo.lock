@@ -102,7 +102,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arc-cli"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "arc-core",
  "arc-discover",
@@ -115,7 +115,9 @@ dependencies = [
  "clap",
  "hex",
  "reqwest",
+ "ring",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2 0.11.1",
  "thiserror 1.0.69",
@@ -127,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "arc-core"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "bitflags",
  "chrono",
@@ -142,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "arc-discover"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "arc-core",
  "arc-dlp",
@@ -160,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "arc-dlp"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "aho-corasick",
  "arc-core",
@@ -179,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "arc-firewall"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "arc-core",
  "chrono",
@@ -200,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "arc-hooks"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "arc-core",
  "arc-dlp",
@@ -209,17 +211,20 @@ dependencies = [
  "hex",
  "libc",
  "reqwest",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "uuid",
 ]
 
 [[package]]
 name = "arc-policy-engine"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "arc-core",
  "arc-dlp",
@@ -237,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "arc-telemetry"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "arc-core",
  "arc-dlp",

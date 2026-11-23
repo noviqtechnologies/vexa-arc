@@ -555,13 +555,24 @@ mod tests {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CloudArcEvent {
     pub event_id: String,
+    pub correlation_id: String,
     pub install_id: String,
+    #[serde(default)]
+    pub actor: String,
     pub host: String,
+    #[serde(default)]
+    pub arc_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
     pub phase: String,
     pub action_class: String,
     pub decision: String,
+    #[serde(default)]
+    pub execution_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
     #[serde(default)]
@@ -595,6 +606,8 @@ pub struct CloudArcHeartbeat {
     pub policy_source: String,
     #[serde(default)]
     pub signed_policy_synced: bool,
+    #[serde(default)]
+    pub policy_health: String,
     pub doctor_status: String,
 }
 
@@ -619,14 +632,38 @@ pub fn spool_arc_event(
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| Utc::now().to_rfc3339());
 
+    let execution_status = event.execution_status.clone().unwrap_or_else(|| {
+        match event.decision.as_str() {
+            "deny" => "blocked",
+            "approval" => "pending_approval",
+            "quarantine" => "quarantined",
+            "allow" => "allowed",
+            _ => "unknown",
+        }
+        .to_string()
+    });
+    let correlation_id = event
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| event.event_id.to_string());
+
     let cloud_ev = CloudArcEvent {
         event_id: event.event_id.to_string(),
+        correlation_id,
         install_id: event.install_id.clone(),
+        actor: sanitize_cloud_actor(&VexaCloudAuth::current_actor()),
         host: event.host.clone(),
+        arc_version: event
+            .adapter_version
+            .clone()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
         transport: event.transport.clone(),
         phase: event.phase.clone(),
         action_class: event.action_class.clone(),
         decision: event.decision.clone(),
+        execution_status,
+        policy_revision: event.policy_revision.clone(),
+        policy_source: event.policy_source.clone(),
         rule_id: event.rule_id.clone(),
         taint_flags: event.taint_flags.clone(),
         sink_class: event.sink_class.clone(),
@@ -867,6 +904,8 @@ mod arc_spool_tests {
             rule_id: Some("ARC-LTT-001".to_string()),
             target_class: "network_utility".to_string(),
             session_id_hash: crate::hash_identifier("secret-session-id"),
+            policy_revision: Some("rev-sha256-test".to_string()),
+            policy_source: Some("signed_organization".to_string()),
             ..Default::default()
         }
         .build("claude_code", Some("native_hook"));
@@ -907,6 +946,11 @@ mod arc_spool_tests {
         assert_eq!(flushed_ok, 1);
         assert!(received.contains("POST /sca/v1/arc/events"));
         assert!(received.contains("ARC-LTT-001"));
+        assert!(received.contains("\"execution_status\":\"blocked\""));
+        assert!(received.contains("\"policy_revision\":\"rev-sha256-test\""));
+        assert!(received.contains("\"correlation_id\""));
+        assert!(received.contains("\"arc_version\""));
+        assert!(received.contains("\"actor\""));
         assert!(!received.contains("secret-session-id"));
         assert!(
             !cloud_spool_path().exists(),

@@ -33,3 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 uuid = { workspace = true }
 vexa-core = { workspace = true }
 vexa-sca = { workspace = true }
+
+[dev-dependencies]
+ring = { workspace = true }
+serde_jcs = { workspace = true }

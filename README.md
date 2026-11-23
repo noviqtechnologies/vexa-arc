@@ -97,7 +97,9 @@ curl -fsSL https://raw.githubusercontent.com/noviqtechnologies/vexa-arc/main/ins
 ```
 
 > [!NOTE]
-> Both installers prepend the install directory to `PATH` and warn if an older `arc` binary (e.g. from `~/.cargo/bin`) is shadowing the new release. Running `arc init` from a default home terminal (`~` or `C:\Users\<user>`) automatically uses **workstation scope** (scanning only known IDE/AI config roots) so it never hangs walking your home directory; running `arc init` inside a project repository uses **project scope** with a deterministic `.gitignore` / `.arcignore`-aware parallel quick-scan (still inspecting local `.env*` and IDE MCP configs even when gitignored, excluding Vexa Arc's own self-managed entries from baseline counts, and rendering `N+` if a large monorepo hits the 5,000-file cap).
+> **Mandatory Artifact Verification & Rollback Protection:** All three installers (`@vexasec/arc`, `install.ps1`, and `install.sh`) verify the archive SHA-256 digest against `checksums.txt` **and** enforce fail-closed publisher authenticity via Sigstore `cosign verify-blob` (pinned to the exact release tag identity `https://github.com/noviqtechnologies/vexa-arc/.github/workflows/release.yml@refs/tags/<TAG>` and GitHub Actions OIDC issuer) or `gh attestation verify`. Releases are immutable (`overwrite` disabled) and installers refuse silent version downgrades unless `ARC_ALLOW_DOWNGRADE=1` is set.
+>
+> Both standalone installers prepend the install directory to `PATH` and warn if an older `arc` binary (e.g. from `~/.cargo/bin`) is shadowing the new release. Running `arc init` from a default home terminal (`~` or `C:\Users\<user>`) automatically uses **workstation scope** (scanning only known IDE/AI config roots) so it never hangs walking your home directory; running `arc init` inside a project repository uses **project scope** with a deterministic `.gitignore` / `.arcignore`-aware parallel quick-scan (still inspecting local `.env*` and IDE MCP configs even when gitignored, excluding Vexa Arc's own self-managed entries from baseline counts, and rendering `N+` if a large monorepo hits the 5,000-file cap).
 
 Or build from source with the Rust toolchain (`>= 1.97.0`):
 ```bash
@@ -113,12 +115,14 @@ arc init
 # Or start in non-blocking audit mode first:
 arc init --audit-mode
 
-# ☁️ (Optional) One-command Vexa Cloud onboarding (browser Device Flow login, IDE hooks, signed policy sync & heartbeat):
+# ☁️ (Optional) One-command Vexa Cloud onboarding (browser Device Flow login, anchored root key, IDE hooks, signed policy sync & heartbeat):
 arc setup
+# Team onboarding with administrator-provisioned Ed25519 root key:
+arc setup --root-key root-2026:<64-hex-ed25519-pubkey>
 # For dev/test/pre-prod/self-hosted environments (persisted in ~/.vexa/credentials.json):
 arc setup --api-url https://<your-vexa-api>/v1
 # Non-interactive CI/headless setup:
-arc setup --token vexa_pat_...
+arc setup --token vexa_pat_... --root-key root-2026:<64-hex-ed25519-pubkey>
 
 # 📦 Live registry + OSV package check (npm, PyPI, crates.io; set ARC_OFFLINE=1 for offline cache):
 arc shield check reactt --ecosystem npm
@@ -499,7 +503,8 @@ All commands support relative and absolute paths, cross-platform path separators
 | `arc shield` | Live cached registry checks (npm, PyPI, crates.io) + exact-version OSV check | `check <PKG>`, `run <CMD>`, `--show-recommendation`, `--fail-on-risk` | `arc shield run --fail-on-risk -- npm install package` |
 | `arc scan-secrets` | Scan files or stdin for secrets with entropy checks | `-p, --path <PATH>`, `--redact` | `arc scan-secrets --path . --redact` |
 | `arc host` | Manage host integrations (Claude Code, Cursor, Codex CLI, Gemini CLI, Windsurf) | `install`, `status`, `uninstall`, `--host <HOST>` | `arc host install --host claude-code` |
-| `arc protect` | Supervise stdio or remote HTTP/SSE MCP servers with schema pinning (`.arc/mcp-pins.lock` or signed policy) | `stdio --server <NAME>`, `http --server <NAME> --target <URL> --listen 127.0.0.1:8787` | `arc protect http --server linear --target https://mcp.linear.app/sse` |
+| `arc protect` | Supervise stdio or remote HTTP/SSE MCP servers with schema pinning (`.arc/mcp-pins.lock` or signed policy). HTTP proxy is loopback-only by default, strips inbound `Authorization` by default, and hard-rejects non-loopback binds unless `--allow-non-loopback`, `--auth-token`, `--tls-cert`, and `--tls-key` are configured | `stdio --server <NAME>`, `http --server <NAME> --target <URL> --listen 127.0.0.1:8787` | `arc protect http --server linear --target https://mcp.linear.app/sse` |
+| `arc policy` | Provision anchored Ed25519 root keys, apply signed key rotations/revocations, sync verified signed org policies, or run policy tests/simulations | `trust-init --root-key <ID:HEX>`, `rotate-key --envelope <FILE>`, `sync`, `test`, `simulate` | `arc policy trust-init --root-key root-2026:<64-hex>` |
 | `arc intercept` | Intercept and evaluate agent actions against session Taint DAG | `eval`, `read`, `exec`, `mcp`, `prompt`, `hook`, `session` | `arc intercept hook --host claude-code` |
 | `arc trace` | Inspect event causality and export redacted audit evidence | `<EVENT_ID>`, `latest`, `--export <PATH>`, `--json` | `arc trace latest --export trace.json` |
 | `arc doctor` | Check host adapters, policy engine, and cumulative metrics | `--metrics`, `--json` | `arc doctor --metrics` |

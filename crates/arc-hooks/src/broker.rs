@@ -236,6 +236,15 @@ impl McpStdioBroker {
             schema_pin_status: None,
             latency_ms,
             error_class: None,
+            policy_revision: self.evaluator.config.read().ok().map(|c| c.revision_hash()),
+            policy_source: self
+                .evaluator
+                .config
+                .read()
+                .ok()
+                .and_then(|c| c.source)
+                .map(|s| format!("{s:?}").to_ascii_lowercase()),
+            ..Default::default()
         }
         .build(self.telemetry_host_name(), Some("stdio"));
         telemetry.phase = match event.phase {
@@ -268,6 +277,15 @@ impl McpStdioBroker {
             schema_pin_status: schema_status.map(str::to_string),
             latency_ms: 0.0,
             error_class: None,
+            policy_revision: self.evaluator.config.read().ok().map(|c| c.revision_hash()),
+            policy_source: self
+                .evaluator
+                .config
+                .read()
+                .ok()
+                .and_then(|c| c.source)
+                .map(|s| format!("{s:?}").to_ascii_lowercase()),
+            ..Default::default()
         }
         .build(self.telemetry_host_name(), Some("stdio"));
         sink.emit(telemetry);

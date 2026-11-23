@@ -413,40 +413,60 @@ impl PolicyConfig {
             return Ok(None);
         }
 
-        // Load trust store & minimum sequence from env vars first, or fall back to local policy-state.json
-        // written by `arc policy sync`.
         let state_path = path.with_file_name("policy-state.json");
-        let state_json: Option<serde_json::Value> = if state_path.exists() {
-            std::fs::read_to_string(&state_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
+        let verified_store = if state_path.exists() {
+            Some(crate::trust_store::PolicyTrustStore::load_verified(
+                &state_path,
+            )?)
         } else {
             None
         };
 
-        let trusted_keys_raw = std::env::var("ARC_POLICY_TRUSTED_PUBLIC_KEYS")
-            .ok()
-            .or_else(|| {
-                state_json
-                    .as_ref()
-                    .and_then(|v| v.get("trusted_key").and_then(|k| k.as_str()))
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| {
-                "ARC_POLICY_TRUSTED_PUBLIC_KEYS (or .arc/policy-state.json via `arc policy sync`) is required to load .arc/signed_policy.json".to_string()
-            })?;
-        let trusted_keys = parse_trusted_policy_keys(&trusted_keys_raw)?;
-
-        let minimum_sequence = match std::env::var("ARC_POLICY_MIN_SEQUENCE") {
-            Ok(raw) => raw
-                .parse::<u64>()
-                .map_err(|e| format!("ARC_POLICY_MIN_SEQUENCE must be an unsigned integer: {e}"))?,
-            Err(_) => state_json
-                .as_ref()
-                .and_then(|v| v.get("min_sequence").and_then(|s| s.as_u64()))
-                .ok_or_else(|| {
-                    "ARC_POLICY_MIN_SEQUENCE (or .arc/policy-state.json via `arc policy sync`) is required to prevent signed-policy rollback".to_string()
-                })?,
+        let (trusted_keys, minimum_sequence) = if let Ok(env_keys_raw) =
+            std::env::var("ARC_POLICY_TRUSTED_PUBLIC_KEYS")
+        {
+            let mut keys = parse_trusted_policy_keys(&env_keys_raw)?;
+            let mut min_seq = match std::env::var("ARC_POLICY_MIN_SEQUENCE") {
+                    Ok(raw) => raw.parse::<u64>().map_err(|e| {
+                        format!("ARC_POLICY_MIN_SEQUENCE must be an unsigned integer: {e}")
+                    })?,
+                    Err(_) => verified_store
+                        .as_ref()
+                        .map(|s| s.min_sequence)
+                        .ok_or_else(|| {
+                            "ARC_POLICY_MIN_SEQUENCE (or integrity-verified .arc/policy-state.json) is required to prevent signed-policy rollback".to_string()
+                        })?,
+                };
+            if let Some(ref store) = verified_store {
+                // Never allow env min_seq to roll back below persisted monotonic state
+                if store.min_sequence > min_seq {
+                    min_seq = store.min_sequence;
+                }
+                // Honor any cryptographically authorized revocations
+                for rev in &store.revoked_key_ids {
+                    keys.remove(rev);
+                }
+            }
+            if keys.is_empty() {
+                return Err("all configured policy keys have been revoked".to_string());
+            }
+            (keys, min_seq)
+        } else if let Some(ref store) = verified_store {
+            let keys = store.active_key_bytes()?;
+            let mut min_seq = store.min_sequence;
+            if let Ok(raw) = std::env::var("ARC_POLICY_MIN_SEQUENCE") {
+                let env_min = raw.parse::<u64>().map_err(|e| {
+                    format!("ARC_POLICY_MIN_SEQUENCE must be an unsigned integer: {e}")
+                })?;
+                if env_min > min_seq {
+                    min_seq = env_min;
+                }
+            }
+            (keys, min_seq)
+        } else {
+            return Err(
+                    "No anchored policy trust root found. Provision an administrator root key via `arc policy trust-init --root-key <key-id:hex>` or set ARC_POLICY_TRUSTED_PUBLIC_KEYS.".to_string(),
+                );
         };
 
         let content = std::fs::read_to_string(path)

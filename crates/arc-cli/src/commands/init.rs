@@ -156,13 +156,40 @@ pub fn install_secure_at_inception_directives(
     updated
 }
 
-pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
+/// Structured result of `execute_init`, reused by both standalone `arc init` and `arc setup`
+/// so composite onboarding commands can render a single unified summary without leaking
+/// duplicate banners or corrupting `--json` stdout.
+pub struct InitSummary {
+    pub is_workstation_scope: bool,
+    pub path: std::path::PathBuf,
+    pub policy_path: std::path::PathBuf,
+    pub policy_created: bool,
+    pub audit_mode: bool,
+    pub installed_hosts: Vec<&'static str>,
+    pub mcp_registered: Vec<&'static str>,
+    pub directives_installed: Vec<String>,
+    pub hook_warnings: Vec<String>,
+    pub mcp_servers: usize,
+    pub agent_skills: usize,
+    pub model_assets: usize,
+    pub exposed_secrets: usize,
+    pub files_scanned: usize,
+    pub overall_risk_band: String,
+    pub scan_duration_ms: u64,
+    pub truncated: bool,
+}
+
+pub fn execute_init(
+    path: &Path,
+    host: &str,
+    audit_mode: bool,
+    quiet: bool,
+) -> Result<InitSummary, String> {
     if !path.exists() || !path.is_dir() {
-        eprintln!(
-            "[Arc Init] Target directory does not exist: {}",
+        return Err(format!(
+            "Target directory does not exist: {}",
             path.display()
-        );
-        return false;
+        ));
     }
 
     // 1. Ensure .arc/policy.json exists (without clobbering existing user config)
@@ -179,8 +206,7 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
         cfg.require_approval_rules.insert("ARC-MCP-001".to_string());
         cfg.require_approval_rules.insert("ARC-FS-001".to_string());
         if let Err(e) = cfg.save_to_dir(path) {
-            eprintln!("[Arc Init] Failed to write {}: {e}", policy_path.display());
-            return false;
+            return Err(format!("Failed to write {}: {e}", policy_path.display()));
         }
         true
     } else {
@@ -325,7 +351,7 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
         .unwrap_or_else(|| path.display().to_string());
     let scanner = DiscoveryScanner::new();
     let audit_report = if is_workstation_scope {
-        if !json {
+        if !quiet {
             eprintln!(
                 "[Arc Init] Home/root directory detected ({}) — using workstation scope (known IDE/AI config roots only).",
                 display_path
@@ -334,26 +360,18 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
                 "[Arc Init] Tip: Run `arc init` inside a project repository for project-scoped policy & repo audit."
             );
         }
-        match scanner.audit_workstation() {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[Arc Init] Workstation discovery scan failed: {e}");
-                return false;
-            }
-        }
+        scanner
+            .audit_workstation()
+            .map_err(|e| format!("Workstation discovery scan failed: {e}"))?
     } else {
-        if !json {
+        if !quiet {
             eprintln!("[Arc Init] Running quick discovery scan...");
         }
         // Use a deterministic sorted file cap (5,000 non-ignored files) with a generous
         // runaway safety timeout so repeated `arc init` runs always report identical counts.
-        match scanner.audit_directory_bounded(path, 5_000, std::time::Duration::from_secs(30)) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[Arc Init] Discovery scan failed: {e}");
-                return false;
-            }
-        }
+        scanner
+            .audit_directory_bounded(path, 5_000, std::time::Duration::from_secs(30))
+            .map_err(|e| format!("Discovery scan failed: {e}"))?
     };
 
     // Exclude Vexa Arc's own self-managed MCP entry and directive file from the baseline
@@ -361,29 +379,59 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     let (mcp_server_count, agent_skill_count, model_asset_count) =
         summarize_project_discovery(&audit_report);
 
+    Ok(InitSummary {
+        is_workstation_scope,
+        path: path.to_path_buf(),
+        policy_path,
+        policy_created,
+        audit_mode,
+        installed_hosts,
+        mcp_registered,
+        directives_installed,
+        hook_warnings,
+        mcp_servers: mcp_server_count,
+        agent_skills: agent_skill_count,
+        model_assets: model_asset_count,
+        exposed_secrets: audit_report.exposed_secrets.len(),
+        files_scanned: audit_report.files_scanned,
+        overall_risk_band: format!("{:?}", audit_report.overall_risk_band).to_lowercase(),
+        scan_duration_ms: audit_report.scan_duration_ms,
+        truncated: audit_report.truncated,
+    })
+}
+
+pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
+    let summary = match execute_init(path, host, audit_mode, json) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[Arc Init] {e}");
+            return false;
+        }
+    };
+
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "success": true,
-                "scope": if is_workstation_scope { "workstation" } else { "project" },
-                "path": path.display().to_string(),
-                "policy_path": policy_path.display().to_string(),
-                "policy_created": policy_created,
-                "mode": if audit_mode { "audit" } else { "enforce" },
-                "installed_hosts": installed_hosts,
-                "mcp_registered": mcp_registered,
-                "directives_installed": directives_installed,
-                "warnings": hook_warnings,
+                "scope": if summary.is_workstation_scope { "workstation" } else { "project" },
+                "path": summary.path.display().to_string(),
+                "policy_path": summary.policy_path.display().to_string(),
+                "policy_created": summary.policy_created,
+                "mode": if summary.audit_mode { "audit" } else { "enforce" },
+                "installed_hosts": summary.installed_hosts,
+                "mcp_registered": summary.mcp_registered,
+                "directives_installed": summary.directives_installed,
+                "warnings": summary.hook_warnings,
                 "discovery": {
-                    "mcp_servers": mcp_server_count,
-                    "agent_skills": agent_skill_count,
-                    "model_assets": model_asset_count,
-                    "exposed_secrets": audit_report.exposed_secrets.len(),
-                    "files_scanned": audit_report.files_scanned,
-                    "overall_risk_band": format!("{:?}", audit_report.overall_risk_band).to_lowercase(),
-                    "scan_duration_ms": audit_report.scan_duration_ms,
-                    "truncated": audit_report.truncated,
+                    "mcp_servers": summary.mcp_servers,
+                    "agent_skills": summary.agent_skills,
+                    "model_assets": summary.model_assets,
+                    "exposed_secrets": summary.exposed_secrets,
+                    "files_scanned": summary.files_scanned,
+                    "overall_risk_band": summary.overall_risk_band,
+                    "scan_duration_ms": summary.scan_duration_ms,
+                    "truncated": summary.truncated,
                 }
             })
         );
@@ -395,7 +443,7 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     println!("=======================================================");
     println!(
         "Scope:           {}",
-        if is_workstation_scope {
+        if summary.is_workstation_scope {
             "workstation (home/root directory detected)"
         } else {
             "project"
@@ -403,9 +451,9 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     );
     println!(
         "Policy:          {} ({})",
-        policy_path.display(),
-        if policy_created {
-            if audit_mode {
+        summary.policy_path.display(),
+        if summary.policy_created {
+            if summary.audit_mode {
                 "created in audit mode"
             } else {
                 "created"
@@ -416,35 +464,38 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
     );
     println!(
         "IDE Hooks:       {}",
-        if installed_hosts.is_empty() {
+        if summary.installed_hosts.is_empty() {
             "none".to_string()
         } else {
-            installed_hosts.join(", ")
+            summary.installed_hosts.join(", ")
         }
     );
-    if !mcp_registered.is_empty() {
+    if !summary.mcp_registered.is_empty() {
         println!(
             "MCP Server:      registered in {}",
-            mcp_registered.join(", ")
+            summary.mcp_registered.join(", ")
         );
     }
-    if !directives_installed.is_empty() {
-        println!("Directives:      {}", directives_installed.join(", "));
+    if !summary.directives_installed.is_empty() {
+        println!(
+            "Directives:      {}",
+            summary.directives_installed.join(", ")
+        );
     }
     println!(
         "AI Assets:       {} MCP server(s), {} rule/skill file(s), {} model(s)",
-        mcp_server_count, agent_skill_count, model_asset_count
+        summary.mcp_servers, summary.agent_skills, summary.model_assets
     );
     println!(
         "Exposed Secrets: {}",
         format_exposed_secrets_line(
-            audit_report.exposed_secrets.len(),
-            audit_report.files_scanned,
-            audit_report.scan_duration_ms,
-            audit_report.truncated,
+            summary.exposed_secrets,
+            summary.files_scanned,
+            summary.scan_duration_ms,
+            summary.truncated,
         )
     );
-    for w in &hook_warnings {
+    for w in &summary.hook_warnings {
         println!("[WARN] {w}");
     }
     println!("\nNext steps:");
@@ -476,7 +527,7 @@ fn summarize_project_discovery(report: &AuditReport) -> (usize, usize, usize) {
 
 /// Formats the `Exposed Secrets:` summary line, rendering a lower-bound `N+` indicator
 /// whenever a bounded quick-scan was capped so partial results are never mistaken for totals.
-fn format_exposed_secrets_line(
+pub fn format_exposed_secrets_line(
     count: usize,
     files_scanned: usize,
     duration_ms: u64,

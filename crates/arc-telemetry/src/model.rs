@@ -24,6 +24,14 @@ pub struct TelemetryEvent {
     pub latency_ms: f64,
     pub error_class: Option<String>,
     pub telemetry_dropped_before_event: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,14 +47,32 @@ pub struct TelemetryEventBuilder {
     pub schema_pin_status: Option<String>,
     pub latency_ms: f64,
     pub error_class: Option<String>,
+    pub policy_revision: Option<String>,
+    pub policy_source: Option<String>,
+    pub execution_status: Option<String>,
+    pub correlation_id: Option<String>,
 }
 
 impl TelemetryEventBuilder {
     pub fn build(self, host: &str, transport: Option<&str>) -> TelemetryEvent {
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let event_id = Uuid::now_v7();
+        let execution_status = self.execution_status.or_else(|| {
+            Some(
+                match self.decision.as_str() {
+                    "deny" => "blocked",
+                    "approval" => "pending_approval",
+                    "quarantine" => "quarantined",
+                    "allow" => "allowed",
+                    _ => "unknown",
+                }
+                .to_string(),
+            )
+        });
+        let correlation_id = self.correlation_id.or_else(|| Some(event_id.to_string()));
         TelemetryEvent {
-            schema_version: 1,
-            event_id: Uuid::now_v7(),
+            schema_version: 2,
+            event_id,
             occurred_at_unix_ms: now,
             install_id: crate::install_id(),
             developer_id: crate::install_id(),
@@ -66,6 +92,10 @@ impl TelemetryEventBuilder {
             latency_ms: self.latency_ms,
             error_class: self.error_class,
             telemetry_dropped_before_event: 0,
+            policy_revision: self.policy_revision,
+            policy_source: self.policy_source,
+            execution_status,
+            correlation_id,
         }
     }
 }

@@ -212,6 +212,18 @@ jobs:
             exit 1
           fi
 
+      - name: Sign Checksums with Pinned Ed25519 Release Key (Zero-Dependency Verifier)
+        if: ${{ secrets.VEXA_RELEASE_SIGNING_KEY_PEM != '' }}
+        shell: bash
+        env:
+          VEXA_RELEASE_SIGNING_KEY_PEM: ${{ secrets.VEXA_RELEASE_SIGNING_KEY_PEM }}
+        run: |
+          printf '%s\n' "$VEXA_RELEASE_SIGNING_KEY_PEM" > /tmp/vexa-release-key.pem
+          chmod 600 /tmp/vexa-release-key.pem
+          openssl pkeyutl -sign -inkey /tmp/vexa-release-key.pem \
+            -rawin -in artifacts/checksums.txt -out artifacts/checksums.txt.ed25519.sig
+          rm -f /tmp/vexa-release-key.pem
+
       - name: Generate SLSA Build Provenance Attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -241,11 +253,11 @@ jobs:
           body_path: release_notes.md
           files: |
             artifacts/**/*.zip
-            artifacts/checksums.txt
-            artifacts/checksums.txt.bundle
+            artifacts/checksums.txt*
             artifacts/vexa-arc-sbom.spdx.json
           generate_release_notes: true
-          overwrite: true
+          # Releases are immutable: never overwrite already-published release assets
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

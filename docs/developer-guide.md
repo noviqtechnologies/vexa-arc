@@ -260,9 +260,13 @@ Projects can customize runtime governance by placing `.arc/policy.json` or `.arc
 ```
 Setting `"mode": "audit"` runs all policy checks and records taints/audit logs without blocking (`Obligation::AddContext`). `PolicyConfig::try_load_with_precedence(Some(&path))` applies BuiltIn < UserGlobal < ProjectLocal < SignedOrganization precedence (preserving `require_approval_*` settings across layers) and returns an error for unreadable/malformed files. Security-sensitive CLI paths abort rather than silently using defaults. The compatibility `load_with_precedence` wrapper uses a restrictive MCP-deny fallback on errors.
 
-### Signed Organization Policy (Ed25519)
+### Signed Organization Policy, Anchored Trust Root & Key Rotation (Ed25519)
 
-`.arc/signed_policy.json` is accepted only when its Ed25519 signature verifies against a trusted key from `ARC_POLICY_TRUSTED_PUBLIC_KEYS` and its sequence meets `ARC_POLICY_MIN_SEQUENCE`. Provide one or more comma-separated `key-id:64-hex-character-public-key` entries and a managed minimum sequence through environment configuration. Multiple key IDs allow overlap during key rotation; remove revoked keys from the trust list. The public key is 32 bytes and the signature is 64 bytes.
+`.arc/signed_policy.json` is accepted only when its Ed25519 signature verifies against an administrator-provisioned trust anchor (`arc policy trust-init --root-key <key-id:hex>` persisting an integrity-protected `PolicyTrustStore` in `.arc/policy-state.json`, or `ARC_POLICY_TRUSTED_PUBLIC_KEYS`) and its sequence meets the monotonic `min_sequence` floor. `run_policy_sync` **never** accepts a `trusted_key` supplied by the remote policy response.
+
+* **Trust State Integrity (`crates/arc-policy-engine/src/trust_store.rs`):** `.arc/policy-state.json` (format v2) stores `active_keys`, monotonically growing `revoked_key_ids`, `min_sequence`, `rotation_sequence`, and a domain-separated canonical SHA-256 digest (`VEXA-ARC-TRUST-STATE-V1\0` + JCS). State updates reject symlinks and commit atomically (`create_new` temp file + `fsync` + `rename`).
+* **Authorized Key Rotation & Revocation (`KeyRotationEnvelope`):** Adding new signing keys (supporting overlap) or revoking compromised/retired keys requires a `KeyRotationEnvelope` signed over `VEXA-ARC-KEY-ROTATION-V1\0` + JCS by an **already-active, non-revoked** trusted key with a strictly increasing `rotation_sequence` and valid `[issued_at_unix_ms, expires_at_unix_ms]` window. Revoked key IDs can never be re-added, and revoking the last active key is rejected.
+* **Policy Envelope (`VEXA-ARC-POLICY-V1\0`):** Public keys are 32 bytes and Ed25519 signatures are 64 bytes.
 
 ```json
 {

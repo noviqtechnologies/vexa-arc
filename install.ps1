@@ -47,6 +47,56 @@ try {
         throw "Checksum mismatch for $Archive! Expected $ExpectedSha, got $ActualSha"
     }
 
+    # Rollback protection: refuse to silently downgrade an existing newer installation
+    $InstalledExeCheck = Join-Path $InstallDir "arc.exe"
+    if ((Test-Path -LiteralPath $InstalledExeCheck) -and ($env:ARC_ALLOW_DOWNGRADE -ne "1")) {
+        $ExistingOut = & $InstalledExeCheck --version 2>$null
+        if ($ExistingOut -match '(\d+\.\d+\.\d+)') {
+            $ExistingVer = [Version]$Matches[1]
+            $ReqVerStr = ($Tag -replace '^v', '') -split '-' | Select-Object -First 1
+            $ReqVer = [Version]$ReqVerStr
+            if ($ReqVer -lt $ExistingVer) {
+                throw "Rollback rejected: installed version v$ExistingVer is newer than requested $Tag (set ARC_ALLOW_DOWNGRADE=1 to override)."
+            }
+        }
+    }
+
+    # Mandatory publisher signature & provenance verification (fail-closed)
+    $CertIdentity = "https://github.com/$Repo/.github/workflows/release.yml@refs/tags/$Tag"
+    $OidcIssuer = "https://token.actions.githubusercontent.com"
+    $CosignCmd = Get-Command cosign -ErrorAction SilentlyContinue
+    $GhCmd = Get-Command gh -ErrorAction SilentlyContinue
+
+    if ($CosignCmd) {
+        $BundlePath = Join-Path $TmpDir "checksums.txt.bundle"
+        Invoke-WebRequest -Uri "$BaseUrl/checksums.txt.bundle" -OutFile $BundlePath
+        if (-not (Test-Path -LiteralPath $BundlePath) -or ((Get-Item -LiteralPath $BundlePath).Length -eq 0)) {
+            throw "Downloaded checksums.txt.bundle is empty or missing; failing closed."
+        }
+        Write-Host "Verifying Sigstore/Cosign publisher signature for $Tag..."
+        & $CosignCmd.Source verify-blob `
+            --bundle $BundlePath `
+            --certificate-identity $CertIdentity `
+            --certificate-oidc-issuer $OidcIssuer `
+            $ChecksumsPath | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Cosign signature verification failed for $Tag; failing closed."
+        }
+    }
+    elseif ($GhCmd) {
+        Write-Host "Verifying GitHub SLSA build provenance attestation for $Archive..."
+        & $GhCmd.Source attestation verify $ArchivePath `
+            --repo $Repo `
+            --signer-workflow "$Repo/.github/workflows/release.yml" `
+            --source-ref "refs/tags/$Tag" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "GitHub SLSA provenance attestation verification failed for $Archive; failing closed."
+        }
+    }
+    else {
+        throw "Mandatory publisher signature verification requires 'cosign' or 'gh' (GitHub CLI); neither was found in PATH. Failing closed."
+    }
+
     $ExtractDir = Join-Path $TmpDir "extracted"
     Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ExtractDir -Force
     $ExtractedBin = Join-Path $ExtractDir "bin\arc.exe"
