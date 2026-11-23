@@ -351,7 +351,7 @@ Implements Pillar 3 human authorization primitives:
 
 ## 7. Live Registry Checks, Package Heuristics & OSV Scanner (`arc-firewall`)
 
-`arc-firewall::registry` (`fetch_live_registry_metadata`, `PackageFirewall::inspect_package_live`) queries npm, PyPI, and crates.io with a 3-second timeout and 24-hour local cache (`.sca-cache/registry/`), falling back to `inspect_package_protected` when `ARC_OFFLINE=1` or the network is unavailable. `PolicyEvaluator` also evaluates `Action::Shell` package-install commands under rule `ARC-PKG-001`.
+`arc-firewall::registry` (`fetch_live_registry_metadata`, `PackageFirewall::inspect_package_live`) queries npm, PyPI, and crates.io with a 3-second timeout and 24-hour OS user cache (`<vexa-cache>/registry/`, overrideable via `VEXA_CACHE_DIR` / `--cache-dir`), falling back to `inspect_package_protected` when `ARC_OFFLINE=1` or the network is unavailable. `PolicyEvaluator` also evaluates `Action::Shell` package-install commands under rule `ARC-PKG-001`.
 
 `CompoundAntiSlopsquatEngine` evaluates a `PackageRegistryMetadata` value supplied by its caller. The current CLI does not obtain authoritative lifecycle, registry age/download, repository provenance, or recent-404 observations from a registry proxy. Its default popular-package baseline is seeded/heuristic data, not proof of package identity or safety. The implementation now scopes built-in names to ecosystems, case-normalizes typo comparisons, blocks caller-reported dangerous lifecycle signals before any fast path, and returns REVIEW for low-history packages lacking SLSA provenance. These are still only as trustworthy as caller-supplied metadata; they must not be described as live registry enforcement.
 
@@ -369,7 +369,7 @@ Implements Pillar 3 human authorization primitives:
 [`crates/arc-firewall/src/osv_scanner.rs`](file:///c:/vexa-arc/crates/arc-firewall/src/osv_scanner.rs) provides `OsvPackageScanner`:
 
 ```rust
-let scanner = OsvPackageScanner::default(); // local .sca-cache; not an install hook
+let scanner = OsvPackageScanner::default(); // OS user cache (VEXA_CACHE_DIR / --cache-dir); not an install hook
 let result = scanner.scan_package("lodash", "4.17.15", "npm")?;
 
 if result.should_block() {
@@ -382,7 +382,7 @@ if result.should_block() {
 
 Key design decisions:
 - **100% payload locality:** Only `(name, version, ecosystem)` tuples are sent to `api.osv.dev`. No source code, prompts, or credentials leave the host.
-- **Fail-Closed Advisory Policy:** `VulnCache` caches advisories as JSON in `.sca-cache/` with 24-hour TTL. When the network or advisory database is unavailable on a cache miss, or when an unpinned version cannot be resolved, the check fails closed (`OsvOutcome::Incomplete`) to prevent unverified dependencies from bypassing enterprise gates.
+- **Fail-Closed Advisory Policy:** `VulnCache` caches advisories as JSON in the OS user cache directory (`~/.cache/vexa`, `~/Library/Caches/vexa`, `%LOCALAPPDATA%\vexa\cache`, overrideable via `VEXA_CACHE_DIR` / `--cache-dir`) with 24-hour TTL. When the network or advisory database is unavailable on a cache miss, or when an unpinned version cannot be resolved, the check fails closed (`OsvOutcome::Incomplete`) to prevent unverified dependencies from bypassing enterprise gates.
 - **Sync wrapper:** `scan_package()` spawns a `tokio::runtime::Builder::new_current_thread()` runtime internally, keeping `PackageFirewall`'s public API synchronous.
 - **Ecosystem bridge:** `ecosystem_to_osv_str(arc_core::event::Ecosystem)` converts between the arc-core `Ecosystem` enum and OSV string identifiers (`npm`, `PyPI`, `crates.io`, `Go`).
 

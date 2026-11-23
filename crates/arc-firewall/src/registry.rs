@@ -32,11 +32,7 @@ fn now_unix_secs() -> u64 {
 }
 
 fn cache_dir() -> PathBuf {
-    let local = Path::new(".sca-cache").join("registry");
-    if local.exists() || std::fs::create_dir_all(&local).is_ok() {
-        return local;
-    }
-    std::env::temp_dir().join("vexa-arc-registry-cache")
+    crate::cache_paths::registry_cache_dir()
 }
 
 fn cache_file_path(dir: &Path, ecosystem: &str, name: &str) -> PathBuf {

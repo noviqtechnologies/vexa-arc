@@ -2,6 +2,15 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.5.0] - 2026-11-23
+
+### Cross-OS User Cache Directories & `vexa-sca` v1.7.0 Integration
+- **Eliminated Repo-Local `.sca-cache/` (`arc-firewall`, `arc-cli`, `vexa-sca` v1.7.0):**
+  - Migrated all advisory, CISA KEV, EPSS, and registry metadata caches to OS-standard user cache directories (`~/.cache/vexa` on Linux/Unix, `~/Library/Caches/vexa` on macOS, `%LOCALAPPDATA%\vexa\cache` on Windows, with temp-dir fallback for minimal containers).
+  - Added global `--cache-dir <PATH>` CLI flag and `VEXA_CACHE_DIR` environment variable override, propagated across both `arc-firewall` and `vexa-sca`.
+  - Upgraded `vexa-sca` and `vexa-core` dependencies from `v1.5.0` to `v1.7.0`, eliminating all transitive `.sca-cache/` writes during OSV/KEV/EPSS scans.
+  - Updated documentation (`README.md`, `COMPATIBILITY_MATRIX.md`, `docs/developer-guide.md`, `docs/user-guide.md`).
+
 ## [1.4.3] - 2026-11-23
 
 ### Installer Hardening, Release Verification & Hook Clarity

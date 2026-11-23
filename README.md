@@ -368,7 +368,7 @@ arc shield check lodash@4.17.21 --ecosystem npm --json
 1. **Ecosystem-scoped seeded popular-package baseline:** A small static baseline informs heuristic results; it is not registry attestation and cannot authorize a same-named package in another ecosystem.
 2. **Name similarity and lifecycle checks:** Jaro-Winkler/Levenshtein comparisons are case-normalized; a caller-reported dangerous lifecycle signal blocks even a popular/established fast path.
 3. **Caller-supplied 404/provenance fields:** These are inputs to the library engine, not signals collected by a registry proxy in this CLI. New low-history packages without SLSA provenance require review rather than an automatic permit.
-4. **Exact-version OSV scan (`ARC-SCA-001`):** A concrete `name@version` may be checked against OSV with local `.sca-cache` use. No version means no exact-version scan; an unavailable uncached query can be incomplete/fail closed.
+4. **Exact-version OSV scan (`ARC-SCA-001`):** A concrete `name@version` may be checked against OSV with the OS user cache (`VEXA_CACHE_DIR` / `--cache-dir`). No version means no exact-version scan; an unavailable uncached query can be incomplete/fail closed.
 
 ---
 

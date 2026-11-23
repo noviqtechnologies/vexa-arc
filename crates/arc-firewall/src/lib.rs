@@ -1,3 +1,4 @@
+pub mod cache_paths;
 pub mod osv_scanner;
 pub mod proxy;
 pub mod registry;

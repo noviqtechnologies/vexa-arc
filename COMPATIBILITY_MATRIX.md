@@ -42,5 +42,5 @@ This matrix reflects the verified capabilities in `crates/` for **Vexa Arc v1.4.
 ## 3. Network & Offline Behavior
 
 * **Default local commands (`audit`, `bom`, `mcp inventory`, `mcp rollout`, `policy test`, `policy simulate`, `scan-secrets`, `intercept`, `test`):** No cloud upload.
-* **Package/advisory lookups (`arc shield`, `arc sca`, MCP `check_package`):** Query public OSV/EPSS (`api.osv.dev`) and package registries with a 24-hour `.sca-cache` fallback and explicit provenance reporting (`live`, `cache`, `heuristic_fallback`). Set `ARC_OFFLINE=1` or `VEXA_FIREWALL_OFFLINE=1` to disable live network lookups.
+* **Package/advisory lookups (`arc shield`, `arc sca`, MCP `check_package`):** Query public OSV/EPSS (`api.osv.dev`) and package registries with a 24-hour OS user cache (`~/.cache/vexa`, `~/Library/Caches/vexa`, `%LOCALAPPDATA%\vexa\cache`; override via `VEXA_CACHE_DIR` or `--cache-dir`) and explicit provenance reporting (`live`, `cache`, `heuristic_fallback`). Set `ARC_OFFLINE=1` or `VEXA_FIREWALL_OFFLINE=1` to disable live network lookups.
 * **Cloud sync (`arc setup`, `arc policy sync`, `arc telemetry flush`, `arc ci-report --upload`):** Opt-in only; sends secret-redacted posture/event metadata to the configured Vexa Console API.

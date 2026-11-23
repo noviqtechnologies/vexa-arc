@@ -102,7 +102,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arc-cli"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "arc-core",
  "arc-discover",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "arc-core"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "bitflags",
  "chrono",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "arc-discover"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "arc-core",
  "arc-dlp",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "arc-dlp"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "aho-corasick",
  "arc-core",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "arc-firewall"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "arc-core",
  "chrono",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "arc-hooks"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "arc-core",
  "arc-dlp",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "arc-policy-engine"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "arc-core",
  "arc-dlp",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "arc-telemetry"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "arc-core",
  "arc-dlp",
@@ -2818,8 +2818,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vexa-core"
-version = "1.5.0"
-source = "git+https://github.com/noviqtechnologies/vexa-sca?tag=v1.5.0#012b0074914c393ef030042d48f73843c2da2c06"
+version = "1.7.0"
+source = "git+https://github.com/noviqtechnologies/vexa-sca?tag=v1.7.0#d41b659b20dfddb44aec42ea7cce18665f2c3177"
 dependencies = [
  "oxc_allocator",
  "oxc_ast",
@@ -2834,8 +2834,8 @@ dependencies = [
 
 [[package]]
 name = "vexa-sca"
-version = "1.5.0"
-source = "git+https://github.com/noviqtechnologies/vexa-sca?tag=v1.5.0#012b0074914c393ef030042d48f73843c2da2c06"
+version = "1.7.0"
+source = "git+https://github.com/noviqtechnologies/vexa-sca?tag=v1.7.0#d41b659b20dfddb44aec42ea7cce18665f2c3177"
 dependencies = [
  "blake3",
  "chrono",

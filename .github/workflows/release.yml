@@ -217,15 +217,43 @@ jobs:
         env:
           VEXA_RELEASE_SIGNING_KEY_PEM: ${{ secrets.VEXA_RELEASE_SIGNING_KEY_PEM }}
         run: |
-          if [ -z "${VEXA_RELEASE_SIGNING_KEY_PEM:-}" ]; then
+          KEY_RAW="${VEXA_RELEASE_SIGNING_KEY_PEM:-}"
+          if [ -z "$(printf '%s' "$KEY_RAW" | tr -d '[:space:]')" ]; then
             echo "VEXA_RELEASE_SIGNING_KEY_PEM not configured; skipping optional Ed25519 signing."
             exit 0
           fi
-          printf '%s\n' "$VEXA_RELEASE_SIGNING_KEY_PEM" > /tmp/vexa-release-key.pem
-          chmod 600 /tmp/vexa-release-key.pem
-          openssl pkeyutl -sign -inkey /tmp/vexa-release-key.pem \
+
+          KEY_FILE="/tmp/vexa-release-key.pem"
+          trap 'rm -f "$KEY_FILE" "${KEY_FILE}.dec" "${KEY_FILE}.nl"' EXIT
+
+          # Normalize CRLF, base64-encoded PEMs, and literal \n escapes from CI secrets
+          printf '%s\n' "$KEY_RAW" | tr -d '\r' > "$KEY_FILE"
+          if ! grep -qF -- "-----BEGIN " "$KEY_FILE"; then
+            if base64 -d "$KEY_FILE" > "${KEY_FILE}.dec" 2>/dev/null && grep -qF -- "-----BEGIN " "${KEY_FILE}.dec"; then
+              tr -d '\r' < "${KEY_FILE}.dec" > "$KEY_FILE"
+            fi
+            rm -f "${KEY_FILE}.dec"
+          elif grep -qF '\n' "$KEY_FILE"; then
+            sed 's/\\n/\n/g' "$KEY_FILE" > "${KEY_FILE}.nl"
+            mv "${KEY_FILE}.nl" "$KEY_FILE"
+          fi
+          chmod 600 "$KEY_FILE"
+
+          if grep -qF -- "-----BEGIN PUBLIC KEY-----" "$KEY_FILE" && ! grep -qF -- "PRIVATE KEY-----" "$KEY_FILE"; then
+            echo "::error::VEXA_RELEASE_SIGNING_KEY_PEM contains a PUBLIC key instead of a PRIVATE key. Store the private key from 'openssl genpkey -algorithm ED25519'."
+            exit 1
+          fi
+          if grep -qF -- "-----BEGIN OPENSSH PRIVATE KEY-----" "$KEY_FILE"; then
+            echo "::error::VEXA_RELEASE_SIGNING_KEY_PEM is in OpenSSH format. Generate a PKCS#8 PEM key with 'openssl genpkey -algorithm ED25519 -out vexa-release-private.pem'."
+            exit 1
+          fi
+          if ! grep -qE -- "-----BEGIN .*PRIVATE KEY-----" "$KEY_FILE"; then
+            echo "::error::VEXA_RELEASE_SIGNING_KEY_PEM does not contain a valid PEM private key header ('-----BEGIN PRIVATE KEY-----'). Regenerate with 'openssl genpkey -algorithm ED25519' or delete the secret to skip optional Ed25519 signing."
+            exit 1
+          fi
+
+          openssl pkeyutl -sign -inkey "$KEY_FILE" \
             -rawin -in artifacts/checksums.txt -out artifacts/checksums.txt.ed25519.sig
-          rm -f /tmp/vexa-release-key.pem
 
       - name: Generate SLSA Build Provenance Attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

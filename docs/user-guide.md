@@ -468,7 +468,7 @@ Vault Tokens Registered (1):
 
 ### `arc shield`: Live Registry & OSV Package Risk Checks (`ARC-PKG-001`)
 
-`arc shield` evaluates package names and install commands using **live cached registry lookups** (npm, PyPI, crates.io; 24-hour cache in `.sca-cache/registry/`, 3-second timeout, `ARC_OFFLINE=1` for offline fallback) combined with exact-version OSV vulnerability checks when `name@version` or `name==version` is provided. When Claude Code or Cursor hooks are installed, `Bash` / `beforeShellExecution` package-install commands (`npm`, `pnpm`, `yarn`, `pip`, `pip3`, `uv`, `cargo`, `go`) are automatically evaluated under rule `ARC-PKG-001`. Age, download, and `--dangerous-scripts` flags remain available as explicit simulation overrides.
+`arc shield` evaluates package names and install commands using **live cached registry lookups** (npm, PyPI, crates.io; 24-hour OS user cache under `<vexa-cache>/registry/`, overrideable via `VEXA_CACHE_DIR` / `--cache-dir`, 3-second timeout, `ARC_OFFLINE=1` for offline fallback) combined with exact-version OSV vulnerability checks when `name@version` or `name==version` is provided. When Claude Code or Cursor hooks are installed, `Bash` / `beforeShellExecution` package-install commands (`npm`, `pnpm`, `yarn`, `pip`, `pip3`, `uv`, `cargo`, `go`) are automatically evaluated under rule `ARC-PKG-001`. Age, download, and `--dangerous-scripts` flags remain available as explicit simulation overrides.
 
 #### Windows (PowerShell):
 ```powershell
@@ -569,7 +569,7 @@ SUGGESTED ACTION:
 `arc shield check` can invoke the **vexa-sca** OSV scanner when given an exact package version. A bare package name or a command parsed by `arc shield run` is not an exact-version vulnerability scan. This query checks known vulnerability records; it does not establish that a package is benign or detect all malicious packages.
 
 - Exact coordinates may be sent to the public OSV service; source code is not part of the query.
-- A local `.sca-cache` is used, but the repository does not provide an enterprise-managed, pre-warmed air-gap cache process. An unavailable exact-version scan can be incomplete and may fail closed.
+- An OS-standard user cache directory (`~/.cache/vexa`, `~/Library/Caches/vexa`, `%LOCALAPPDATA%\vexa\cache`; override via `VEXA_CACHE_DIR` or `--cache-dir`) is used, but the repository does not provide an enterprise-managed, pre-warmed air-gap cache process. An unavailable exact-version scan can be incomplete and may fail closed.
 - EPSS, when returned by the SCA provider, is a prioritization signal for known vulnerabilities—not a typosquat or malware verdict.
 - `--json` returns CLI JSON output; it is not a JSON-RPC agent remediation channel.
 

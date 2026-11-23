@@ -39,6 +39,10 @@ use arc_telemetry::{
     long_about = "Vexa Arc provides ultra-low latency, zero-dependency pre-execution security for autonomous AI coding agents and MCP interactions."
 )]
 struct Cli {
+    /// Override local advisory/registry cache directory (defaults to OS user cache dir)
+    #[arg(long, global = true, env = "VEXA_CACHE_DIR")]
+    cache_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -1086,6 +1090,9 @@ enum InterceptAction {
 
 fn main() {
     let cli = Cli::parse();
+    if let Some(dir) = cli.cache_dir {
+        arc_firewall::cache_paths::set_cache_dir_override(Some(dir));
+    }
 
     match cli.command {
         Commands::Audit {

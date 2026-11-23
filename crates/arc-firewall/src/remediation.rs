@@ -336,7 +336,7 @@ pub(crate) async fn refine_remediations_against_osv(
     };
 
     let scanner = vexa_sca::scanner::vuln_scanner::VulnScanner::new(Some(
-        vexa_sca::scanner::cache::VulnCache::default(),
+        vexa_sca::scanner::cache::VulnCache::new(&crate::cache_paths::default_cache_dir()),
     ));
 
     for rem in remediations.iter_mut() {

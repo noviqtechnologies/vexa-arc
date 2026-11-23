@@ -1,14 +1,15 @@
 //! # OSV/EPSS Vulnerability Scanner Integration — FR-PKG-005 & FR-PKG-006
 //!
 //! Provides [`OsvPackageScanner`] which wraps `vexa_sca::VulnScanner` to deliver:
-//! - **FR-PKG-005 (P0):** OSV batch-query + EPSS scoring with 24-hour `.sca-cache` fallback
+//! - **FR-PKG-005 (P0):** OSV batch-query + EPSS scoring with 24-hour local cache fallback
 //!   (air-gapped safe; only public package coordinates are queried).
 //! - **FR-PKG-006 (P1):** Structured JSON-RPC-style inline remediation:
 //!   `{"error": "Vulnerable package {name}@{version}; update constraint to >={safe}"}`.
 //!
 //! ## Cross-platform notes
-//! The `.sca-cache` directory is created relative to the current working directory on all
-//! platforms (Windows, Linux, macOS) and requires no OS-specific code.
+//! By default, caches are stored in the OS-standard user cache directory
+//! (`~/.cache/vexa` on Linux, `~/Library/Caches/vexa` on macOS, `%LOCALAPPDATA%\vexa\cache` on Windows),
+//! overrideable via `VEXA_CACHE_DIR` or `--cache-dir`, never inside the scanned repository.
 
 use serde::Serialize;
 use std::path::Path;
@@ -203,10 +204,10 @@ impl PackageScanResult {
 
 /// Cross-platform OSV/EPSS vulnerability scanner for single packages.
 ///
-/// Internally uses `vexa_sca::VulnScanner` with a `.sca-cache` directory
-/// for 24-hour air-gapped caching.  Only public package coordinates
-/// (name + version + ecosystem) are sent to OSV; no source code leaves
-/// the host (100% payload locality).
+/// Internally uses `vexa_sca::VulnScanner` with the OS-standard Vexa user
+/// cache directory (overrideable via `VEXA_CACHE_DIR` / `--cache-dir`)
+/// for 24-hour caching. Only public package coordinates (name + version +
+/// ecosystem) are sent to OSV; no source code leaves the host (100% payload locality).
 pub struct OsvPackageScanner {
     scanner: VulnScanner,
 }
@@ -220,13 +221,12 @@ impl Default for OsvPackageScanner {
 impl OsvPackageScanner {
     /// Creates a new scanner with the given cache directory.
     ///
-    /// If `cache_dir` is `None` the default `.sca-cache` in the current
-    /// working directory is used, enabling air-gapped / offline operation
-    /// after the first successful query.
+    /// If `cache_dir` is `None`, the OS-standard Vexa user cache directory
+    /// (or `VEXA_CACHE_DIR` / `--cache-dir` override) is used.
     pub fn new(cache_dir: Option<&Path>) -> Self {
         let cache = match cache_dir {
             Some(dir) => VulnCache::new(dir),
-            None => VulnCache::default(),
+            None => VulnCache::new(&crate::cache_paths::default_cache_dir()),
         };
         Self {
             scanner: VulnScanner::new(Some(cache)),
