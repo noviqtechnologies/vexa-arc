@@ -40,14 +40,102 @@ function getPlatformTarget(platform = os.platform(), arch = os.arch()) {
   throw new Error(`Unsupported platform: ${platform}/${arch}`);
 }
 
-function getCacheDir(version = resolveVersion()) {
-  validateVersionTag(version);
-  if (process.platform === "win32") {
-    const base = process.env.LOCALAPPDATA || path.join(os.homedir(), ".arc");
-    return path.join(base, "vexa-arc", "bin", version);
+function getCacheRoot(platform = process.platform, env = process.env, homeDir = os.homedir()) {
+  if (platform === "win32") {
+    const base = env.LOCALAPPDATA || path.join(homeDir, ".arc");
+    return path.join(base, "vexa-arc", "bin");
   }
-  const base = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
-  return path.join(base, "vexa-arc", version);
+  const base = env.XDG_CACHE_HOME || path.join(homeDir, ".cache");
+  return path.join(base, "vexa-arc");
+}
+
+function getCacheDir(version = resolveVersion(), cacheRoot = getCacheRoot()) {
+  validateVersionTag(version);
+  return path.join(cacheRoot, version);
+}
+
+function compareSemverTags(a, b) {
+  const ta = parseSemverTuple(a);
+  const tb = parseSemverTuple(b);
+  for (let i = 0; i < 3; i++) {
+    if (ta[i] !== tb[i]) return ta[i] - tb[i];
+  }
+  return 0;
+}
+
+function getHighestInstalledVersion(cacheRoot = getCacheRoot()) {
+  let highest = null;
+  const statePath = path.join(cacheRoot, "installed-version.txt");
+  if (fs.existsSync(statePath)) {
+    const raw = fs.readFileSync(statePath, "utf8").trim();
+    if (TAG_REGEX.test(raw)) {
+      highest = raw;
+    }
+  }
+  if (fs.existsSync(cacheRoot)) {
+    for (const entry of fs.readdirSync(cacheRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !TAG_REGEX.test(entry.name)) continue;
+      const candidateBinDir = path.join(cacheRoot, entry.name, "bin");
+      if (!fs.existsSync(candidateBinDir)) continue;
+      if (!highest || compareSemverTags(entry.name, highest) > 0) {
+        highest = entry.name;
+      }
+    }
+  }
+  return highest;
+}
+
+function recordInstalledVersion(version, cacheRoot = getCacheRoot()) {
+  validateVersionTag(version);
+  fs.mkdirSync(cacheRoot, { recursive: true });
+  const existing = getHighestInstalledVersion(cacheRoot);
+  const next =
+    existing && compareSemverTags(existing, version) > 0 ? existing : version;
+  const statePath = path.join(cacheRoot, "installed-version.txt");
+  const tmpPath = `${statePath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmpPath, `${next}\n`, "utf8");
+  fs.renameSync(tmpPath, statePath);
+  return next;
+}
+
+function computeFileSha256(filePath) {
+  const buf = fs.readFileSync(filePath);
+  return crypto.createHash("sha256").update(buf).digest("hex").toLowerCase();
+}
+
+function getCachedBinaryHashPath(binPath) {
+  return `${binPath}.sha256`;
+}
+
+function writeCachedBinaryHash(binPath) {
+  const digest = computeFileSha256(binPath);
+  const hashPath = getCachedBinaryHashPath(binPath);
+  const tmpPath = `${hashPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmpPath, `${digest}\n`, "utf8");
+  fs.renameSync(tmpPath, hashPath);
+  return digest;
+}
+
+function verifyCachedBinary(binPath) {
+  const hashPath = getCachedBinaryHashPath(binPath);
+  if (!fs.existsSync(hashPath)) {
+    throw new Error(
+      `Cached binary integrity digest missing at ${hashPath}; failing closed (remove cache directory to re-download and re-verify)`
+    );
+  }
+  const expected = fs.readFileSync(hashPath, "utf8").trim().toLowerCase();
+  if (!SHA256_REGEX.test(expected)) {
+    throw new Error(
+      `Malformed cached binary SHA-256 digest at ${hashPath}; failing closed`
+    );
+  }
+  const actual = computeFileSha256(binPath);
+  if (actual !== expected) {
+    throw new Error(
+      `Cached binary SHA-256 mismatch for ${binPath}: expected ${expected}, got ${actual}; failing closed`
+    );
+  }
+  return actual;
 }
 
 function downloadBuffer(url, redirects = 5) {
@@ -248,6 +336,7 @@ function verifyPublisherSignature({
   }
 
   // 2. Fallback to GitHub CLI SLSA provenance verification against the archive
+  let ghAuthSkipped = null;
   const ghProbe = spawnFn("gh", ["--version"], { stdio: "pipe" });
   if (!ghProbe.error && ghProbe.status === 0) {
     const res = spawnFn(
@@ -265,13 +354,23 @@ function verifyPublisherSignature({
       ],
       { stdio: "pipe", encoding: "utf8" }
     );
-    if (res.error || res.status !== 0) {
-      const detail = (res.stderr || res.error?.message || "unknown error").trim();
+    if (!res.error && res.status === 0) {
+      return { verifier: "gh-attestation", identity: certIdentity };
+    }
+    const detail = (res.stderr || res.error?.message || "unknown error").trim();
+    const isUnauthenticated =
+      /gh auth login|GH_TOKEN|not logged into any GitHub hosts|authentication required/i.test(
+        detail
+      );
+    // Only fall through to Ed25519 if `gh` is unauthenticated and an Ed25519 key is configured;
+    // actual attestation verification failures always fail closed immediately.
+    if (isUnauthenticated && resolveReleasePublicKeyPem(publicKeyPem)) {
+      ghAuthSkipped = detail;
+    } else {
       throw new Error(
         `GitHub SLSA provenance attestation verification failed for ${tag}: ${detail}`
       );
     }
-    return { verifier: "gh-attestation", identity: certIdentity };
   }
 
   // 3. Zero-dependency native Node.js Ed25519 verification against pinned release public key
@@ -290,29 +389,45 @@ function verifyPublisherSignature({
     return { verifier: "ed25519-native", identity: "pinned-release-key" };
   }
 
+  const extra = ghAuthSkipped ? ` (gh CLI was unauthenticated: ${ghAuthSkipped})` : "";
   throw new Error(
-    `Mandatory publisher signature verification requires 'cosign', 'gh' (GitHub CLI), or a pinned Ed25519 release public key (ARC_RELEASE_PUBLIC_KEY_PEM/FILE); none was found. Failing closed.`
+    `Mandatory publisher signature verification requires 'cosign', authenticated 'gh' (run 'gh auth login' or set GH_TOKEN), or a pinned Ed25519 release public key (ARC_RELEASE_PUBLIC_KEY_PEM/FILE); none was available${extra}. Failing closed.`
   );
 }
 
-async function ensureBinary() {
-  const version = resolveVersion();
-  const { target, bin } = getPlatformTarget();
-  const cacheDir = getCacheDir(version);
+async function ensureBinary(options = {}) {
+  const version = validateVersionTag(options.version || resolveVersion());
+  const { target, bin } = options.platformTarget || getPlatformTarget();
+  const cacheRoot = options.cacheRoot || getCacheRoot();
+  const allowDowngrade =
+    options.allowDowngrade !== undefined
+      ? Boolean(options.allowDowngrade)
+      : process.env.ARC_ALLOW_DOWNGRADE === "1";
+
+  // Enforce rollback protection before serving a cached binary or downloading an older release
+  const installedVersion = getHighestInstalledVersion(cacheRoot);
+  checkVersionRollback(version, installedVersion, allowDowngrade);
+
+  const cacheDir = getCacheDir(version, cacheRoot);
   const cachedBin = path.join(cacheDir, "bin", bin);
   if (fs.existsSync(cachedBin)) {
+    verifyCachedBinary(cachedBin);
     return cachedBin;
   }
+
+  const downloadFn = options.downloadFn || downloadBuffer;
+  const verifySigFn = options.verifyPublisherSignatureFn || verifyPublisherSignature;
+  const extractFn = options.extractFn || extractBinary;
 
   const archiveName = `vexa-arc-${version}-${target}.zip`;
   const baseUrl = `https://github.com/${REPO}/releases/download/${version}`;
   process.stderr.write(`[arc] Downloading ${archiveName}...\n`);
 
   const [archiveBuf, checksumsBuf, bundleBuf, ed25519SigBuf] = await Promise.all([
-    downloadBuffer(`${baseUrl}/${archiveName}`),
-    downloadBuffer(`${baseUrl}/checksums.txt`),
-    downloadBuffer(`${baseUrl}/checksums.txt.bundle`).catch(() => null),
-    downloadBuffer(`${baseUrl}/checksums.txt.ed25519.sig`).catch(() => null),
+    downloadFn(`${baseUrl}/${archiveName}`),
+    downloadFn(`${baseUrl}/checksums.txt`),
+    downloadFn(`${baseUrl}/checksums.txt.bundle`).catch(() => null),
+    downloadFn(`${baseUrl}/checksums.txt.ed25519.sig`).catch(() => null),
   ]);
 
   verifyArchiveChecksum(
@@ -331,14 +446,18 @@ async function ensureBinary() {
   if (bundleBuf) fs.writeFileSync(tmpBundle, bundleBuf);
   if (ed25519SigBuf) fs.writeFileSync(tmpEdSig, ed25519SigBuf);
   try {
-    verifyPublisherSignature({
+    verifySigFn({
       checksumsPath: tmpChecksums,
       bundlePath: bundleBuf ? tmpBundle : null,
       ed25519SigPath: ed25519SigBuf ? tmpEdSig : null,
       archivePath: tmpZip,
       tag: version,
+      publicKeyPem: options.publicKeyPem || null,
     });
-    return extractBinary(tmpZip, cacheDir, bin);
+    const extractedBin = extractFn(tmpZip, cacheDir, bin);
+    writeCachedBinaryHash(extractedBin);
+    recordInstalledVersion(version, cacheRoot);
+    return extractedBin;
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -361,11 +480,17 @@ if (require.main === module) {
 module.exports = {
   validateVersionTag,
   getPlatformTarget,
+  getCacheRoot,
   getCacheDir,
+  getHighestInstalledVersion,
+  recordInstalledVersion,
+  verifyCachedBinary,
+  writeCachedBinaryHash,
   verifyArchiveChecksum,
   expectedCertificateIdentity,
   checkVersionRollback,
   verifyEd25519Signature,
   verifyPublisherSignature,
   extractBinary,
+  ensureBinary,
 };

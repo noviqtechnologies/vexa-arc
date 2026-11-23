@@ -17,6 +17,8 @@ const {
   expectedCertificateIdentity,
   checkVersionRollback,
   verifyPublisherSignature,
+  verifyCachedBinary,
+  ensureBinary,
 } = require("../../npm/bin/arc");
 
 async function run() {
@@ -305,6 +307,141 @@ async function run() {
         }),
       /Mandatory publisher signature verification requires/
     );
+
+    // 7. Unauthenticated `gh` falls through to Ed25519 when a pinned key is configured,
+    //    while actual attestation mismatch still fails closed immediately
+    const ghUnauthFallback = verifyPublisherSignature({
+      checksumsPath: tmpChecksums,
+      bundlePath: null,
+      ed25519SigPath: tmpEdSig,
+      archivePath: tmpArchive,
+      tag: "v1.4.1",
+      publicKeyPem: edPubPem,
+      spawnFn: (cmd, args) => {
+        if (cmd === "cosign") return { error: new Error("ENOENT"), status: null };
+        if (cmd === "gh" && args[0] === "--version") return { status: 0 };
+        return {
+          status: 1,
+          stderr: "To get started with GitHub CLI, please run: gh auth login",
+        };
+      },
+    });
+    assert.strictEqual(ghUnauthFallback.verifier, "ed25519-native");
+
+    assert.throws(
+      () =>
+        verifyPublisherSignature({
+          checksumsPath: tmpChecksums,
+          bundlePath: null,
+          ed25519SigPath: tmpEdSig,
+          archivePath: tmpArchive,
+          tag: "v1.4.1",
+          publicKeyPem: edPubPem,
+          spawnFn: (cmd, args) => {
+            if (cmd === "cosign") return { error: new Error("ENOENT"), status: null };
+            if (cmd === "gh" && args[0] === "--version") return { status: 0 };
+            return { status: 1, stderr: "attestation verification failed: signer mismatch" };
+          },
+        }),
+      /GitHub SLSA provenance attestation verification failed/
+    );
+
+    // 8. End-to-end ensureBinary(): download -> verify -> cache hash -> cache hit -> tamper rejection -> rollback rejection
+    const cacheRoot = path.join(tmpDir, "arc-cache-root");
+    let downloadCalls = 0;
+    const binName = process.platform === "win32" ? "arc.exe" : "arc";
+    const platformTarget = { target: "linux-x86_64", bin: binName };
+    const makeDownloads = (ver) => {
+      const archName = `vexa-arc-${ver}-${platformTarget.target}.zip`;
+      const archBytes = Buffer.from(`archive-for-${ver}`, "utf8");
+      const sha = crypto.createHash("sha256").update(archBytes).digest("hex");
+      const checksums = Buffer.from(`# SHA-256 Digests\n${sha}  ${archName}\n`, "utf8");
+      return async (url) => {
+        downloadCalls += 1;
+        if (url.endsWith(archName)) return archBytes;
+        if (url.endsWith("/checksums.txt")) return checksums;
+        if (url.endsWith("/checksums.txt.bundle")) return Buffer.from("{}", "utf8");
+        throw new Error(`HTTP 404 fetching ${url}`);
+      };
+    };
+    const fakeExtract = (_zipPath, destDir, bin) => {
+      const outDir = path.join(destDir, "bin");
+      fs.mkdirSync(outDir, { recursive: true });
+      const outBin = path.join(outDir, bin);
+      fs.writeFileSync(outBin, "verified-arc-binary-bytes", "utf8");
+      return outBin;
+    };
+
+    const installedV142 = await ensureBinary({
+      version: "v1.4.2",
+      platformTarget,
+      cacheRoot,
+      downloadFn: makeDownloads("v1.4.2"),
+      verifyPublisherSignatureFn: () => ({ verifier: "mock-cosign" }),
+      extractFn: fakeExtract,
+    });
+    assert.ok(fs.existsSync(installedV142));
+    assert.ok(fs.existsSync(`${installedV142}.sha256`));
+    const callsAfterFirst = downloadCalls;
+
+    // Second call hits verified cache without re-downloading
+    const cachedHit = await ensureBinary({
+      version: "v1.4.2",
+      platformTarget,
+      cacheRoot,
+      downloadFn: makeDownloads("v1.4.2"),
+      verifyPublisherSignatureFn: () => ({ verifier: "mock-cosign" }),
+      extractFn: fakeExtract,
+    });
+    assert.strictEqual(cachedHit, installedV142);
+    assert.strictEqual(downloadCalls, callsAfterFirst, "Cache hit must not re-download");
+
+    // Silent downgrade to v1.4.1 must be rejected by ensureBinary()
+    await assert.rejects(
+      () =>
+        ensureBinary({
+          version: "v1.4.1",
+          platformTarget,
+          cacheRoot,
+          allowDowngrade: false,
+          downloadFn: makeDownloads("v1.4.1"),
+          verifyPublisherSignatureFn: () => ({ verifier: "mock-cosign" }),
+          extractFn: fakeExtract,
+        }),
+      /Rollback rejected/
+    );
+
+    // Explicit allowDowngrade permits installing v1.4.1
+    const downgraded = await ensureBinary({
+      version: "v1.4.1",
+      platformTarget,
+      cacheRoot,
+      allowDowngrade: true,
+      downloadFn: makeDownloads("v1.4.1"),
+      verifyPublisherSignatureFn: () => ({ verifier: "mock-cosign" }),
+      extractFn: fakeExtract,
+    });
+    assert.ok(fs.existsSync(downgraded));
+
+    // Tampering with cached binary must fail closed on next invocation
+    fs.writeFileSync(installedV142, "tampered-binary-bytes", "utf8");
+    assert.throws(() => verifyCachedBinary(installedV142), /Cached binary SHA-256 mismatch/);
+    await assert.rejects(
+      () =>
+        ensureBinary({
+          version: "v1.4.2",
+          platformTarget,
+          cacheRoot,
+          downloadFn: makeDownloads("v1.4.2"),
+          verifyPublisherSignatureFn: () => ({ verifier: "mock-cosign" }),
+          extractFn: fakeExtract,
+        }),
+      /Cached binary SHA-256 mismatch/
+    );
+
+    // Missing sidecar digest must also fail closed
+    fs.unlinkSync(`${installedV142}.sha256`);
+    assert.throws(() => verifyCachedBinary(installedV142), /Cached binary integrity digest missing/);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

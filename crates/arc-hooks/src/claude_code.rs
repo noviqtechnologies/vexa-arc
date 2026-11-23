@@ -30,6 +30,27 @@ const DLP_UNAPPLIED_REDACTION_MESSAGE: &str = concat!(
 /// reported to the taint tracker via a PostToolUse hook.
 const POST_MATCHER: &str = "WebFetch|WebSearch|mcp__.*";
 
+/// Non-blocking Claude Code lifecycle events explicitly allowed through with no action events.
+const IGNORED_LIFECYCLE_EVENTS: [&str; 7] = [
+    "Notification",
+    "Stop",
+    "SubagentStop",
+    "SessionStart",
+    "SessionEnd",
+    "PreCompact",
+    "PermissionRequest",
+];
+
+impl ClaudeCodeAdapter {
+    /// Returns `true` when `event_name` is a documented non-blocking Claude Code lifecycle
+    /// notification that Arc intentionally ignores.
+    pub fn is_ignored_lifecycle_event(event_name: &str) -> bool {
+        IGNORED_LIFECYCLE_EVENTS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(event_name))
+    }
+}
+
 fn str_field<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| v.get(*k).and_then(|x| x.as_str()))
 }
@@ -118,6 +139,11 @@ impl HostAdapter for ClaudeCodeAdapter {
                 return Err(AdapterError::Malformed(format!(
                     "missing tool_name in Claude Code {event_name} hook payload"
                 )));
+            }
+            if !Self::is_ignored_lifecycle_event(event_name) {
+                eprintln!(
+                    "[Arc Hook] Ignoring unrecognized Claude Code hook event '{event_name}' (not in mediated or ignored lifecycle allowlist)"
+                );
             }
             return Ok(Vec::new());
         };
@@ -589,6 +615,28 @@ mod tests {
     fn unmediated_builtin_tools_produce_no_events() {
         let e = decode(serde_json::json!({"tool_name":"TodoWrite","tool_input":{}}));
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn ignored_and_unrecognized_lifecycle_events_are_explicitly_handled() {
+        assert!(ClaudeCodeAdapter::is_ignored_lifecycle_event(
+            "Notification"
+        ));
+        assert!(ClaudeCodeAdapter::is_ignored_lifecycle_event("stop"));
+        assert!(!ClaudeCodeAdapter::is_ignored_lifecycle_event(
+            "FutureCustomEvent"
+        ));
+
+        let known_ignored = decode(serde_json::json!({
+            "hook_event_name": "Notification",
+            "message": "Agent finished turn"
+        }));
+        assert!(known_ignored.is_empty());
+
+        let unknown_no_tool = decode(serde_json::json!({
+            "hook_event_name": "FutureCustomEvent"
+        }));
+        assert!(unknown_no_tool.is_empty());
     }
 
     #[test]

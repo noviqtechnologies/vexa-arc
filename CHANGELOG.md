@@ -2,6 +2,22 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.4.3] - 2026-11-23
+
+### Installer Hardening, Release Verification & Hook Clarity
+- **npm Launcher Rollback & Cache Integrity (`npm/bin/arc.js`):**
+  - Wired `checkVersionRollback` into `ensureBinary()` using persisted highest-installed version state (`installed-version.txt` + cache scan) across Windows, macOS, and Linux; silent downgrades fail closed unless `ARC_ALLOW_DOWNGRADE=1`.
+  - Added cached-binary SHA-256 sidecar verification (`<bin>.sha256`) re-checked on every cache hit; missing or tampered cache digests fail closed.
+  - Updated `gh attestation verify` fallback so unauthenticated `gh` falls through to pinned Ed25519 verification when configured, while genuine attestation mismatches still fail closed immediately.
+- **Cross-OS Release Smoke-Test Gate (`.github/workflows/release.yml`):**
+  - Added `verify-release` (`ubuntu-latest`, `macos-latest`, `windows-latest`) running `npm/bin/arc.js --version` cold and cached against the live published GitHub Release before `publish-npm` executes, preventing npm/GitHub version drift.
+- **Explicit Hook Lifecycle Allowlists (`arc-hooks`):**
+  - Added explicit `IGNORED_LIFECYCLE_EVENTS` allowlists to `ClaudeCodeAdapter` and `CursorAdapter`, emitting a stderr diagnostic for unrecognized non-mediated event names while keeping malformed mediated payloads fail-closed.
+- **macOS HTTP Proxy Rate-Limit Fix (`arc-hooks`):**
+  - Fixed BSD `ECONNRESET` race when reading `429 Too Many Requests` status lines on macOS.
+- **Documentation Sync (`README.md`, `npm/README.md`, `docs/user-guide.md`, `install.sh`, `install.ps1`):**
+  - Documented mandatory fail-closed verifier prerequisites (`cosign`, authenticated `gh`, or pinned Ed25519 key), cached-binary integrity checks, and rollback override behavior consistently across all installers and guides.
+
 ## [1.4.2] - 2026-11-23
 
 ### Security & Trust-Plane Hardening (P0/P1)

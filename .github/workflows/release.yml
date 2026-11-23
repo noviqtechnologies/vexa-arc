@@ -261,9 +261,57 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  verify-release:
+    name: Smoke-Test Published Release (${{ matrix.os }})
+    needs: [release]
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '20'
+
+      - name: Extract version
+        shell: bash
+        run: |
+          VERSION=$(grep -m 1 "^version = " Cargo.toml | cut -d '"' -f 2)
+          echo "VERSION=v$VERSION" >> "$GITHUB_ENV"
+          echo "RAW_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Verify live GitHub Release assets & npm launcher cold/cached execution
+        shell: bash
+        env:
+          ARC_VERSION: ${{ env.VERSION }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SMOKE_CACHE="$(mktemp -d)"
+          export XDG_CACHE_HOME="$SMOKE_CACHE"
+          export LOCALAPPDATA="$SMOKE_CACHE"
+
+          # Cold download + SHA-256 + SLSA provenance verification + extract + execute
+          OUT1="$(node npm/bin/arc.js --version)"
+          echo "Cold run output: $OUT1"
+          echo "$OUT1" | grep -F "$RAW_VERSION"
+
+          # Warm cache hit + cached binary SHA-256 re-verification
+          OUT2="$(node npm/bin/arc.js --version)"
+          echo "Cached run output: $OUT2"
+          echo "$OUT2" | grep -F "$RAW_VERSION"
+
+          rm -rf "$SMOKE_CACHE"
+
   publish-npm:
     name: Publish @vexasec/arc to npm
-    needs: [release]
+    needs: [release, verify-release]
     runs-on: ubuntu-latest
     permissions:
       contents: read

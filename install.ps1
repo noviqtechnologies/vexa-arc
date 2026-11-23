@@ -94,7 +94,7 @@ try {
         }
     }
     else {
-        throw "Mandatory publisher signature verification requires 'cosign' or 'gh' (GitHub CLI); neither was found in PATH. Failing closed."
+        throw "Mandatory publisher signature verification requires 'cosign' or authenticated 'gh' (run 'gh auth login' or set GH_TOKEN); neither was found in PATH. Failing closed."
     }
 
     $ExtractDir = Join-Path $TmpDir "extracted"

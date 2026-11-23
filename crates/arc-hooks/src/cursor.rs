@@ -35,6 +35,25 @@ const BEFORE_EVENTS: [&str; 3] = [
 ];
 const AFTER_EVENTS: [&str; 1] = ["afterMCPExecution"];
 
+/// Non-blocking Cursor lifecycle notifications explicitly allowed through with no action events.
+const IGNORED_LIFECYCLE_EVENTS: [&str; 5] = [
+    "afterFileEdit",
+    "afterShellExecution",
+    "stop",
+    "sessionStart",
+    "sessionEnd",
+];
+
+impl CursorAdapter {
+    /// Returns `true` when `event_name` is a documented non-blocking Cursor lifecycle
+    /// notification that Arc intentionally ignores.
+    pub fn is_ignored_lifecycle_event(event_name: &str) -> bool {
+        IGNORED_LIFECYCLE_EVENTS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(event_name))
+    }
+}
+
 fn server_identity(name: String) -> ServerIdentity {
     ServerIdentity {
         config_name: name,
@@ -133,7 +152,12 @@ impl HostAdapter for CursorAdapter {
                     },
                 )
             } else {
-                // afterFileEdit and similar notifications cannot be blocked; ignore.
+                if !Self::is_ignored_lifecycle_event(event_name) {
+                    eprintln!(
+                        "[Arc Hook] Ignoring unrecognized Cursor file hook event '{event_name}' (not in mediated or ignored lifecycle allowlist)"
+                    );
+                }
+                // afterFileEdit and similar post-hoc notifications cannot be blocked.
                 return Ok(Vec::new());
             }
         } else if let Some(cmd) = val.get("command").and_then(|c| c.as_str()) {
@@ -196,6 +220,11 @@ impl HostAdapter for CursorAdapter {
                 }
             )));
         } else {
+            if !Self::is_ignored_lifecycle_event(event_name) {
+                eprintln!(
+                    "[Arc Hook] Ignoring unrecognized Cursor hook event '{event_name}' (not in mediated or ignored lifecycle allowlist)"
+                );
+            }
             return Ok(Vec::new());
         };
 
@@ -588,5 +617,25 @@ mod tests {
                 OsPrincipal::Uid(1000)
             )
             .is_err());
+    }
+
+    #[test]
+    fn ignored_and_unrecognized_cursor_lifecycle_events_are_explicitly_handled() {
+        assert!(CursorAdapter::is_ignored_lifecycle_event("afterFileEdit"));
+        assert!(CursorAdapter::is_ignored_lifecycle_event("stop"));
+        assert!(!CursorAdapter::is_ignored_lifecycle_event(
+            "futureCursorEvent"
+        ));
+
+        let known_ignored = decode(serde_json::json!({
+            "hook_event_name": "afterFileEdit",
+            "file_path": "/w/src/lib.rs"
+        }));
+        assert!(known_ignored.is_empty());
+
+        let unknown_event = decode(serde_json::json!({
+            "hook_event_name": "futureCursorEvent"
+        }));
+        assert!(unknown_event.is_empty());
     }
 }

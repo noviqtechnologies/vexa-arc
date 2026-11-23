@@ -150,8 +150,8 @@ elif command -v openssl >/dev/null 2>&1 && [ -n "${ARC_RELEASE_PUBLIC_KEY_FILE:-
   openssl pkeyutl -verify -pubin -inkey "$ARC_RELEASE_PUBLIC_KEY_FILE" \
     -rawin -in "$TMP_DIR/checksums.txt" -sigfile "$TMP_DIR/checksums.txt.ed25519.sig" >/dev/null
 else
-  echo "Error: Mandatory publisher signature verification requires 'cosign', 'gh' (GitHub CLI), or ARC_RELEASE_PUBLIC_KEY_FILE with 'openssl'; none was available. Failing closed." >&2
-  echo "Install cosign (https://docs.sigstore.dev/cosign/system_config/installation/) or gh (https://cli.github.com/) and re-run." >&2
+  echo "Error: Mandatory publisher signature verification requires 'cosign', authenticated 'gh' (run 'gh auth login' or set GH_TOKEN), or ARC_RELEASE_PUBLIC_KEY_FILE with 'openssl'; none was available. Failing closed." >&2
+  echo "Install cosign (https://docs.sigstore.dev/cosign/system_config/installation/) or authenticate gh (https://cli.github.com/) and re-run." >&2
   exit 1
 fi
 
