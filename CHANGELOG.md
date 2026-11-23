@@ -2,6 +2,30 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.4.0] - 2026-11-23
+
+### Security & Runtime Fixes (P0)
+- **Native Hook DLP Fail-Closed Enforcement (`arc-cli`):** Fixed a critical bypass in `run_intercept_hook` where `ARC-DLP-001` (`Verdict::Allow { obligations: [Obligation::Redact] }`) was skipped by `!verdict.is_allowed()`, silently allowing raw secrets in shell commands, MCP arguments, and prompts across all 5 host adapters. Native Pre-phase hooks now reliably fail closed (exit code 2 / deny) and emit `ARC-DLP-001` audit and cloud telemetry records.
+- **Managed MCP Stdio Broker Reliability (`arc-hooks`):** Fixed two concurrency/lifecycle bugs in `McpStdioBroker::run_stdio`:
+  - Added a `Condvar` synchronization barrier for in-flight `tools/list` exchanges so pipelined `tools/call` frames wait for trusted schema pin verification instead of racing into false `ARC-MCP-003` denials.
+  - Fixed premature child termination on host stdin EOF: `run_stdio` now closes child stdin first and waits for the relay thread to drain all pending JSON-RPC responses (with a bounded 5s grace timeout) before terminating the child process tree, fixing silent empty exits under `--allow-tofu` and pipelined sessions across Windows, macOS, and Linux.
+
+### Hardened Defaults & False-Positive Reduction (P1)
+- **Standalone Sensitive Path (`ARC-FS-001`) & Destructive Command (`ARC-CMD-001`) Rules (`arc-policy-engine`, `arc-cli`):**
+  - Added `protect_sensitive_paths` (`ARC-FS-001`) protecting `.env`, `.env.*`, `~/.ssh/*`, `~/.aws/*`, `*.pem`, `*.key`, and credential stores across Unix and Windows, and `protect_destructive_commands` (`ARC-CMD-001`, enabled by default) blocking `rm -rf`, `Remove-Item -Recurse -Force`, `rmdir /s /q`, `curl/wget/iwr | sh/bash/iex`, `git push --force`, `git reset --hard`, `git clean -fd`, `chmod 777`, and disk wipes.
+  - Hardened `arc init` generated `.arc/policy.json` to enable `block_unapproved_mcp: true`, `protect_sensitive_paths: true`, `protect_destructive_commands: true`, and `require_approval_rules: ["ARC-MCP-001", "ARC-FS-001"]`, while including `vexa-arc` in `allowed_mcp_servers` and dynamically pinning `vexa-arc` in `.arc/mcp-pins.lock`.
+- **`.env.example` & Benign File Taint Exclusion (`arc-policy-engine`):** Excluded environment template files (`.env.example`, `.env.sample`, `.env.template`, `.env.dist`, `.env.defaults`, `.env.schema`) and public docs (`README.md`, `LICENSE`, `CHANGELOG.md`) from sensitive path classification and session taint, eliminating `ARC-LTT-001` false positives on example files.
+
+### Consistency, Inventory & Cloud Telemetry Parity (P2)
+- **Unified Secret Scanning & Zero-Allocation Prefilter (`arc-discover`, `arc-dlp`, `arc-cli`):**
+  - Upgraded `DiscoveryScanner::inspect_file` to scan all non-binary repository files up to 2 MB so `arc audit`, `arc ci-report`, `arc scan-secrets`, and MCP `audit_ai_assets` / `scan_secrets` report identical secret findings.
+  - Replaced per-file `to_ascii_lowercase()` heap allocations in `SecretScanEngine::scan` with a case-insensitive Aho-Corasick automaton.
+  - Fixed `arc audit --json --output-bom` printing plain text to stdout before the JSON payload.
+- **Claude Code `UserPromptSubmit` & Full 5-Host Inventory Parity (`arc-hooks`, `arc-cli`):**
+  - Wired `UserPromptSubmit` installation, uninstallation, and decoding in `ClaudeCodeAdapter`.
+  - Updated `arc mcp inventory` coverage contracts (`rollout.rs`) to accurately reflect `pre_and_post_hook` automatic installer parity for `windsurf`, `codex-cli`, and `gemini-cli`.
+- **Heartbeat Policy Source Disambiguation (`arc-telemetry`, `arc-cli`):** Added `policy_source` and `signed_policy_synced` fields to `CloudArcHeartbeat` so Vexa Cloud Console can distinguish local `.arc/policy.json` enforcement at sequence 0 from synced signed organization policies.
+
 ## [1.3.0] - 2026-11-22
 
 ### Security & Correctness Fixes (P0)

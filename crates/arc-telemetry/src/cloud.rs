@@ -591,6 +591,10 @@ pub struct CloudArcHeartbeat {
     pub arc_version: String,
     pub policy_mode: String,
     pub active_policy_seq: i64,
+    #[serde(default)]
+    pub policy_source: String,
+    #[serde(default)]
+    pub signed_policy_synced: bool,
     pub doctor_status: String,
 }
 

@@ -15,6 +15,7 @@ pub struct SecretFinding {
 
 pub struct SecretScanEngine {
     ac: AhoCorasick,
+    ac_ci: AhoCorasick,
     regex_aws_key: Regex,
     regex_aws_secret: Regex,
     regex_github_pat: Regex,
@@ -67,8 +68,15 @@ impl SecretScanEngine {
             .build(&patterns)
             .expect("Failed to build Aho-Corasick automaton");
 
+        let ac_ci = AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .match_kind(MatchKind::Standard)
+            .build(["aws_secret", "secret_key"])
+            .expect("Failed to build case-insensitive Aho-Corasick automaton");
+
         Self {
             ac,
+            ac_ci,
             regex_aws_key: Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(),
             regex_aws_secret: Regex::new(r#"(?i)(?:aws_secret_access_key|secret_key|aws_secret)\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})["']?"#).unwrap(),
             regex_github_pat: Regex::new(r"\bghp_[0-9a-zA-Z]{36}\b").unwrap(),
@@ -97,15 +105,9 @@ impl SecretScanEngine {
 
         let mut findings = Vec::new();
 
-        // Stage 1: Quick Aho-Corasick check
-        let has_any_match = self.ac.find(data).is_some();
-        if !has_any_match {
-            // Case-insensitive fallback for env-var style secret assignments
-            // (e.g. AWS_SECRET_ACCESS_KEY=..., SECRET_KEY=...) that lack a fixed token prefix.
-            let lower = text.to_ascii_lowercase();
-            if !lower.contains("aws_secret") && !lower.contains("secret_key") {
-                return findings;
-            }
+        // Stage 1: Zero-allocation Aho-Corasick prefilter (exact prefixes + case-insensitive env-var names)
+        if self.ac.find(data).is_none() && self.ac_ci.find(data).is_none() {
+            return findings;
         }
 
         // AWS Access Key ID

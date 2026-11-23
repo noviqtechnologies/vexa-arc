@@ -6,7 +6,7 @@ branding:
 
 inputs:
   version:
-    description: 'Vexa Arc release tag to use (e.g. v1.3.0, latest, or source to build from checkout)'
+    description: 'Vexa Arc release tag to use (e.g. v1.4.0, latest, or source to build from checkout)'
     required: false
     default: 'latest'
   path:

@@ -151,6 +151,21 @@ pub fn build_workstation_heartbeat(project_dir: &Path) -> CloudArcHeartbeat {
         })
         .unwrap_or("enforce");
 
+    let policy_source = policy_res
+        .as_ref()
+        .ok()
+        .and_then(|p| p.source)
+        .map(|s| match s {
+            arc_policy_engine::evaluator::PolicySource::BuiltInDefault => "built_in_default",
+            arc_policy_engine::evaluator::PolicySource::UserGlobal => "user_global",
+            arc_policy_engine::evaluator::PolicySource::ProjectLocal => "project_local",
+            arc_policy_engine::evaluator::PolicySource::SignedOrganization => "signed_organization",
+            arc_policy_engine::evaluator::PolicySource::EmergencyDeny => "emergency_deny",
+        })
+        .unwrap_or("built_in_default");
+    let active_policy_seq = read_active_policy_sequence(project_dir);
+    let signed_policy_synced = active_policy_seq > 0 && policy_source == "signed_organization";
+
     let host_adapters = detect_installed_host_adapters(project_dir);
     let doctor_status = if !policy_ok {
         "degraded"
@@ -167,7 +182,9 @@ pub fn build_workstation_heartbeat(project_dir: &Path) -> CloudArcHeartbeat {
         host_adapters,
         arc_version: env!("CARGO_PKG_VERSION").to_string(),
         policy_mode: mode_str.to_string(),
-        active_policy_seq: read_active_policy_sequence(project_dir),
+        active_policy_seq,
+        policy_source: policy_source.to_string(),
+        signed_policy_synced,
         doctor_status: doctor_status.to_string(),
     }
 }
@@ -340,6 +357,9 @@ mod tests {
         assert!(detected.contains(&"claude-code".to_string()));
         let hb2 = build_workstation_heartbeat(&tmp);
         assert_eq!(hb2.doctor_status, "healthy");
+        // Local-only directory with no signed_policy.json must report signed_policy_synced=false
+        assert!(!hb2.signed_policy_synced);
+        assert_ne!(hb2.policy_source, "signed_organization");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

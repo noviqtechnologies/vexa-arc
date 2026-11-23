@@ -504,24 +504,74 @@ impl DiscoveryScanner {
             });
         }
 
-        // 4. Exposed Secrets Scan (.env*, credentials.json, id_rsa, etc.)
-        if lower.starts_with(".env")
-            || lower.contains("credential")
-            || lower.ends_with(".pem")
-            || lower.ends_with(".key")
-            || lower == "id_rsa"
-            || lower == "id_ed25519"
-            || lower == "id_ecdsa"
-            || lower == "id_dsa"
-        {
-            if let Ok(bytes) = fs::read(path) {
-                let findings = self.dlp_engine.scan(&bytes);
-                for f in findings {
-                    exposed_secrets.push(ExposedSecretFinding {
-                        file_path: path.to_path_buf(),
-                        detector: f.detector.to_string(),
-                        snippet: f.snippet,
-                    });
+        // 4. Exposed Secrets Scan across all non-binary repository files (up to 2 MB)
+        //    so `arc audit`, `audit_ai_assets`, `arc ci-report`, and `arc scan-secrets` agree.
+        const MAX_SECRET_SCAN_BYTES: u64 = 2 * 1024 * 1024;
+        let is_binary_ext = matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some(
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "ico"
+                    | "pdf"
+                    | "zip"
+                    | "tar"
+                    | "gz"
+                    | "tgz"
+                    | "7z"
+                    | "rar"
+                    | "exe"
+                    | "dll"
+                    | "so"
+                    | "dylib"
+                    | "wasm"
+                    | "o"
+                    | "a"
+                    | "rlib"
+                    | "class"
+                    | "jar"
+                    | "pyc"
+                    | "pyo"
+                    | "safetensors"
+                    | "gguf"
+                    | "onnx"
+                    | "pt"
+                    | "bin"
+                    | "mp3"
+                    | "mp4"
+                    | "mov"
+                    | "avi"
+                    | "woff"
+                    | "woff2"
+                    | "ttf"
+                    | "otf"
+                    | "db"
+                    | "sqlite"
+                    | "sqlite3"
+            )
+        );
+        if !is_binary_ext {
+            let within_size = fs::metadata(path)
+                .map(|m| m.len() <= MAX_SECRET_SCAN_BYTES)
+                .unwrap_or(false);
+            if within_size {
+                if let Ok(bytes) = fs::read(path) {
+                    if !bytes.contains(&0) {
+                        let findings = self.dlp_engine.scan(&bytes);
+                        for f in findings {
+                            exposed_secrets.push(ExposedSecretFinding {
+                                file_path: path.to_path_buf(),
+                                detector: f.detector.to_string(),
+                                snippet: f.snippet,
+                            });
+                        }
+                    }
                 }
             }
         }

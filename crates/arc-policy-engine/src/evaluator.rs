@@ -202,6 +202,10 @@ pub struct PolicyConfig {
     pub block_unapproved_mcp: bool,
     pub enforce_taint_dag: bool,
     pub redact_secrets: bool,
+    #[serde(default)]
+    pub protect_sensitive_paths: bool,
+    #[serde(default = "default_true")]
+    pub protect_destructive_commands: bool,
     #[serde(default = "default_true")]
     pub fail_closed_on_eval_error: bool,
     #[serde(default)]
@@ -223,6 +227,7 @@ impl Default for PolicyConfig {
         allowed.insert("local-filesystem".to_string());
         allowed.insert("git".to_string());
         allowed.insert("sqlite".to_string());
+        allowed.insert("vexa-arc".to_string());
 
         Self {
             version: default_policy_version(),
@@ -234,6 +239,8 @@ impl Default for PolicyConfig {
             block_unapproved_mcp: false,
             enforce_taint_dag: true,
             redact_secrets: true,
+            protect_sensitive_paths: false,
+            protect_destructive_commands: true,
             fail_closed_on_eval_error: true,
             emergency_deny_servers: HashSet::new(),
             active_exceptions: Vec::new(),
@@ -533,6 +540,8 @@ impl PolicyConfig {
             self.block_unapproved_mcp |= higher.block_unapproved_mcp;
             self.enforce_taint_dag |= higher.enforce_taint_dag;
             self.redact_secrets |= higher.redact_secrets;
+            self.protect_sensitive_paths |= higher.protect_sensitive_paths;
+            self.protect_destructive_commands |= higher.protect_destructive_commands;
             self.fail_closed_on_eval_error |= higher.fail_closed_on_eval_error;
             for denied in &self.emergency_deny_servers {
                 self.allowed_mcp_servers.remove(denied);
@@ -546,6 +555,8 @@ impl PolicyConfig {
         self.block_unapproved_mcp = higher.block_unapproved_mcp;
         self.enforce_taint_dag = higher.enforce_taint_dag;
         self.redact_secrets = higher.redact_secrets;
+        self.protect_sensitive_paths = higher.protect_sensitive_paths;
+        self.protect_destructive_commands = higher.protect_destructive_commands;
         self.fail_closed_on_eval_error = higher.fail_closed_on_eval_error;
         if higher.source == Some(PolicySource::SignedOrganization) {
             self.mcp_schema_pins = higher.mcp_schema_pins;
@@ -1196,6 +1207,92 @@ impl PolicyEvaluator {
                     rule: RuleId("ARC-LTT-001".to_string()),
                     explanation,
                 };
+            }
+        }
+
+        // 2.2 Standalone Sensitive Path Protection (ARC-FS-001)
+        // Protects `.env` (excluding templates like `.env.example`), SSH keys, AWS credentials,
+        // PEM/key files, and system credential stores even before untrusted content is ingested.
+        if cfg.protect_sensitive_paths {
+            let sensitive_path = match &event.action {
+                Action::FileRead { path } | Action::FileWrite { path, .. }
+                    if crate::taint_dag::is_sensitive_secret_path(path) =>
+                {
+                    Some(path.clone())
+                }
+                _ => None,
+            };
+            if let Some(path) = sensitive_path {
+                if let Some(exc) =
+                    check_exception("ARC-FS-001").or_else(|| check_approval("ARC-FS-001"))
+                {
+                    // Record taint for approved/excepted sensitive file access before returning.
+                    self.taint_tracker.record_event_and_update_taints(event);
+                    return exc;
+                }
+                let path_display = path.display().to_string();
+                let explanation = Explanation::new(
+                    format!(
+                        "Sensitive credential or secret path access blocked: '{path_display}'."
+                    ),
+                    vec![
+                        "Use a non-secret template file (such as .env.example) or inject values via environment variables.".to_string(),
+                        format!("If this access is intentional, approve once or allowlist with: arc allow --rule ARC-FS-001 --target {path_display}"),
+                    ],
+                    Some("https://docs.vexa.ai/arc/policies/ARC-FS-001".to_string()),
+                );
+                if cfg.require_approval_rules.contains("ARC-FS-001") {
+                    return Verdict::RequireApproval {
+                        rule: RuleId("ARC-FS-001".to_string()),
+                        explanation,
+                        timeout_secs: 300,
+                        on_timeout: arc_core::verdict::TimeoutAction::Deny,
+                    };
+                }
+                return Verdict::Deny {
+                    rule: RuleId("ARC-FS-001".to_string()),
+                    explanation,
+                };
+            }
+        }
+
+        // 2.3 Standalone Destructive / RCE Shell Command Protection (ARC-CMD-001)
+        // Blocks recursive forced deletion, pipe-to-shell RCE, disk wipes, chmod 777, and
+        // destructive git force-push/reset-hard even outside a Lethal Trifecta session.
+        if cfg.protect_destructive_commands {
+            if let Action::Shell { ref command, .. } = event.action {
+                if let Some(category) =
+                    crate::taint_dag::classify_destructive_shell_command(command)
+                {
+                    if let Some(exc) =
+                        check_exception("ARC-CMD-001").or_else(|| check_approval("ARC-CMD-001"))
+                    {
+                        self.taint_tracker.record_event_and_update_taints(event);
+                        return exc;
+                    }
+                    let explanation = Explanation::new(
+                        format!(
+                            "Destructive or high-risk shell command blocked ({category}): '{command}'."
+                        ),
+                        vec![
+                            "Use a narrower, non-destructive command or inspect scripts locally before execution.".to_string(),
+                            "If this command is intentionally required, grant a scoped exception with: arc allow --rule ARC-CMD-001 --target <pattern>".to_string(),
+                        ],
+                        Some("https://docs.vexa.ai/arc/policies/ARC-CMD-001".to_string()),
+                    );
+                    if cfg.require_approval_rules.contains("ARC-CMD-001") {
+                        return Verdict::RequireApproval {
+                            rule: RuleId("ARC-CMD-001".to_string()),
+                            explanation,
+                            timeout_secs: 300,
+                            on_timeout: arc_core::verdict::TimeoutAction::Deny,
+                        };
+                    }
+                    return Verdict::Deny {
+                        rule: RuleId("ARC-CMD-001".to_string()),
+                        explanation,
+                    };
+                }
             }
         }
 

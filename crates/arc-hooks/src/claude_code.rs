@@ -94,6 +94,22 @@ impl HostAdapter for ClaudeCodeAdapter {
             .get("hook_event_name")
             .and_then(|s| s.as_str())
             .unwrap_or("PreToolUse");
+        if event_name.eq_ignore_ascii_case("UserPromptSubmit") {
+            let prompt_text = str_field(&val, &["prompt", "user_prompt", "text"]).unwrap_or("");
+            if prompt_text.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![ActionEvent::new(
+                AgentHost::ClaudeCode,
+                session_id,
+                principal,
+                Phase::Pre,
+                Action::PromptSubmit {
+                    text: prompt_text.to_string(),
+                    source: Some("user".to_string()),
+                },
+            )]);
+        }
         let is_post = event_name.eq_ignore_ascii_case("PostToolUse");
         let is_mediated_event = is_post || event_name.eq_ignore_ascii_case("PreToolUse");
 
@@ -346,6 +362,11 @@ impl ClaudeCodeAdapter {
             "PostToolUse",
             Some(Self::hook_entry_with_cmd(POST_MATCHER, &hook_cmd)),
         );
+        upsert_event_entry(
+            hooks,
+            "UserPromptSubmit",
+            Some(Self::hook_entry_with_cmd("*", &hook_cmd)),
+        );
 
         write_json_atomic(&config_path, &root)?;
 
@@ -366,7 +387,7 @@ impl ClaudeCodeAdapter {
         if config_path.exists() {
             let mut root = read_json_object(&config_path)?;
             if let Some(hooks) = root.get_mut("hooks") {
-                for event in ["PreToolUse", "PostToolUse"] {
+                for event in ["PreToolUse", "PostToolUse", "UserPromptSubmit"] {
                     modified |= upsert_event_entry(hooks, event, None);
                 }
                 if hooks.as_object().is_some_and(|o| o.is_empty()) {

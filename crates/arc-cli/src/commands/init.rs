@@ -172,7 +172,12 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
         if audit_mode {
             cfg.mode = PolicyMode::Audit;
         }
+        cfg.block_unapproved_mcp = true;
+        cfg.protect_sensitive_paths = true;
+        cfg.protect_destructive_commands = true;
         cfg.require_approval_for_trifecta = true;
+        cfg.require_approval_rules.insert("ARC-MCP-001".to_string());
+        cfg.require_approval_rules.insert("ARC-FS-001".to_string());
         if let Err(e) = cfg.save_to_dir(path) {
             eprintln!("[Arc Init] Failed to write {}: {e}", policy_path.display());
             return false;
@@ -291,6 +296,14 @@ pub fn run_init(path: &Path, host: &str, audit_mode: bool, json: bool) -> bool {
         let claude_mcp = path.join(".mcp.json");
         if upsert_mcp_server_config(&claude_mcp, &arc_exe).is_ok() {
             mcp_registered.push(".mcp.json");
+        }
+    }
+    // Pin the built-in `vexa-arc` MCP server schema dynamically in `.arc/mcp-pins.lock` so
+    // `arc mcp inventory` and `arc ci-report --fail-on-unpinned-mcp` do not flag Arc's own server.
+    if !mcp_registered.is_empty() {
+        if let Some(pin_hex) = crate::commands::mcp_server::builtin_tools_schema_hash() {
+            let lock_path = path.join(".arc").join("mcp-pins.lock");
+            let _ = arc_hooks::broker::save_mcp_pin_to_lockfile(&lock_path, "vexa-arc", &pin_hex);
         }
     }
     let directives_installed = install_secure_at_inception_directives(

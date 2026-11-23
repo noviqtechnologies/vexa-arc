@@ -68,6 +68,16 @@ fn tool_definitions() -> Value {
     })
 }
 
+/// Computes the canonical RFC 8785 JCS SHA-256 schema hash of the built-in `vexa-arc` MCP server's
+/// `tools/list` definitions dynamically so lockfiles and tests never hardcode stale hashes.
+pub fn builtin_tools_schema_hash() -> Option<String> {
+    let defs = tool_definitions();
+    let tools = defs.get("tools")?;
+    let bytes = serde_json::to_vec(tools).ok()?;
+    let hash = arc_core::compute_jcs_schema_hash(&bytes).ok()?;
+    Some(hex::encode(hash))
+}
+
 fn ok_tool_result(payload: Value) -> Value {
     json!({
         "content": [

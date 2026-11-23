@@ -124,44 +124,56 @@ pub fn build_host_coverage_contracts(project_dir: &Path) -> Vec<HostCoverageCont
         },
         HostCoverageContract {
             integration: "windsurf".to_string(),
-            event_types: vec!["pre_action".to_string(), "post_action".to_string()],
-            interception_point: "decode_only_manual_hook".to_string(),
-            known_bypasses: vec![
-                "No automatic DEFAULT_HOOK_CMD installer parity".to_string(),
-                "Direct subprocess or network traffic outside hook".to_string(),
+            event_types: vec![
+                "pre_run_command".to_string(),
+                "pre_read_code".to_string(),
+                "pre_write_code".to_string(),
+                "pre_mcp_tool_use".to_string(),
+                "post_mcp_tool_use".to_string(),
             ],
-            required_config: "Manual hook wiring to `arc intercept hook --host windsurf`"
+            interception_point: "pre_and_post_hook".to_string(),
+            known_bypasses: vec![
+                "Direct terminal shell commands outside Windsurf hooks".to_string(),
+                "Unwrapped MCP servers if Windsurf hooks are disabled".to_string(),
+            ],
+            required_config: ".windsurf/hooks.json (`arc init --host windsurf` or `arc host install --host windsurf`)"
                 .to_string(),
             coverage_status: if installed.iter().any(|h| h == "windsurf") {
                 active_status.to_string()
             } else {
-                "unsupported".to_string()
+                "unknown".to_string()
             },
         },
         HostCoverageContract {
             integration: "codex-cli".to_string(),
-            event_types: vec!["pre_tool".to_string(), "post_tool".to_string()],
-            interception_point: "decode_only_manual_hook".to_string(),
-            known_bypasses: vec!["No automatic DEFAULT_HOOK_CMD installer parity".to_string()],
-            required_config: "Manual hook wiring to `arc intercept hook --host codex-cli`"
+            event_types: vec!["PreToolUse".to_string(), "PostToolUse".to_string()],
+            interception_point: "pre_and_post_hook".to_string(),
+            known_bypasses: vec![
+                "Direct terminal shell commands outside Codex CLI".to_string(),
+                "Hooks disabled via user settings override".to_string(),
+            ],
+            required_config: ".codex/hooks.json (`arc init --host codex-cli` or `arc host install --host codex-cli`)"
                 .to_string(),
             coverage_status: if installed.iter().any(|h| h == "codex-cli") {
                 active_status.to_string()
             } else {
-                "unsupported".to_string()
+                "unknown".to_string()
             },
         },
         HostCoverageContract {
             integration: "gemini-cli".to_string(),
-            event_types: vec!["PreToolUse".to_string(), "PostToolUse".to_string()],
-            interception_point: "decode_only_manual_hook".to_string(),
-            known_bypasses: vec!["No automatic DEFAULT_HOOK_CMD installer parity".to_string()],
-            required_config: "Manual hook wiring to `arc intercept hook --host gemini-cli`"
+            event_types: vec!["BeforeTool".to_string(), "AfterTool".to_string()],
+            interception_point: "pre_and_post_hook".to_string(),
+            known_bypasses: vec![
+                "Direct terminal shell commands outside Gemini CLI".to_string(),
+                "Hooks disabled via user settings override".to_string(),
+            ],
+            required_config: ".gemini/settings.json (`arc init --host gemini-cli` or `arc host install --host gemini-cli`)"
                 .to_string(),
             coverage_status: if installed.iter().any(|h| h == "gemini-cli") {
                 active_status.to_string()
             } else {
-                "unsupported".to_string()
+                "unknown".to_string()
             },
         },
         HostCoverageContract {

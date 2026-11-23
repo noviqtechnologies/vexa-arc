@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::process_containment::{ContainmentLimits, OsProcessSupervisor};
@@ -102,6 +103,8 @@ pub struct McpStdioBroker {
     pub observe_only: bool,
     /// In-flight `tools/call` request id (JSON text) -> tool name, for result taint attribution.
     pending_calls: HashMap<String, String>,
+    /// Number of in-flight `tools/list` requests awaiting a server response.
+    in_flight_tools_list: usize,
 }
 
 impl McpStdioBroker {
@@ -131,6 +134,7 @@ impl McpStdioBroker {
             pin_lockfile: None,
             observe_only: false,
             pending_calls: HashMap::new(),
+            in_flight_tools_list: 0,
         }
     }
 
@@ -319,14 +323,22 @@ impl McpStdioBroker {
                 if self.schema_pin_violated
                     || (self.schema_pin_required && self.current_schema_hash.is_none())
                 {
+                    let reason = if self.schema_pin_violated {
+                        format!(
+                            "MCP server '{}' cannot be used because its schema failed trusted pin or poisoning verification; tool calls are disabled.",
+                            self.server_name,
+                        )
+                    } else {
+                        format!(
+                            "MCP server '{}' cannot be used because its schema has not passed a trusted pin check yet (complete a 'tools/list' exchange before 'tools/call'); tool calls are disabled.",
+                            self.server_name,
+                        )
+                    };
                     let verdict = Self::deny_verdict(
                         "ARC-MCP-003",
-                        format!(
-                            "MCP server '{}' cannot be used because its schema has not passed a trusted pin check; tool calls are disabled.",
-                            self.server_name,
-                        ),
+                        reason,
                         vec![
-                            "Verify the server binary/version and update the pinned schema hash."
+                            "Ensure the client completes 'tools/list' before invoking 'tools/call', and verify the pinned schema hash matches `arc mcp inspect-schema`."
                                 .to_string(),
                         ],
                     );
@@ -698,6 +710,10 @@ impl McpStdioBroker {
 
                 ClientMessageOutcome::Forward(line.to_string())
             }
+            Some("tools/list") => {
+                self.in_flight_tools_list = self.in_flight_tools_list.saturating_add(1);
+                ClientMessageOutcome::Forward(line.to_string())
+            }
             _ => ClientMessageOutcome::Forward(line.to_string()),
         }
     }
@@ -733,6 +749,7 @@ impl McpStdioBroker {
 
         // Check for tools/list response
         if let Some(tools) = parsed.get("result").and_then(|r| r.get("tools")) {
+            self.in_flight_tools_list = self.in_flight_tools_list.saturating_sub(1);
             if self.schema_pin_required && self.pinned_schema_hash.is_none() {
                 self.schema_pin_violated = true;
                 self.requests_blocked += 1;
@@ -863,6 +880,11 @@ impl McpStdioBroker {
             }
         }
 
+        // If the server returned a JSON-RPC error while a tools/list was in flight, release the barrier.
+        if parsed.get("error").is_some() && self.in_flight_tools_list > 0 {
+            self.in_flight_tools_list = self.in_flight_tools_list.saturating_sub(1);
+        }
+
         // Correlate tools/call responses with their requests and classify the result for taint.
         if let Some(id) = parsed.get("id").filter(|i| !i.is_null()) {
             if let Some(tool) = self.pending_calls.remove(&id.to_string()) {
@@ -948,8 +970,13 @@ impl McpStdioBroker {
         // job assignment on Windows; process group + PDEATHSIG on Unix).
         let mut child = supervisor.spawn(&mut cmd)?;
 
-        let mut child_stdin = child.stdin.take().ok_or(BrokerError::ChildTerminated)?;
+        let mut child_stdin = Some(child.stdin.take().ok_or(BrokerError::ChildTerminated)?);
         let child_stdout = child.stdout.take().ok_or(BrokerError::ChildTerminated)?;
+
+        struct SharedBrokerState<'a> {
+            broker: &'a mut McpStdioBroker,
+            relay_exited: bool,
+        }
 
         let running = AtomicBool::new(true);
         let running_ref = &running;
@@ -957,7 +984,13 @@ impl McpStdioBroker {
         // neither holds the process-wide stdout lock for its whole lifetime.
         let out = Mutex::new(std::io::stdout());
         let out_ref = &out;
-        let shared = Mutex::new(&mut *self);
+        let shared = (
+            Mutex::new(SharedBrokerState {
+                broker: &mut *self,
+                relay_exited: false,
+            }),
+            Condvar::new(),
+        );
         let shared_ref = &shared;
 
         fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -971,6 +1004,15 @@ impl McpStdioBroker {
             }
             let _ = o.flush();
         }
+        fn is_tools_call_line(line: &str) -> bool {
+            serde_json::from_str::<Value>(line.trim())
+                .ok()
+                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s == "tools/call"))
+                .unwrap_or(false)
+        }
+
+        const SCHEMA_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+        const DRAIN_GRACE_TIMEOUT: Duration = Duration::from_secs(5);
 
         std::thread::scope(|scope| {
             // Child server stdout -> (schema capture / result taint) -> host stdout
@@ -982,7 +1024,12 @@ impl McpStdioBroker {
                     match reader.read_line(&mut line_buf) {
                         Ok(0) => break, // EOF
                         Ok(_) => {
-                            let outcome = lock(shared_ref).handle_server_message(&line_buf);
+                            let outcome = {
+                                let mut state = lock(&shared_ref.0);
+                                let out = state.broker.handle_server_message(&line_buf);
+                                shared_ref.1.notify_all();
+                                out
+                            };
                             let forward = match outcome {
                                 ServerMessageOutcome::Forward(l) => l,
                                 ServerMessageOutcome::CapturedSchema {
@@ -1001,6 +1048,9 @@ impl McpStdioBroker {
                         Err(_) => break,
                     }
                 }
+                let mut state = lock(&shared_ref.0);
+                state.relay_exited = true;
+                shared_ref.1.notify_all();
             });
 
             // Host stdin -> policy evaluation -> child server stdin
@@ -1013,14 +1063,40 @@ impl McpStdioBroker {
                 match reader.read_line(&mut line_buf) {
                     Ok(0) => break, // Host closed stdin
                     Ok(_) => {
-                        let outcome = lock(shared_ref).handle_client_message(&line_buf);
+                        // If a `tools/call` arrives while a prior `tools/list` is still in flight
+                        // (e.g., pipelined JSON-RPC frames), wait for the child's `tools/list`
+                        // response so schema pin verification completes before evaluating the call.
+                        if is_tools_call_line(&line_buf) {
+                            let deadline = Instant::now() + SCHEMA_WAIT_TIMEOUT;
+                            let mut state = lock(&shared_ref.0);
+                            while state.broker.schema_pin_required
+                                && !state.broker.schema_pin_violated
+                                && state.broker.current_schema_hash.is_none()
+                                && state.broker.in_flight_tools_list > 0
+                                && !state.relay_exited
+                            {
+                                let remaining = deadline.saturating_duration_since(Instant::now());
+                                if remaining.is_zero() {
+                                    break;
+                                }
+                                let (guard, _) = shared_ref
+                                    .1
+                                    .wait_timeout(state, remaining)
+                                    .unwrap_or_else(|e| e.into_inner());
+                                state = guard;
+                            }
+                        }
+
+                        let outcome = lock(&shared_ref.0).broker.handle_client_message(&line_buf);
                         match outcome {
                             ClientMessageOutcome::Forward(forward_str) => {
-                                let _ = child_stdin.write_all(forward_str.as_bytes());
-                                if !forward_str.ends_with('\n') {
-                                    let _ = child_stdin.write_all(b"\n");
+                                if let Some(ref mut c_in) = child_stdin {
+                                    let _ = c_in.write_all(forward_str.as_bytes());
+                                    if !forward_str.ends_with('\n') {
+                                        let _ = c_in.write_all(b"\n");
+                                    }
+                                    let _ = c_in.flush();
                                 }
-                                let _ = child_stdin.flush();
                             }
                             ClientMessageOutcome::RespondLocally(resp) => {
                                 write_line(out_ref, &resp.to_string());
@@ -1038,6 +1114,26 @@ impl McpStdioBroker {
                         }
                     }
                     Err(_) => break,
+                }
+            }
+
+            // Close child stdin first so the child sees EOF, finishes writing any in-flight
+            // JSON-RPC responses, and exits cleanly before we tear down the process tree.
+            drop(child_stdin.take());
+
+            let drain_deadline = Instant::now() + DRAIN_GRACE_TIMEOUT;
+            {
+                let mut state = lock(&shared_ref.0);
+                while !state.relay_exited {
+                    let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let (guard, _) = shared_ref
+                        .1
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(|e| e.into_inner());
+                    state = guard;
                 }
             }
 

@@ -583,12 +583,14 @@ arc protect stdio --server github --pin-schema "$MCP_SCHEMA_SHA256" -- npx @mode
 
 ### Field-Level & Path-Level Taint Isolation (`FR-TAINT-005`)
 
-The Session Taint DAG tracks taint at **field granularity** and **path granularity**:
+The Session Taint DAG tracks taint at **field granularity** and **path granularity**, while standalone policy rules protect high-risk actions even before untrusted content enters the session:
 
-- Reading `.env.SECRET` taints that specific field, not the entire session.
+- **Sensitive Path Protection (`ARC-FS-001`):** Enabled by `arc init` (`protect_sensitive_paths: true`, requiring approval by default or hard-denied under signed org policy) for `.env`, `.env.local`, `~/.ssh/*`, `~/.aws/*`, `*.pem`, `*.key`, and credential files across Windows, macOS, and Linux. Non-secret templates (`.env.example`, `.env.sample`, `.env.template`, `.env.dist`, `.env.defaults`) and public docs (`README.md`, `LICENSE`) are explicitly excluded from both `ARC-FS-001` and session taint to prevent false positives.
+- **Destructive Command Protection (`ARC-CMD-001`):** Enabled by default (`protect_destructive_commands: true`) to block recursive forced deletion (`rm -rf`, `Remove-Item -Recurse -Force`, `rmdir /s /q`), pipe-to-shell RCE (`curl ... | sh`, `iwr ... | iex`), destructive git operations (`git push --force`, `git reset --hard`, `git clean -fd`), `chmod 777`, and disk wipes (`mkfs`, `dd of=`).
+- **Native Hook Secret Blocking (`ARC-DLP-001`):** When a secret is detected in a Pre-phase native hook (shell command, MCP argument, or Claude Code `UserPromptSubmit` prompt), Arc fails closed (exit code 2 / deny) because hooks cannot safely rewrite tool arguments in place.
 - **Benign local commands** (`git status`, `git diff`, `git log`, `cargo test`, `npm test`, `pytest`) are whitelisted from blanket session taint and permitted in tainted sessions.
 - **Compound command guard:** The benign exemption strictly requires atomic commands; command chaining, pipes, or shell redirection (`git status; curl ...`, `pytest | nc ...`) immediately void the exemption and are evaluated against full egress policy.
-- The Lethal Trifecta check can target specific field/path combinations for surgical blocking.
+- The Lethal Trifecta check (`ARC-LTT-001`) can target specific field/path combinations for surgical blocking.
 
 ```bash
 # Benign command in a tainted session — permitted

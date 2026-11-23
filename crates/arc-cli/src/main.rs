@@ -3240,7 +3240,7 @@ fn run_audit(path: &Path, workstation: bool, output_json: bool, bom_file: Option
                 bom_path.display()
             );
             return false;
-        } else {
+        } else if !output_json {
             println!("Exported CycloneDX v1.6 AI-BOM to {}", bom_path.display());
         }
     }
@@ -4031,8 +4031,7 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
             telemetry.emit(telemetry_event);
         }
         // Record operational audit log for every evaluated action (Pillar 2)
-        let rule_id = verdict_rule(verdict);
-        let redactions_count = match verdict {
+        let redactions_count: usize = match verdict {
             arc_core::verdict::Verdict::Allow { obligations } => obligations
                 .iter()
                 .filter_map(|o| match o {
@@ -4042,22 +4041,35 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
                 .sum(),
             _ => 0,
         };
+        // Native hooks cannot safely rewrite tool arguments in-place; when ARC-DLP-001 produces
+        // unapplied redaction spans on a Pre-phase hook, the host adapter fails closed (exit 2).
+        let unapplied_dlp_block = event.phase == Phase::Pre && redactions_count > 0;
+        let effective_decision = if unapplied_dlp_block {
+            "deny"
+        } else {
+            verdict_decision(verdict)
+        };
+        let effective_rule = if unapplied_dlp_block {
+            Some("ARC-DLP-001".to_string())
+        } else {
+            verdict_rule(verdict)
+        };
         let audit_record = SessionAuditRecord::new(
             event.event_id.to_string(),
             target_class(event),
             action_class(event),
-            verdict_decision(verdict),
-            rule_id,
+            effective_decision,
+            effective_rule.clone(),
             redactions_count,
         );
         let _ = audit_record.append_to_dir(&storage_dir, &session);
 
         // Post-phase hooks only report results for taint tracking; they never block.
-        if event.phase == Phase::Pre && !verdict.is_allowed() {
+        if event.phase == Phase::Pre && (!verdict.is_allowed() || unapplied_dlp_block) {
             let mut cloud_tel = TelemetryEventBuilder {
                 action_class: action_class(event).to_string(),
-                decision: verdict_decision(verdict).to_string(),
-                rule_id: verdict_rule(verdict),
+                decision: effective_decision.to_string(),
+                rule_id: effective_rule,
                 taint_flags: taint_names(observation.taints_after),
                 sink_class: Some(sink_class_name(observation.sink_class)),
                 target_class: target_class(event).to_string(),
