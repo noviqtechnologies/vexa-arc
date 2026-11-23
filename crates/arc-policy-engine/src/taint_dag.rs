@@ -1212,7 +1212,13 @@ pub fn classify_destructive_shell_command(command: &str) -> Option<&'static str>
             let lhs_fetches = lhs.iter().any(|t| {
                 matches!(
                     t.as_str(),
-                    "curl" | "wget" | "fetch" | "iwr" | "invoke-webrequest" | "irm" | "invoke-restmethod"
+                    "curl"
+                        | "wget"
+                        | "fetch"
+                        | "iwr"
+                        | "invoke-webrequest"
+                        | "irm"
+                        | "invoke-restmethod"
                 )
             });
             let rhs_execs = rhs.first().is_some_and(|t| {
@@ -1241,7 +1247,11 @@ pub fn classify_destructive_shell_command(command: &str) -> Option<&'static str>
     }
 
     // Split compound commands on ;, &&, ||, newline and inspect each sub-command
-    for segment in cmd_lower.split([';', '\n', '\r']).flat_map(|s| s.split("&&")).flat_map(|s| s.split("||")) {
+    for segment in cmd_lower
+        .split([';', '\n', '\r'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+    {
         let seg_tokens = shell_tokens(segment);
         let Some(first) = seg_tokens.first().map(String::as_str) else {
             continue;
@@ -1316,14 +1326,14 @@ pub fn classify_destructive_shell_command(command: &str) -> Option<&'static str>
                 return Some("destructive git reset --hard");
             }
             if sub == "clean" {
-                let has_f = seg_tokens
-                    .iter()
-                    .skip(2)
-                    .any(|t| t == "--force" || (t.starts_with('-') && !t.starts_with("--") && t.contains('f')));
-                let has_d = seg_tokens
-                    .iter()
-                    .skip(2)
-                    .any(|t| t == "--directories" || (t.starts_with('-') && !t.starts_with("--") && t.contains('d')));
+                let has_f = seg_tokens.iter().skip(2).any(|t| {
+                    t == "--force"
+                        || (t.starts_with('-') && !t.starts_with("--") && t.contains('f'))
+                });
+                let has_d = seg_tokens.iter().skip(2).any(|t| {
+                    t == "--directories"
+                        || (t.starts_with('-') && !t.starts_with("--") && t.contains('d'))
+                });
                 if has_f && has_d {
                     return Some("destructive git clean -fd");
                 }
@@ -2257,7 +2267,10 @@ mod tests {
             "README.md",
         ] {
             let p = Path::new(tpl);
-            assert!(!is_sensitive_secret_path(p), "{tpl} should not be sensitive");
+            assert!(
+                !is_sensitive_secret_path(p),
+                "{tpl} should not be sensitive"
+            );
             let (taint, _) = TaintTracker::classify_action_taints(&Action::FileRead {
                 path: p.to_path_buf(),
             });

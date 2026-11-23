@@ -2768,7 +2768,14 @@ fn test_v14_native_hook_dlp_blocks_secrets_and_init_policy_protects_paths_comman
 
     // 1. Run `arc init --host all` and verify hardened policy + auto-pinned vexa-arc + Claude UserPromptSubmit
     let init_out = Command::new(arc_bin)
-        .args(["init", "--path", temp_dir.to_str().unwrap(), "--host", "all", "--json"])
+        .args([
+            "init",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--host",
+            "all",
+            "--json",
+        ])
         .output()
         .expect("arc init failed");
     assert!(
@@ -2786,11 +2793,14 @@ fn test_v14_native_hook_dlp_blocks_secrets_and_init_policy_protects_paths_comman
     let lock_raw = fs::read_to_string(temp_dir.join(".arc").join("mcp-pins.lock")).unwrap();
     let lock_json: serde_json::Value = serde_json::from_str(&lock_raw).unwrap();
     assert!(
-        lock_json["pins"]["vexa-arc"].as_str().is_some_and(|s| s.len() == 64),
+        lock_json["pins"]["vexa-arc"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64),
         "arc init must dynamically pin vexa-arc in .arc/mcp-pins.lock"
     );
 
-    let claude_settings = fs::read_to_string(temp_dir.join(".claude").join("settings.json")).unwrap();
+    let claude_settings =
+        fs::read_to_string(temp_dir.join(".claude").join("settings.json")).unwrap();
     let claude_json: serde_json::Value = serde_json::from_str(&claude_settings).unwrap();
     assert!(claude_json["hooks"]["PreToolUse"].is_array());
     assert!(claude_json["hooks"]["PostToolUse"].is_array());
@@ -2836,7 +2846,11 @@ fn test_v14_native_hook_dlp_blocks_secrets_and_init_policy_protects_paths_comman
             "cwd": cwd_str
         }),
     );
-    assert_eq!(cursor_secret.status.code(), Some(2), "Cursor hook must block leaked AWS key");
+    assert_eq!(
+        cursor_secret.status.code(),
+        Some(2),
+        "Cursor hook must block leaked AWS key"
+    );
     let cursor_secret_out: serde_json::Value =
         serde_json::from_slice(&cursor_secret.stdout).unwrap();
     assert_eq!(cursor_secret_out["permission"], "deny");
@@ -3062,11 +3076,15 @@ fn test_v14_protect_stdio_pinned_and_tofu_e2e_with_real_mcp_server() {
         .map(|l| serde_json::from_str(l).expect("valid jsonrpc line"))
         .collect();
     assert!(
-        responses.iter().any(|r| r["id"] == 1 && r["result"]["serverInfo"]["name"] == "vexa-arc"),
+        responses
+            .iter()
+            .any(|r| r["id"] == 1 && r["result"]["serverInfo"]["name"] == "vexa-arc"),
         "expected initialize response, got: {pinned_stdout}"
     );
     assert!(
-        responses.iter().any(|r| r["id"] == 2 && r["result"]["tools"].is_array()),
+        responses
+            .iter()
+            .any(|r| r["id"] == 2 && r["result"]["tools"].is_array()),
         "expected tools/list response, got: {pinned_stdout}"
     );
     let call_resp = responses
@@ -3146,7 +3164,9 @@ fn test_v14_protect_stdio_pinned_and_tofu_e2e_with_real_mcp_server() {
         .map(|l| serde_json::from_str(l).expect("valid jsonrpc line"))
         .collect();
     assert!(
-        tofu_resps.iter().any(|r| r["id"] == 3 && r["result"]["isError"] == false),
+        tofu_resps
+            .iter()
+            .any(|r| r["id"] == 3 && r["result"]["isError"] == false),
         "TOFU session must relay tools/call response before exit, got: {tofu_stdout}"
     );
     let saved_lock = fs::read_to_string(tofu_dir.join(".arc").join("mcp-pins.lock")).unwrap();
@@ -3169,7 +3189,10 @@ fn test_v14_unified_secret_scanning_and_audit_json_bom() {
 
     // Put 3 fake secrets in `.env` and a 4th fake GitHub token in `src/config.ts`
     let fake_ghp = format!("ghp_{}", "aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5");
-    let fake_oai = format!("sk-proj-{}", "aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5zA7bC9dE1fG3");
+    let fake_oai = format!(
+        "sk-proj-{}",
+        "aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5zA7bC9dE1fG3"
+    );
     fs::write(
         temp_dir.join(".env"),
         format!(
@@ -3252,13 +3275,29 @@ fn test_v14_unified_secret_scanning_and_audit_json_bom() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     assert_eq!(mcp_lines.len(), 2);
-    let audit_mcp_text = mcp_lines[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let audit_mcp_text = mcp_lines[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
     let audit_mcp_payload: serde_json::Value = serde_json::from_str(audit_mcp_text).unwrap();
-    assert_eq!(audit_mcp_payload["exposed_secrets"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        audit_mcp_payload["exposed_secrets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
 
-    let scan_mcp_text = mcp_lines[1]["result"]["content"][0]["text"].as_str().unwrap();
+    let scan_mcp_text = mcp_lines[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
     let scan_mcp_payload: serde_json::Value = serde_json::from_str(scan_mcp_text).unwrap();
-    assert_eq!(scan_mcp_payload["exposed_secrets"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        scan_mcp_payload["exposed_secrets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -3272,14 +3311,26 @@ fn test_v14_mcp_inventory_contracts_reflect_all_five_host_installers() {
     fs::create_dir_all(&temp_dir).unwrap();
 
     let inv_out = Command::new(arc_bin)
-        .args(["mcp", "inventory", "--path", temp_dir.to_str().unwrap(), "--json"])
+        .args([
+            "mcp",
+            "inventory",
+            "--path",
+            temp_dir.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .expect("arc mcp inventory failed");
     assert!(inv_out.status.success());
     let inv_json: serde_json::Value = serde_json::from_slice(&inv_out.stdout).unwrap();
     let contracts = inv_json["coverage_contracts"].as_array().unwrap();
 
-    for host in ["claude-code", "cursor", "windsurf", "codex-cli", "gemini-cli"] {
+    for host in [
+        "claude-code",
+        "cursor",
+        "windsurf",
+        "codex-cli",
+        "gemini-cli",
+    ] {
         let entry = contracts
             .iter()
             .find(|c| c["integration"] == host)

@@ -1007,7 +1007,11 @@ impl McpStdioBroker {
         fn is_tools_call_line(line: &str) -> bool {
             serde_json::from_str::<Value>(line.trim())
                 .ok()
-                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s == "tools/call"))
+                .and_then(|v| {
+                    v.get("method")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s == "tools/call")
+                })
                 .unwrap_or(false)
         }
 
