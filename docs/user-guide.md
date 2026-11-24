@@ -169,7 +169,7 @@ Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON 
 arc ci-report --sca --policy-test --fail-on high --fail-on-unpinned-mcp --markdown-out arc-pr-report.md --json-out arc-pr-report.json
 ```
 
-For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.7.0`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
+For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.7.1`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
 
 ### Remote Streamable HTTP / SSE MCP Proxy (`arc protect http`)
 

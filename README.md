@@ -562,7 +562,7 @@ jobs:
     runs-on: ubuntu-latest # also supports macos-latest and windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: noviqtechnologies/vexa-arc@v1.7.0
+      - uses: noviqtechnologies/vexa-arc@v1.7.1
         with:
           fail-on: high
           fail-on-secrets: 'true'

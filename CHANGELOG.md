@@ -2,6 +2,15 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.7.1] - 2026-11-24
+
+### Security Patching & Full Multi-Engine CI Scan
+- **Dependency Security Fixes (`Cargo.lock`):**
+  - Updated `url` (`2.5.8` → `2.5.9`, resolving `RUSTSEC-2026-0592` / `GHSA-hrj5-67jp-wqp9`) and `rustix` (`1.1.5` → `1.1.6`, resolving `RUSTSEC-2026-0486` / `GHSA-jh2m-fhpj-3vr7`).
+  - Synced `npm/package-lock.json` root version alignment with `npm/package.json` (`1.7.1`).
+- **CI Security Workflow (`.github/workflows/vexa-sca.yml`):**
+  - Enabled `--sast` and `--secrets` in `Vexa SCA Security Scan` so Code Security (SAST) and Secrets engines execute instead of being skipped.
+
 ## [1.7.0] - 2026-11-24
 
 ### Multi-Engine PR Security Matrix, License Exposure & Policy Fixture Reporting

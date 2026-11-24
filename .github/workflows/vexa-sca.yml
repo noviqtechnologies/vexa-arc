@@ -32,6 +32,8 @@ jobs:
       - name: Run Vexa SCA Scan
         run: |
           vexa-sca scan . \
+            --sast \
+            --secrets \
             --fail-on high \
             --html-file vexa-sca-report.html \
             --sarif-file vexa-sca-report.sarif \
