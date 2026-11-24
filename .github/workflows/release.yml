@@ -48,7 +48,9 @@ jobs:
           fi
 
       - name: Run Action & Installer Security Regression Tests
-        run: node .github/actions/comment-pr.test.js
+        run: |
+          npm --prefix npm ci --ignore-scripts
+          node .github/actions/comment-pr.test.js
 
       - name: Format Check
         run: cargo fmt --all -- --check
@@ -318,17 +320,19 @@ jobs:
           echo "VERSION=v$VERSION" >> "$GITHUB_ENV"
           echo "RAW_VERSION=$VERSION" >> "$GITHUB_ENV"
 
+      - name: Install npm launcher dependencies
+        run: npm --prefix npm ci --ignore-scripts
+
       - name: Verify live GitHub Release assets & npm launcher cold/cached execution
         shell: bash
         env:
           ARC_VERSION: ${{ env.VERSION }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SMOKE_CACHE="$(mktemp -d)"
           export XDG_CACHE_HOME="$SMOKE_CACHE"
           export LOCALAPPDATA="$SMOKE_CACHE"
 
-          # Cold download + SHA-256 + SLSA provenance verification + extract + execute
+          # Cold download + SHA-256 + built-in native Sigstore bundle verification (no GH_TOKEN or cosign) + extract + execute
           OUT1="$(node npm/bin/arc.js --version)"
           echo "Cold run output: $OUT1"
           echo "$OUT1" | grep -F "$RAW_VERSION"

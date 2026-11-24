@@ -40,7 +40,9 @@ jobs:
           fi
 
       - name: Run Action & Installer Security Regression Tests
-        run: node .github/actions/comment-pr.test.js
+        run: |
+          npm --prefix npm ci --ignore-scripts
+          node .github/actions/comment-pr.test.js
 
       - name: Format Check
         run: cargo fmt --all -- --check
@@ -85,7 +87,9 @@ jobs:
         continue-on-error: true
 
       - name: Run Action & Installer Security Regression Tests
-        run: node .github/actions/comment-pr.test.js
+        run: |
+          npm --prefix npm ci --ignore-scripts
+          node .github/actions/comment-pr.test.js
 
       - name: Check code formatting
         run: cargo fmt --all -- --check

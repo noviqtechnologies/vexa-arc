@@ -74,8 +74,8 @@ To ensure clarity across security, DevOps, and AI development teams, the table b
 
 ### Prerequisites
 
-* **Prebuilt / `npx`:** Node.js 18+ (for `npx @vexasec/arc`) or `curl`/`sh` (Linux/macOS) or PowerShell (Windows).
-* **Mandatory Publisher Verification (fail-closed):** All prebuilt installers (`@vexasec/arc`, `install.sh`, `install.ps1`) require one of: [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/), an authenticated GitHub CLI (`gh auth login` or `GH_TOKEN` set), or a pinned Ed25519 release public key (`ARC_RELEASE_PUBLIC_KEY_PEM` / `ARC_RELEASE_PUBLIC_KEY_FILE`). On clean machines without one of these verifiers, installation fails closed by design. All three installers also enforce rollback protection (set `ARC_ALLOW_DOWNGRADE=1` to explicitly downgrade), and `@vexasec/arc` re-verifies cached binary SHA-256 digests on every run.
+* **Prebuilt / `npx`:** Node.js 20.17+ (for `npx @vexasec/arc`) or `curl`/`sh` (Linux/macOS) or PowerShell (Windows).
+* **Mandatory Publisher Verification (fail-closed):** `@vexasec/arc` verifies Sigstore `checksums.txt.bundle` signatures natively out of the box (no `cosign` or `gh` CLI required) against the bundled Sigstore Public Good trusted root, and also supports `cosign`, authenticated `gh`, or a pinned Ed25519 release public key (`ARC_RELEASE_PUBLIC_KEY_PEM` / `ARC_RELEASE_PUBLIC_KEY_FILE`). Standalone shell installers (`install.sh`, `install.ps1`) require `cosign` or authenticated `gh` in `PATH` and fail closed otherwise. All three installers also enforce rollback protection (set `ARC_ALLOW_DOWNGRADE=1` to explicitly downgrade), and `@vexasec/arc` re-verifies cached binary SHA-256 digests on every run.
 * **From source:** Rust 1.97.0+ toolchain installed via [rustup.rs](https://rustup.rs/).
 
 ### Quick Install (All Platforms)

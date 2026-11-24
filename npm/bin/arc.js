@@ -292,6 +292,93 @@ function resolveReleasePublicKeyPem(overridePem) {
   return null;
 }
 
+const TRUSTED_ROOT_PATH = path.join(__dirname, "..", "lib", "sigstore-trusted-root.json");
+
+function normalizeSigstoreBundle(rawBundle, payloadBuf, bundleFromJSON) {
+  if (rawBundle && typeof rawBundle.mediaType === "string") {
+    return bundleFromJSON(rawBundle);
+  }
+  // Support Cosign `sign-blob --bundle` legacy JSON bundle format
+  if (
+    rawBundle &&
+    typeof rawBundle.base64Signature === "string" &&
+    typeof rawBundle.cert === "string" &&
+    rawBundle.rekorBundle &&
+    rawBundle.rekorBundle.Payload &&
+    typeof rawBundle.rekorBundle.SignedEntryTimestamp === "string"
+  ) {
+    const pem = Buffer.from(rawBundle.cert, "base64").toString("utf8");
+    const certDerB64 = pem
+      .replace(/-----BEGIN CERTIFICATE-----/g, "")
+      .replace(/-----END CERTIFICATE-----/g, "")
+      .replace(/\s+/g, "");
+    const payload = rawBundle.rekorBundle.Payload;
+    const bodyObj = JSON.parse(Buffer.from(payload.body, "base64").toString("utf8"));
+    const digestB64 = crypto.createHash("sha256").update(payloadBuf).digest("base64");
+    return bundleFromJSON({
+      mediaType: "application/vnd.dev.sigstore.bundle+json;version=0.1",
+      verificationMaterial: {
+        x509CertificateChain: { certificates: [{ rawBytes: certDerB64 }] },
+        tlogEntries: [
+          {
+            logIndex: String(payload.logIndex),
+            logId: { keyId: Buffer.from(payload.logID, "hex").toString("base64") },
+            kindVersion: { kind: bodyObj.kind, version: bodyObj.apiVersion },
+            integratedTime: String(payload.integratedTime),
+            inclusionPromise: {
+              signedEntryTimestamp: rawBundle.rekorBundle.SignedEntryTimestamp,
+            },
+            canonicalizedBody: payload.body,
+          },
+        ],
+      },
+      messageSignature: {
+        messageDigest: { algorithm: "SHA2_256", digest: digestB64 },
+        signature: rawBundle.base64Signature,
+      },
+    });
+  }
+  throw new Error("Unrecognized Sigstore bundle format");
+}
+
+function loadNativeSigstoreModules() {
+  try {
+    const { Verifier, toTrustMaterial, toSignedEntity } = require("@sigstore/verify");
+    const { bundleFromJSON } = require("@sigstore/bundle");
+    const { TrustedRoot } = require("@sigstore/protobuf-specs");
+    return { Verifier, toTrustMaterial, toSignedEntity, bundleFromJSON, TrustedRoot };
+  } catch (err) {
+    if (err && err.code === "MODULE_NOT_FOUND") return null;
+    throw err;
+  }
+}
+
+function verifySigstoreBundleNative({
+  checksumsPath,
+  bundlePath,
+  certIdentity,
+  oidcIssuer,
+  trustedRootPath = TRUSTED_ROOT_PATH,
+}) {
+  const mods = loadNativeSigstoreModules();
+  if (!mods || !fs.existsSync(trustedRootPath)) {
+    return null;
+  }
+  const { Verifier, toTrustMaterial, toSignedEntity, bundleFromJSON, TrustedRoot } = mods;
+  const rawTrustedRoot = JSON.parse(fs.readFileSync(trustedRootPath, "utf8"));
+  const trustMaterial = toTrustMaterial(TrustedRoot.fromJSON(rawTrustedRoot));
+  const verifier = new Verifier(trustMaterial);
+  const checksumsBuf = fs.readFileSync(checksumsPath);
+  const rawBundle = JSON.parse(fs.readFileSync(bundlePath, "utf8"));
+  const bundle = normalizeSigstoreBundle(rawBundle, checksumsBuf, bundleFromJSON);
+  const entity = toSignedEntity(bundle, checksumsBuf);
+  verifier.verify(entity, {
+    subjectAlternativeName: certIdentity,
+    extensions: { issuer: oidcIssuer },
+  });
+  return { verifier: "sigstore-native", identity: certIdentity };
+}
+
 function verifyPublisherSignature({
   checksumsPath,
   bundlePath,
@@ -300,6 +387,7 @@ function verifyPublisherSignature({
   tag,
   publicKeyPem = null,
   spawnFn = spawnSync,
+  nativeSigstoreVerifyFn = verifySigstoreBundleNative,
 }) {
   const certIdentity = expectedCertificateIdentity(tag);
   const oidcIssuer = "https://token.actions.githubusercontent.com";
@@ -337,6 +425,8 @@ function verifyPublisherSignature({
 
   // 2. Fallback to GitHub CLI SLSA provenance verification against the archive
   let ghAuthSkipped = null;
+  const hasBundle =
+    Boolean(bundlePath) && fs.existsSync(bundlePath) && fs.statSync(bundlePath).size > 0;
   const ghProbe = spawnFn("gh", ["--version"], { stdio: "pipe" });
   if (!ghProbe.error && ghProbe.status === 0) {
     const res = spawnFn(
@@ -362,9 +452,12 @@ function verifyPublisherSignature({
       /gh auth login|GH_TOKEN|not logged into any GitHub hosts|authentication required/i.test(
         detail
       );
-    // Only fall through to Ed25519 if `gh` is unauthenticated and an Ed25519 key is configured;
+    // Only fall through to native Sigstore or Ed25519 if `gh` is unauthenticated;
     // actual attestation verification failures always fail closed immediately.
-    if (isUnauthenticated && resolveReleasePublicKeyPem(publicKeyPem)) {
+    const hasNativeFallback =
+      (hasBundle && typeof nativeSigstoreVerifyFn === "function") ||
+      Boolean(resolveReleasePublicKeyPem(publicKeyPem));
+    if (isUnauthenticated && hasNativeFallback) {
       ghAuthSkipped = detail;
     } else {
       throw new Error(
@@ -373,7 +466,28 @@ function verifyPublisherSignature({
     }
   }
 
-  // 3. Zero-dependency native Node.js Ed25519 verification against pinned release public key
+  // 3. Built-in native Node.js Sigstore verification against checksums.txt.bundle
+  if (hasBundle && typeof nativeSigstoreVerifyFn === "function") {
+    let nativeResult = null;
+    try {
+      nativeResult = nativeSigstoreVerifyFn({
+        checksumsPath,
+        bundlePath,
+        certIdentity,
+        oidcIssuer,
+      });
+    } catch (err) {
+      const detail = (err && err.message ? err.message : String(err)).trim();
+      throw new Error(
+        `Native Sigstore bundle verification failed for ${tag}: ${detail}`
+      );
+    }
+    if (nativeResult) {
+      return nativeResult;
+    }
+  }
+
+  // 4. Native Node.js Ed25519 verification against pinned release public key
   const pem = resolveReleasePublicKeyPem(publicKeyPem);
   if (pem) {
     if (!ed25519SigPath || !fs.existsSync(ed25519SigPath)) {
@@ -391,7 +505,7 @@ function verifyPublisherSignature({
 
   const extra = ghAuthSkipped ? ` (gh CLI was unauthenticated: ${ghAuthSkipped})` : "";
   throw new Error(
-    `Mandatory publisher signature verification requires 'cosign', authenticated 'gh' (run 'gh auth login' or set GH_TOKEN), or a pinned Ed25519 release public key (ARC_RELEASE_PUBLIC_KEY_PEM/FILE); none was available${extra}. Failing closed.`
+    `Mandatory publisher signature verification requires a valid checksums.txt.bundle (for built-in Sigstore verification or 'cosign'), authenticated 'gh' (run 'gh auth login' or set GH_TOKEN), or a pinned Ed25519 release public key (ARC_RELEASE_PUBLIC_KEY_PEM/FILE); none was available${extra}. Failing closed.`
   );
 }
 
@@ -490,6 +604,8 @@ module.exports = {
   expectedCertificateIdentity,
   checkVersionRollback,
   verifyEd25519Signature,
+  normalizeSigstoreBundle,
+  verifySigstoreBundleNative,
   verifyPublisherSignature,
   extractBinary,
   ensureBinary,

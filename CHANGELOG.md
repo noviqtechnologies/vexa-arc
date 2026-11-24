@@ -2,6 +2,17 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.5.1] - 2026-11-24
+
+### Zero-Prerequisite Native Sigstore Verification in `@vexasec/arc`
+- **Built-in Offline Sigstore Bundle Verification (`npm/bin/arc.js`, `npm/lib/sigstore-trusted-root.json`):**
+  - Added native Node.js Sigstore verification (`@sigstore/verify@^3.1.1`) against the bundled Sigstore Public Good trusted root so `npx @vexasec/arc@latest` works out of the box on clean Windows, macOS, and Linux machines without requiring `cosign`, authenticated `gh`, or a manually configured Ed25519 public key.
+  - Supports both Cosign `sign-blob --bundle` legacy JSON bundles and Sigstore v0.1/v0.2/v0.3 bundles while strictly pinning the exact GitHub Actions release workflow + tag identity (`@refs/tags/<TAG>`) and OIDC issuer (`https://token.actions.githubusercontent.com`), remaining fail-closed on any signature, digest, or identity mismatch.
+  - Updated `gh` fallback so unauthenticated `gh` falls through to built-in native Sigstore verification automatically.
+- **CI & Release Gate Updates (`.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/actions/comment-pr.test.js`):**
+  - Added regression tests for native Sigstore bundle verification, malformed bundle rejection, unauthenticated `gh` fallback, and bundled trusted root validation.
+  - Updated `verify-release` cross-OS smoke tests to execute `npm/bin/arc.js --version` cold without `GH_TOKEN` to verify end-user zero-prerequisite Sigstore verification before publishing to npm.
+
 ## [1.5.0] - 2026-11-23
 
 ### Cross-OS User Cache Directories & `vexa-sca` v1.7.0 Integration

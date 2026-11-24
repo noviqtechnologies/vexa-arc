@@ -1,6 +1,6 @@
 {
   "name": "@vexasec/arc",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "publishConfig": {
     "access": "public"
   },
@@ -10,6 +10,7 @@
   },
   "files": [
     "bin/",
+    "lib/",
     "README.md"
   ],
   "license": "Apache-2.0",
@@ -18,7 +19,7 @@
     "url": "git+https://github.com/noviqtechnologies/vexa-arc.git"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.17.0"
   },
   "os": [
     "darwin",
@@ -28,5 +29,10 @@
   "cpu": [
     "x64",
     "arm64"
-  ]
+  ],
+  "dependencies": {
+    "@sigstore/bundle": "^4.0.0",
+    "@sigstore/protobuf-specs": "^0.5.0",
+    "@sigstore/verify": "^3.1.1"
+  }
 }

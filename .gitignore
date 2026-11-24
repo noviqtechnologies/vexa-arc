@@ -1,6 +1,8 @@
 # Rust & Build Artifacts
 target/
 **/target/
+node_modules/
+**/node_modules/
 **/*.rs.bk
 *.pdb
 *.profraw

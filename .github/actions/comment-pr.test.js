@@ -295,7 +295,7 @@ async function run() {
       /Ed25519 release signature verification failed/
     );
 
-    // 6. Neither cosign, gh, nor pinned Ed25519 key available must fail closed
+    // 6. Malformed/forged Sigstore bundle must fail closed via built-in native Sigstore verifier
     assert.throws(
       () =>
         verifyPublisherSignature({
@@ -305,7 +305,85 @@ async function run() {
           tag: "v1.4.1",
           spawnFn: () => ({ error: new Error("ENOENT"), status: null }),
         }),
+      /Native Sigstore bundle verification failed/
+    );
+
+    // 6b. Native Sigstore verifier succeeds when cosign and gh are absent and pins exact identity + issuer
+    let nativeSigArgs = null;
+    const nativeSigOk = verifyPublisherSignature({
+      checksumsPath: tmpChecksums,
+      bundlePath: tmpBundle,
+      archivePath: tmpArchive,
+      tag: "v1.4.1",
+      spawnFn: () => ({ error: new Error("ENOENT"), status: null }),
+      nativeSigstoreVerifyFn: (args) => {
+        nativeSigArgs = args;
+        return { verifier: "sigstore-native", identity: args.certIdentity };
+      },
+    });
+    assert.strictEqual(nativeSigOk.verifier, "sigstore-native");
+    assert.strictEqual(
+      nativeSigArgs.certIdentity,
+      "https://github.com/noviqtechnologies/vexa-arc/.github/workflows/release.yml@refs/tags/v1.4.1"
+    );
+    assert.strictEqual(
+      nativeSigArgs.oidcIssuer,
+      "https://token.actions.githubusercontent.com"
+    );
+
+    // 6c. Missing bundle and neither cosign, gh, nor pinned Ed25519 key available must fail closed
+    assert.throws(
+      () =>
+        verifyPublisherSignature({
+          checksumsPath: tmpChecksums,
+          bundlePath: null,
+          archivePath: tmpArchive,
+          tag: "v1.4.1",
+          spawnFn: () => ({ error: new Error("ENOENT"), status: null }),
+        }),
       /Mandatory publisher signature verification requires/
+    );
+
+    // 6d. Unauthenticated `gh` falls through to built-in native Sigstore when bundle is present
+    const ghUnauthToSigstore = verifyPublisherSignature({
+      checksumsPath: tmpChecksums,
+      bundlePath: tmpBundle,
+      archivePath: tmpArchive,
+      tag: "v1.4.1",
+      spawnFn: (cmd, args) => {
+        if (cmd === "cosign") return { error: new Error("ENOENT"), status: null };
+        if (cmd === "gh" && args[0] === "--version") return { status: 0 };
+        return {
+          status: 1,
+          stderr: "To get started with GitHub CLI, please run: gh auth login",
+        };
+      },
+      nativeSigstoreVerifyFn: (args) => ({
+        verifier: "sigstore-native",
+        identity: args.certIdentity,
+      }),
+    });
+    assert.strictEqual(ghUnauthToSigstore.verifier, "sigstore-native");
+
+    // 6e. Bundled Sigstore trusted root JSON exists and is valid
+    const trustedRootPath = path.join(
+      __dirname,
+      "..",
+      "..",
+      "npm",
+      "lib",
+      "sigstore-trusted-root.json"
+    );
+    assert.ok(fs.existsSync(trustedRootPath), "npm/lib/sigstore-trusted-root.json must exist");
+    const trustedRootJson = JSON.parse(fs.readFileSync(trustedRootPath, "utf8"));
+    assert.ok(
+      Array.isArray(trustedRootJson.certificateAuthorities) &&
+        trustedRootJson.certificateAuthorities.length > 0,
+      "Bundled Sigstore trusted root must contain Fulcio CAs"
+    );
+    assert.ok(
+      Array.isArray(trustedRootJson.tlogs) && trustedRootJson.tlogs.length > 0,
+      "Bundled Sigstore trusted root must contain Rekor tlogs"
     );
 
     // 7. Unauthenticated `gh` falls through to Ed25519 when a pinned key is configured,
