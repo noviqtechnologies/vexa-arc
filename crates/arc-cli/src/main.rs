@@ -3401,12 +3401,8 @@ fn maybe_sync_audit_to_cloud(
     {
         return None;
     }
-    let payload = commands::ci_report::build_arc_inventory_payload_from_audit(
-        path,
-        report,
-        workstation,
-        0,
-    );
+    let payload =
+        commands::ci_report::build_arc_inventory_payload_from_audit(path, report, workstation, 0);
     Some(
         arc_telemetry::upload_arc_inventory(&payload, api_url).map(|resp| {
             resp.get("snapshot_id")
@@ -3516,7 +3512,10 @@ fn run_audit(
                             report.model_assets.len()
                         );
                         for m in report.model_assets.iter().take(25) {
-                            println!("    • {:<24} [format: {}] ({} bytes)", m.name, m.kind, m.size_bytes);
+                            println!(
+                                "    • {:<24} [format: {}] ({} bytes)",
+                                m.name, m.kind, m.size_bytes
+                            );
                         }
                         if report.model_assets.len() > 25 {
                             println!("    ... and {} more", report.model_assets.len() - 25);

@@ -1393,9 +1393,7 @@ mod tests {
         let report = scanner.audit_directory(&temp_dir).unwrap();
         assert_eq!(report.exposed_secrets.len(), 1);
         assert!(
-            report.exposed_secrets[0]
-                .file_path
-                .ends_with("app.env"),
+            report.exposed_secrets[0].file_path.ends_with("app.env"),
             "unexpected secret path: {:?}",
             report.exposed_secrets[0].file_path
         );

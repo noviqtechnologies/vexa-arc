@@ -232,8 +232,12 @@ pub fn run_setup(
     let mut authed_email: Option<String> = None;
 
     if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
-        if !crate::commands::auth::run_auth_login_with_quiet(Some(tok), Some(&base_url), false, json)
-        {
+        if !crate::commands::auth::run_auth_login_with_quiet(
+            Some(tok),
+            Some(&base_url),
+            false,
+            json,
+        ) {
             return false;
         }
         if let Some(c) = VexaCloudAuth::load_stored_credentials() {
@@ -348,20 +352,17 @@ pub fn run_setup(
     //    populates MCP Governance & AI-BOM Anomalies immediately after onboarding.
     let inventory_synced = if let Ok(ref s) = init_result {
         if let Some(ref report) = s.audit_report {
-            let inv_payload =
-                crate::commands::ci_report::build_arc_inventory_payload_from_audit(
-                    project_dir,
-                    report,
-                    s.is_workstation_scope,
-                    0,
-                );
+            let inv_payload = crate::commands::ci_report::build_arc_inventory_payload_from_audit(
+                project_dir,
+                report,
+                s.is_workstation_scope,
+                0,
+            );
             match arc_telemetry::upload_arc_inventory(&inv_payload, Some(&base_url)) {
                 Ok(_) => true,
                 Err(e) => {
                     if !json {
-                        eprintln!(
-                            "[Arc Setup] Warning: initial AI-BOM inventory sync failed: {e}"
-                        );
+                        eprintln!("[Arc Setup] Warning: initial AI-BOM inventory sync failed: {e}");
                     }
                     false
                 }
@@ -437,7 +438,11 @@ fn format_setup_summary(
         base_url,
         org,
         if heartbeat_ok { "connected" } else { "queued" },
-        if inventory_synced { "synced" } else { "pending" }
+        if inventory_synced {
+            "synced"
+        } else {
+            "pending"
+        }
     ));
 
     if let Some(s) = init_summary {

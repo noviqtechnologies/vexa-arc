@@ -3757,7 +3757,10 @@ fn test_v16_audit_and_setup_cloud_inventory_sync() {
     let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
     fs::write(root_dir.join(".env"), format!("AWS_KEY={fake_aws}\n")).unwrap();
     fs::write(
-        root_dir.join(".sca-cache").join("advisories").join("GHSA-1.json"),
+        root_dir
+            .join(".sca-cache")
+            .join("advisories")
+            .join("GHSA-1.json"),
         format!(r#"{{"token":"{fake_aws}"}}"#),
     )
     .unwrap();
@@ -3798,8 +3801,7 @@ fn test_v16_audit_and_setup_cloud_inventory_sync() {
                             Ok(n) => {
                                 raw.extend_from_slice(&chunk[..n]);
                                 if header_end.is_none() {
-                                    if let Some(pos) =
-                                        raw.windows(4).position(|w| w == b"\r\n\r\n")
+                                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
                                     {
                                         header_end = Some(pos + 4);
                                         let hdrs = String::from_utf8_lossy(&raw[..pos]);
@@ -3826,7 +3828,10 @@ fn test_v16_audit_and_setup_cloud_inventory_sync() {
                     let body = header_end
                         .map(|h| String::from_utf8_lossy(&raw[h..]).to_string())
                         .unwrap_or_default();
-                    received_for_srv.lock().unwrap().push((first_line.clone(), body));
+                    received_for_srv
+                        .lock()
+                        .unwrap()
+                        .push((first_line.clone(), body));
 
                     let resp_body = if first_line.contains("/auth/whoami")
                         || first_line.contains("/auth/status")
@@ -3926,7 +3931,11 @@ fn test_v16_audit_and_setup_cloud_inventory_sync() {
         .filter(|(line, _)| line.contains("POST /sca/v1/arc/inventory"))
         .map(|(_, body)| body.clone())
         .collect();
-    assert_eq!(inv_reqs.len(), 1, "expected 1 /arc/inventory POST from arc audit");
+    assert_eq!(
+        inv_reqs.len(),
+        1,
+        "expected 1 /arc/inventory POST from arc audit"
+    );
     let inv_body: serde_json::Value = serde_json::from_str(&inv_reqs[0]).unwrap();
     assert_eq!(inv_body["exposed_secrets_count"], 1);
     assert!(inv_body["mcp_servers"]
@@ -3939,7 +3948,10 @@ fn test_v16_audit_and_setup_cloud_inventory_sync() {
         .unwrap()
         .iter()
         .any(|s| s["name"] == "CLAUDE.md"));
-    assert!(!inv_reqs[0].contains(&fake_aws), "raw secret must never leave workstation");
+    assert!(
+        !inv_reqs[0].contains(&fake_aws),
+        "raw secret must never leave workstation"
+    );
 
     // 3. `arc audit --no-upload` must NOT hit /arc/inventory
     let count_before_no_upload = received_paths.lock().unwrap().len();
