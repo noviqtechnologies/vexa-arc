@@ -546,7 +546,7 @@ If the collector is unavailable, Arc continues with its existing security behavi
 
 ## CI/CD Quality Gate (GitHub Actions & PR Commenter)
 
-Add Vexa Arc to any repository in 6 lines to scan PRs for leaked secrets, hidden Unicode in agent rules, unpinned MCP servers, and vulnerable dependencies, posting a single deduplicated PR summary comment:
+Add Vexa Arc to any repository to scan PRs for leaked secrets, hidden Unicode in agent rules, unpinned MCP servers, policy fixture compliance, vulnerable dependencies (SCA), and license risk—posting a single deduplicated multi-engine severity matrix PR comment (`<!-- vexa-arc-pr-report -->`):
 
 ```yaml
 name: Vexa Arc Security Gate
@@ -562,7 +562,7 @@ jobs:
     runs-on: ubuntu-latest # also supports macos-latest and windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: noviqtechnologies/vexa-arc@v1.3.0
+      - uses: noviqtechnologies/vexa-arc@v1.7.0
         with:
           fail-on: high
           fail-on-secrets: 'true'

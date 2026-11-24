@@ -1,3 +1,4 @@
+use crate::commands::rollout::{evaluate_policy_tests, PolicyTestSummary};
 use arc_discover::scanner::DiscoveryScanner;
 use arc_dlp::detector::SecretScanEngine;
 use arc_dlp::sanitizer::sanitize_inbound_text;
@@ -29,6 +30,8 @@ pub struct CiReport {
     pub unpinned_mcp_servers: Vec<String>,
     pub agent_skills_count: usize,
     pub sca: Option<ScaAuditResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_test: Option<PolicyTestSummary>,
     pub checks_enforced: Vec<String>,
     pub advisory_warnings: Vec<String>,
     pub passed: bool,
@@ -92,12 +95,31 @@ fn is_agent_instruction_file(path: &Path) -> bool {
         || lower.ends_with(".prompt.md")
 }
 
+#[cfg(test)]
 pub fn generate_ci_report(
     path: &Path,
     run_sca: bool,
     fail_on: Option<&str>,
     fail_on_secrets: bool,
     fail_on_unpinned_mcp: bool,
+) -> Result<CiReport, String> {
+    generate_ci_report_with_options(
+        path,
+        run_sca,
+        fail_on,
+        fail_on_secrets,
+        fail_on_unpinned_mcp,
+        false,
+    )
+}
+
+pub fn generate_ci_report_with_options(
+    path: &Path,
+    run_sca: bool,
+    fail_on: Option<&str>,
+    fail_on_secrets: bool,
+    fail_on_unpinned_mcp: bool,
+    run_policy_test: bool,
 ) -> Result<CiReport, String> {
     if !path.exists() || !path.is_dir() {
         return Err(format!(
@@ -175,6 +197,13 @@ pub fn generate_ci_report(
         None
     };
 
+    let policy_test = if run_policy_test {
+        let (summary, _) = evaluate_policy_tests(path);
+        Some(summary)
+    } else {
+        None
+    };
+
     let mut checks_enforced = vec!["unicode_anomalies".to_string()];
     if fail_on_secrets {
         checks_enforced.push("secrets".to_string());
@@ -184,6 +213,9 @@ pub fn generate_ci_report(
     }
     if run_sca {
         checks_enforced.push(format!("sca(fail_on={})", fail_on.unwrap_or("high")));
+    }
+    if run_policy_test {
+        checks_enforced.push("policy_fixtures".to_string());
     }
 
     let mut failure_reasons = Vec::new();
@@ -227,6 +259,16 @@ pub fn generate_ci_report(
             );
         }
     }
+    if let Some(ref pt) = policy_test {
+        if !pt.all_passed {
+            failure_reasons.push(format!(
+                "Policy fixture verification failed ({} of {} failed): {}",
+                pt.failed_fixtures.len(),
+                pt.fixture_count,
+                pt.failed_fixtures.join(", ")
+            ));
+        }
+    }
 
     let passed = failure_reasons.is_empty();
 
@@ -238,6 +280,7 @@ pub fn generate_ci_report(
         unpinned_mcp_servers,
         agent_skills_count: audit.agent_skills.len(),
         sca,
+        policy_test,
         checks_enforced,
         advisory_warnings,
         passed,
@@ -614,92 +657,238 @@ pub fn upload_ci_report_to_cloud(
     Ok(result_url)
 }
 
+fn escape_md_cell(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('`', "'")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace(['\r', '\n'], " ")
+}
+
 pub fn render_markdown_report(report: &CiReport) -> String {
-    let status_badge = if report.passed {
-        "✅ **PASSED**"
-    } else {
-        "❌ **FAILED**"
-    };
     let mut md = String::new();
     md.push_str("<!-- vexa-arc-pr-report -->\n");
+
+    let secrets_gated = report.checks_enforced.iter().any(|c| c == "secrets");
+    let mcp_gated = report
+        .checks_enforced
+        .iter()
+        .any(|c| c == "unpinned_mcp_servers");
+
+    let sec_crit = report.secrets.len();
+    let uni_crit = report.unicode_anomalies.len();
+    let mcp_high = report.unpinned_mcp_servers.len();
+
+    let (sca_crit, sca_high, sca_med, sca_low, sca_total) = match &report.sca {
+        Some(s) => (
+            s.critical_count,
+            s.high_count,
+            s.medium_count,
+            s.low_count,
+            s.total_vulnerabilities,
+        ),
+        None => (0, 0, 0, 0, 0),
+    };
+
+    let (lic_high, lic_med, lic_low, lic_total, has_licenses) =
+        match report.sca.as_ref().and_then(|s| s.licenses.as_ref()) {
+            Some(l) => (
+                l.strong_copyleft,
+                l.weak_copyleft,
+                l.unknown,
+                l.strong_copyleft + l.weak_copyleft + l.unknown,
+                true,
+            ),
+            None => (0, 0, 0, 0, false),
+        };
+
+    let policy_failed_count = report
+        .policy_test
+        .as_ref()
+        .map(|p| p.failed_fixtures.len())
+        .unwrap_or(0);
+
+    let total_issues = sec_crit + uni_crit + mcp_high + sca_total + lic_total + policy_failed_count;
+
+    if report.passed && total_issues == 0 {
+        md.push_str("### ✅ Vexa Arc checks have passed. No issues have been found so far.\n\n");
+    } else if report.passed {
+        md.push_str(&format!(
+            "### ✅ Vexa Arc checks have passed ({total_issues} advisory/ungated finding(s)).\n\n"
+        ));
+    } else {
+        md.push_str(&format!(
+            "### ❌ Vexa Arc checks failed ({total_issues} total issue(s) found).\n\n"
+        ));
+    }
+
     md.push_str(&format!(
-        "## 🛡️ Vexa Arc Security Report — {status_badge}\n\n"
+        "| Status | Scan Engine | Critical | High | Medium | Low | Total ({total_issues}) |\n"
+    ));
+    md.push_str("| :---: | :--- | :---: | :---: | :---: | :---: | :---: |\n");
+
+    let sec_status = if sec_crit > 0 && secrets_gated {
+        "❌"
+    } else if sec_crit > 0 {
+        "⚠️"
+    } else {
+        "✅"
+    };
+    md.push_str(&format!(
+        "| {sec_status} | **Secret Detection (DLP)** | {sec_crit} | 0 | 0 | 0 | {sec_crit} issues |\n"
     ));
 
-    md.push_str("| Check | Result |\n| :--- | :--- |\n");
+    let uni_status = if uni_crit > 0 { "❌" } else { "✅" };
     md.push_str(&format!(
-        "| **Leaked Secrets** | {} finding(s) |\n",
-        report.secrets.len()
+        "| {uni_status} | **Agent Prompt / Unicode Integrity** | {uni_crit} | 0 | 0 | 0 | {uni_crit} issues |\n"
     ));
+
+    let mcp_status = if mcp_high > 0 && mcp_gated {
+        "❌"
+    } else if mcp_high > 0 {
+        "⚠️"
+    } else {
+        "✅"
+    };
+    let mcp_total_cell = if report.mcp_servers_total > 0 {
+        format!("{mcp_high} unpinned ({} total)", report.mcp_servers_total)
+    } else {
+        format!("{mcp_high} issues")
+    };
     md.push_str(&format!(
-        "| **Hidden Unicode / Injection** | {} file(s) |\n",
-        report.unicode_anomalies.len()
-    ));
-    md.push_str(&format!(
-        "| **MCP Servers** | {} discovered ({} unpinned) |\n",
-        report.mcp_servers_total,
-        report.unpinned_mcp_servers.len()
-    ));
-    md.push_str(&format!(
-        "| **Agent Rules / Skills** | {} file(s) |\n",
-        report.agent_skills_count
+        "| {mcp_status} | **MCP Supply Chain & Pinning** | 0 | {mcp_high} | 0 | 0 | {mcp_total_cell} |\n"
     ));
 
     if let Some(ref sca) = report.sca {
+        let sca_status = if sca.should_fail {
+            "❌"
+        } else if sca_total > 0 {
+            "⚠️"
+        } else {
+            "✅"
+        };
+        let sca_total_cell = if sca_total > 0 && sca.reachable_count > 0 {
+            format!("{sca_total} issues ({} reachable)", sca.reachable_count)
+        } else {
+            format!("{sca_total} issues")
+        };
         md.push_str(&format!(
-            "| **Dependencies (SCA)** | {} total ({} critical, {} high, {} reachable) |\n",
-            sca.total_vulnerabilities, sca.critical_count, sca.high_count, sca.reachable_count
+            "| {sca_status} | **Open Source Security (SCA)** | {sca_crit} | {sca_high} | {sca_med} | {sca_low} | {sca_total_cell} |\n"
         ));
     } else {
-        md.push_str("| **Dependencies (SCA)** | skipped / no supported manifest |\n");
+        md.push_str("| ⏭️ | **Open Source Security (SCA)** | — | — | — | — | skipped |\n");
     }
 
-    if !report.secrets.is_empty() {
-        md.push_str("\n### Secrets Detected\n");
-        for s in report.secrets.iter().take(15) {
-            md.push_str(&format!(
-                "- `{}` in `{}` (`{}`)\n",
-                s.detector, s.file_path, s.snippet
-            ));
-        }
-    }
-
-    if !report.unicode_anomalies.is_empty() {
-        md.push_str("\n### Hidden Unicode / Trojan Source in Agent Rules\n");
-        for u in &report.unicode_anomalies {
-            md.push_str(&format!(
-                "- `{}` contains invisible or bidi-override characters\n",
-                u.file_path
-            ));
-        }
-    }
-
-    if !report.unpinned_mcp_servers.is_empty() {
-        md.push_str("\n### Unpinned MCP Servers (Advisory)\n");
+    if has_licenses {
+        let lic_status = if lic_total > 0 { "⚠️" } else { "✅" };
         md.push_str(&format!(
-            "- Servers without `.arc/mcp-pins.lock` entries: `{}`\n",
-            report.unpinned_mcp_servers.join("`, `")
+            "| {lic_status} | **Licenses** | 0 | {lic_high} | {lic_med} | {lic_low} | {lic_total} issues |\n"
         ));
+    } else {
+        md.push_str("| ⏭️ | **Licenses** | — | — | — | — | skipped |\n");
+    }
+
+    if let Some(ref pt) = report.policy_test {
+        let pt_status = if pt.all_passed { "✅" } else { "❌" };
+        let passed_count = pt.fixture_count.saturating_sub(policy_failed_count);
+        md.push_str(&format!(
+            "| {pt_status} | **Policy Fixtures** | 0 | {policy_failed_count} | 0 | 0 | {policy_failed_count} failed ({passed_count}/{} passed) |\n",
+            pt.fixture_count
+        ));
+    } else {
+        md.push_str("| ⏭️ | **Policy Fixtures** | — | — | — | — | skipped |\n");
     }
 
     md.push_str(&format!(
-        "\n**Enforced Gate Checks:** `{}`\n",
+        "\n**Inventory:** {} MCP server(s) • {} agent rule/skill file(s) | **Enforced Gate Checks:** `{}`\n",
+        report.mcp_servers_total,
+        report.agent_skills_count,
         report.checks_enforced.join("`, `")
     ));
-    if !report.advisory_warnings.is_empty() {
-        md.push_str("\n### Advisory Warnings (Not Gated)\n");
-        for w in &report.advisory_warnings {
-            md.push_str(&format!("- {w}\n"));
+
+    if !report.secrets.is_empty() {
+        md.push_str(&format!(
+            "\n<details>\n<summary>🔑 <b>Secrets Detected ({} finding(s))</b></summary>\n\n",
+            report.secrets.len()
+        ));
+        md.push_str("| Detector | File | Sanitized Match |\n| :--- | :--- | :--- |\n");
+        for s in report.secrets.iter().take(20) {
+            md.push_str(&format!(
+                "| `{}` | `{}` | `{}` |\n",
+                escape_md_cell(&s.detector),
+                escape_md_cell(&s.file_path),
+                escape_md_cell(&s.snippet)
+            ));
         }
+        if report.secrets.len() > 20 {
+            md.push_str(&format!(
+                "\n*...and {} more secret finding(s).*\n",
+                report.secrets.len() - 20
+            ));
+        }
+        md.push_str("\n</details>\n");
     }
-    if !report.failure_reasons.is_empty() {
-        md.push_str("\n### Gate Failures\n");
-        for r in &report.failure_reasons {
-            md.push_str(&format!("- {r}\n"));
+
+    if !report.unicode_anomalies.is_empty() {
+        md.push_str(&format!(
+            "\n<details>\n<summary>🧬 <b>Hidden Unicode / Trojan Source in Agent Rules ({} file(s))</b></summary>\n\n",
+            report.unicode_anomalies.len()
+        ));
+        for u in report.unicode_anomalies.iter().take(20) {
+            md.push_str(&format!(
+                "- `{}` contains invisible or bidi-override characters\n",
+                escape_md_cell(&u.file_path)
+            ));
+        }
+        md.push_str("\n</details>\n");
+    }
+
+    if !report.unpinned_mcp_servers.is_empty() {
+        let label = if mcp_gated { "Gated" } else { "Advisory" };
+        md.push_str(&format!(
+            "\n<details>\n<summary>🔌 <b>Unpinned MCP Servers ({label} — {} server(s))</b></summary>\n\n",
+            report.unpinned_mcp_servers.len()
+        ));
+        let escaped: Vec<String> = report
+            .unpinned_mcp_servers
+            .iter()
+            .map(|s| escape_md_cell(s))
+            .collect();
+        md.push_str(&format!(
+            "- Servers without `.arc/mcp-pins.lock` entries: `{}`\n",
+            escaped.join("`, `")
+        ));
+        md.push_str("\n</details>\n");
+    }
+
+    if let Some(ref pt) = report.policy_test {
+        if !pt.failed_fixtures.is_empty() {
+            md.push_str(&format!(
+                "\n<details>\n<summary>🧪 <b>Failed Policy Fixtures ({} failed)</b></summary>\n\n",
+                pt.failed_fixtures.len()
+            ));
+            for f in &pt.failed_fixtures {
+                md.push_str(&format!("- `{}`\n", escape_md_cell(f)));
+            }
+            md.push_str("\n</details>\n");
         }
     }
 
-    md.push_str("\n<sub>Generated by Vexa Arc (`arc ci-report`)</sub>\n");
+    if !report.advisory_warnings.is_empty() {
+        md.push_str("\n#### ⚠️ Advisory Warnings (Not Gated)\n");
+        for w in &report.advisory_warnings {
+            md.push_str(&format!("- {}\n", escape_md_cell(w)));
+        }
+    }
+    if !report.failure_reasons.is_empty() {
+        md.push_str("\n#### 🚦 Gate Failures\n");
+        for r in &report.failure_reasons {
+            md.push_str(&format!("- {}\n", escape_md_cell(r)));
+        }
+    }
+
+    md.push_str("\n💻 Catch issues earlier locally with `npx @vexasec/arc init` (Claude Code, Cursor, Codex CLI, Gemini CLI, Windsurf).\n");
     md
 }
 
@@ -710,18 +899,20 @@ pub fn run_ci_report(
     fail_on: Option<&str>,
     fail_on_secrets: bool,
     fail_on_unpinned_mcp: bool,
+    run_policy_test: bool,
     markdown_out: Option<&Path>,
     json_out: Option<&Path>,
     json: bool,
     upload: bool,
     api_url: Option<&str>,
 ) -> bool {
-    let report = match generate_ci_report(
+    let report = match generate_ci_report_with_options(
         path,
         run_sca,
         fail_on,
         fail_on_secrets,
         fail_on_unpinned_mcp,
+        run_policy_test,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -854,6 +1045,61 @@ mod tests {
         // Zero-code-retention: never leak raw secret values or file paths
         let inv_str = inv.to_string();
         assert!(!inv_str.contains("AKIAIOSFODNN7EXAMPLE"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_markdown_report_emits_severity_matrix_policy_and_licenses() {
+        let dir = std::env::temp_dir().join(format!("arc_ci_matrix_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "clean\n").unwrap();
+
+        let mut report = generate_ci_report_with_options(&dir, false, None, true, false, true)
+            .expect("generate clean report with policy tests");
+        assert!(report.passed);
+        assert!(report.policy_test.as_ref().unwrap().all_passed);
+
+        let clean_md = render_markdown_report(&report);
+        assert!(clean_md.contains("Vexa Arc checks have passed. No issues have been found so far."));
+        assert!(clean_md
+            .contains("| Status | Scan Engine | Critical | High | Medium | Low | Total (0) |"));
+        assert!(clean_md
+            .contains("| ✅ | **Policy Fixtures** | 0 | 0 | 0 | 0 | 0 failed (10/10 passed) |"));
+        assert!(
+            clean_md.contains("| ⏭️ | **Open Source Security (SCA)** | — | — | — | — | skipped |")
+        );
+        assert!(clean_md.contains("npx @vexasec/arc init"));
+
+        // Attach SCA + License summary and ensure all 4 severities + licenses render
+        report.sca = Some(arc_firewall::remediation::ScaAuditResult {
+            project_dir: ".".to_string(),
+            manifest_file: "Cargo.lock".to_string(),
+            manifest_type: "CargoLock".to_string(),
+            total_vulnerabilities: 4,
+            reachable_count: 1,
+            critical_count: 1,
+            high_count: 1,
+            medium_count: 1,
+            low_count: 1,
+            licenses: Some(arc_firewall::remediation::ScaLicenseSummary {
+                total: 5,
+                permissive: 3,
+                weak_copyleft: 1,
+                strong_copyleft: 1,
+                unknown: 0,
+            }),
+            sarif_path: None,
+            should_fail: true,
+            failure_reason: Some("SCA threshold exceeded".to_string()),
+        });
+        report.passed = false;
+        let full_md = render_markdown_report(&report);
+        assert!(full_md.contains(
+            "| ❌ | **Open Source Security (SCA)** | 1 | 1 | 1 | 1 | 4 issues (1 reachable) |"
+        ));
+        assert!(full_md.contains("| ⚠️ | **Licenses** | 0 | 1 | 1 | 0 | 2 issues |"));
+        assert!(full_md.contains("Total (6)"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

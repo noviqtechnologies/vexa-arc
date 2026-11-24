@@ -24,7 +24,7 @@ jobs:
 
       - name: Build and install Vexa SCA CLI
         run: |
-          git clone --depth 1 --branch v1.5.0 https://github.com/noviqtechnologies/vexa-sca.git /tmp/vexa-sca
+          git clone --depth 1 --branch v1.8.0 https://github.com/noviqtechnologies/vexa-sca.git /tmp/vexa-sca
           cargo build --locked --release --manifest-path /tmp/vexa-sca/Cargo.toml
           sudo cp /tmp/vexa-sca/target/release/vexa-sca /usr/local/bin/vexa-sca
           rm -rf /tmp/vexa-sca

@@ -163,13 +163,13 @@ For agents without native hook integrations (e.g. Cline, VS Code Copilot) — or
 
 ### CI/CD & Pull Request Gate (`arc ci-report` & GitHub Action)
 
-Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON report covering leaked secrets, hidden Unicode/Trojan-Source characters in agent rule files (`CLAUDE.md`, `.cursorrules`, `.mdc`), unpinned MCP servers, and optional SCA vulnerability counts:
+Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON PR security matrix covering **Secret Detection (DLP)**, **Agent Prompt / Unicode Integrity** (`CLAUDE.md`, `.cursorrules`, `.mdc`), **MCP Supply Chain & Pinning**, **Open Source Security (SCA)**, **Licenses**, and **Policy Fixtures** (`--policy-test`):
 
 ```bash
-arc ci-report --sca --fail-on high --fail-on-unpinned-mcp --markdown-out arc-pr-report.md --json-out arc-pr-report.json
+arc ci-report --sca --policy-test --fail-on high --fail-on-unpinned-mcp --markdown-out arc-pr-report.md --json-out arc-pr-report.json
 ```
 
-For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.1.0`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
+For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.7.0`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
 
 ### Remote Streamable HTTP / SSE MCP Proxy (`arc protect http`)
 

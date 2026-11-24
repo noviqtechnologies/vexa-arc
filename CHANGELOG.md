@@ -2,6 +2,17 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.7.0] - 2026-11-24
+
+### Multi-Engine PR Security Matrix, License Exposure & Policy Fixture Reporting
+- **Multi-Engine PR Security Matrix (`arc-cli`, `action.yml`, `.github/actions/comment-pr.js`):**
+  - Upgraded `arc ci-report` Markdown rendering to a 7-column severity matrix (`Status | Scan Engine | Critical | High | Medium | Low | Total`) covering **Secret Detection (DLP)**, **Agent Prompt / Unicode Integrity**, **MCP Supply Chain & Pinning**, **Open Source Security (SCA)** (all 4 severities + reachable count), **Licenses**, and **Policy Fixtures**, with collapsible `<details>` sections, Markdown/HTML injection escaping (`escape_md_cell`), and a shift-left local onboarding CTA.
+  - Added `--policy-test` flag to `arc ci-report` (and wired it in `action.yml` when `run-policy-test: 'true'`) so deterministic policy fixture results are included directly in the PR report matrix.
+  - Hardened `.github/actions/comment-pr.js` with a 65,000-character truncation guard (`clampCommentBody`) for GitHub's PR comment API limit.
+- **License Summary Surfacing & `vexa-sca` v1.8.0 Upgrade (`arc-firewall`, `Cargo.toml`):**
+  - Added `ScaLicenseSummary` to `ScaAuditResult` and populated it directly from `vexa_sca::scan_project`'s `license_audit` instead of discarding it.
+  - Upgraded `vexa-sca` and `vexa-core` dependencies to `v1.8.0` and updated `.github/workflows/vexa-sca.yml`, `README.md`, and `docs/user-guide.md`.
+
 ## [1.6.0] - 2026-11-24
 
 ### Automatic Cloud AI-BOM Sync, Fair Workstation Discovery & CLI Ergonomics

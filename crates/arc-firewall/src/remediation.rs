@@ -99,6 +99,15 @@ impl Default for ScaAuditOptions {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScaLicenseSummary {
+    pub total: usize,
+    pub permissive: usize,
+    pub weak_copyleft: usize,
+    pub strong_copyleft: usize,
+    pub unknown: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScaAuditResult {
     pub project_dir: String,
@@ -110,6 +119,8 @@ pub struct ScaAuditResult {
     pub high_count: usize,
     pub medium_count: usize,
     pub low_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licenses: Option<ScaLicenseSummary>,
     pub sarif_path: Option<String>,
     pub should_fail: bool,
     pub failure_reason: Option<String>,
@@ -204,6 +215,17 @@ pub async fn run_sca_audit(
         None
     };
 
+    let licenses = scan_out
+        .license_audit
+        .as_ref()
+        .map(|audit| ScaLicenseSummary {
+            total: audit.summary.total,
+            permissive: audit.summary.permissive,
+            weak_copyleft: audit.summary.weak_copyleft,
+            strong_copyleft: audit.summary.strong_copyleft,
+            unknown: audit.summary.unknown,
+        });
+
     Ok(ScaAuditResult {
         project_dir: project_dir.display().to_string(),
         manifest_file: scan_out.manifest_file.display().to_string(),
@@ -214,6 +236,7 @@ pub async fn run_sca_audit(
         high_count,
         medium_count,
         low_count,
+        licenses,
         sarif_path,
         should_fail,
         failure_reason,

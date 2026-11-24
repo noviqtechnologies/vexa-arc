@@ -5,6 +5,14 @@ const fs = require("fs");
 const https = require("https");
 
 const MARKER = "<!-- vexa-arc-pr-report -->";
+const MAX_GITHUB_COMMENT_CHARS = 65000;
+
+function clampCommentBody(markdown) {
+  if (typeof markdown !== "string") return "";
+  if (markdown.length <= MAX_GITHUB_COMMENT_CHARS) return markdown;
+  const suffix = "\n\n*Report truncated to fit GitHub PR comment size limit.*\n";
+  return markdown.slice(0, MAX_GITHUB_COMMENT_CHARS - suffix.length) + suffix;
+}
 
 function githubRequest(method, apiPath, token, body) {
   return new Promise((resolve, reject) => {
@@ -70,6 +78,7 @@ async function upsertPrComment({
   if (!token || !repo || !prNumber) {
     return { skipped: true, reason: "missing token, repo, or PR number" };
   }
+  const safeBody = clampCommentBody(markdown);
   const commentsPath = `/repos/${repo}/issues/${prNumber}/comments?per_page=100`;
   const listRes = await requestFn("GET", commentsPath, token, null);
   if (listRes.status < 200 || listRes.status >= 300) {
@@ -82,7 +91,7 @@ async function upsertPrComment({
       "PATCH",
       `/repos/${repo}/issues/comments/${existingId}`,
       token,
-      { body: markdown }
+      { body: safeBody }
     );
     return { updated: true, commentId: existingId, status: patchRes.status };
   }
@@ -91,7 +100,7 @@ async function upsertPrComment({
     "POST",
     `/repos/${repo}/issues/${prNumber}/comments`,
     token,
-    { body: markdown }
+    { body: safeBody }
   );
   return { created: true, commentId: postRes.body?.id ?? null, status: postRes.status };
 }
@@ -133,7 +142,9 @@ if (require.main === module) {
 
 module.exports = {
   MARKER,
+  MAX_GITHUB_COMMENT_CHARS,
   findExistingCommentId,
   resolvePullRequestNumber,
+  clampCommentBody,
   upsertPrComment,
 };

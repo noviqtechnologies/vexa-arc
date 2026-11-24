@@ -317,6 +317,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         fail_on_unpinned_mcp: bool,
 
+        /// Run deterministic policy & MCP rollout fixtures and include results in the report
+        #[arg(long, default_value_t = false)]
+        policy_test: bool,
+
         /// Write rendered Markdown PR report to file
         #[arg(long)]
         markdown_out: Option<PathBuf>,
@@ -1757,6 +1761,7 @@ fn main() {
             fail_on,
             fail_on_secrets,
             fail_on_unpinned_mcp,
+            policy_test,
             markdown_out,
             json_out,
             json,
@@ -1769,6 +1774,7 @@ fn main() {
                 fail_on.as_deref(),
                 fail_on_secrets,
                 fail_on_unpinned_mcp,
+                policy_test,
                 markdown_out.as_deref(),
                 json_out.as_deref(),
                 json,

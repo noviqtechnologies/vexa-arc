@@ -136,6 +136,9 @@ runs:
         if [ "$INPUT_RUN_SCA" = "true" ]; then
           ARGS+=(--sca)
         fi
+        if [ "$INPUT_RUN_POLICY_TEST" = "true" ]; then
+          ARGS+=(--policy-test)
+        fi
         if [ -n "$INPUT_FAIL_ON" ]; then
           ARGS+=(--fail-on "$INPUT_FAIL_ON")
         fi

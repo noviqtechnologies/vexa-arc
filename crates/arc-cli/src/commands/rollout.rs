@@ -588,8 +588,18 @@ pub fn run_mcp_rollout_report(
     true
 }
 
-/// Runs the 10 deterministic checked-in policy & MCP rollout fixtures across PolicyEvaluator and McpStdioBroker.
-pub fn run_policy_test(path: &Path, json: bool) -> bool {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyTestSummary {
+    pub all_passed: bool,
+    pub fixture_count: usize,
+    pub failed_fixtures: Vec<String>,
+    pub policy_revision: String,
+}
+
+/// Evaluates the 10 deterministic checked-in policy & MCP rollout fixtures and returns structured results.
+pub fn evaluate_policy_tests(
+    path: &Path,
+) -> (PolicyTestSummary, Vec<(&'static str, bool, &'static str)>) {
     let active_policy = PolicyConfig::load_with_precedence(Some(path));
     let policy_revision = active_policy.revision_hash();
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -849,6 +859,25 @@ pub fn run_policy_test(path: &Path, json: bool) -> bool {
     fixtures.push(("policy_conflict_signed_org_vs_local_exception", f10, "deny"));
 
     let all_passed = fixtures.iter().all(|(_, passed, _)| *passed);
+    let failed_fixtures: Vec<String> = fixtures
+        .iter()
+        .filter(|(_, passed, _)| !*passed)
+        .map(|(name, _, _)| (*name).to_string())
+        .collect();
+    let summary = PolicyTestSummary {
+        all_passed,
+        fixture_count: fixtures.len(),
+        failed_fixtures,
+        policy_revision,
+    };
+    (summary, fixtures)
+}
+
+/// Runs the 10 deterministic checked-in policy & MCP rollout fixtures across PolicyEvaluator and McpStdioBroker.
+pub fn run_policy_test(path: &Path, json: bool) -> bool {
+    let (summary, fixtures) = evaluate_policy_tests(path);
+    let all_passed = summary.all_passed;
+    let policy_revision = summary.policy_revision;
 
     if json {
         let list: Vec<serde_json::Value> = fixtures
