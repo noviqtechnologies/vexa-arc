@@ -24,6 +24,7 @@ misc/
 design/
 outputs/
 completed/
+npm/
 
 # IDEs & Editors
 .vscode/
