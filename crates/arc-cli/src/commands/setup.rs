@@ -232,7 +232,8 @@ pub fn run_setup(
     let mut authed_email: Option<String> = None;
 
     if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
-        if !crate::commands::auth::run_auth_login(Some(tok), Some(&base_url), false) {
+        if !crate::commands::auth::run_auth_login_with_quiet(Some(tok), Some(&base_url), false, json)
+        {
             return false;
         }
         if let Some(c) = VexaCloudAuth::load_stored_credentials() {
@@ -343,6 +344,35 @@ pub fn run_setup(
     let hb = build_workstation_heartbeat(project_dir);
     let heartbeat_ok = emit_cloud_heartbeat(&hb, Some(&base_url));
 
+    // 5. Upload initial zero-code AI-BOM / MCP inventory snapshot so the dashboard
+    //    populates MCP Governance & AI-BOM Anomalies immediately after onboarding.
+    let inventory_synced = if let Ok(ref s) = init_result {
+        if let Some(ref report) = s.audit_report {
+            let inv_payload =
+                crate::commands::ci_report::build_arc_inventory_payload_from_audit(
+                    project_dir,
+                    report,
+                    s.is_workstation_scope,
+                    0,
+                );
+            match arc_telemetry::upload_arc_inventory(&inv_payload, Some(&base_url)) {
+                Ok(_) => true,
+                Err(e) => {
+                    if !json {
+                        eprintln!(
+                            "[Arc Setup] Warning: initial AI-BOM inventory sync failed: {e}"
+                        );
+                    }
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     if json {
         let discovery_json = init_result.as_ref().ok().map(|s| {
             serde_json::json!({
@@ -368,6 +398,7 @@ pub fn run_setup(
                 "policy_synced": policy_synced,
                 "active_policy_seq": active_seq,
                 "heartbeat_ok": heartbeat_ok,
+                "inventory_synced": inventory_synced,
                 "discovery": discovery_json,
             })
         );
@@ -380,6 +411,7 @@ pub fn run_setup(
                 policy_synced,
                 active_seq,
                 heartbeat_ok,
+                inventory_synced,
                 init_result.as_ref().ok(),
             )
         );
@@ -393,6 +425,7 @@ fn format_setup_summary(
     policy_synced: bool,
     active_seq: i64,
     heartbeat_ok: bool,
+    inventory_synced: bool,
     init_summary: Option<&crate::commands::init::InitSummary>,
 ) -> String {
     let mut out = String::new();
@@ -400,10 +433,11 @@ fn format_setup_summary(
     out.push_str("               VEXA ARC SETUP COMPLETE                 \n");
     out.push_str("=======================================================\n");
     out.push_str(&format!(
-        "Cloud:           {} (org: {}, heartbeat: {})\n",
+        "Cloud:           {} (org: {}, heartbeat: {}, inventory: {})\n",
         base_url,
         org,
-        if heartbeat_ok { "connected" } else { "queued" }
+        if heartbeat_ok { "connected" } else { "queued" },
+        if inventory_synced { "synced" } else { "pending" }
     ));
 
     if let Some(s) = init_summary {
@@ -546,6 +580,7 @@ mod tests {
             overall_risk_band: "high".to_string(),
             scan_duration_ms: 42,
             truncated: false,
+            audit_report: None,
         };
 
         let out = format_setup_summary(
@@ -553,6 +588,7 @@ mod tests {
             "acme",
             true,
             2,
+            true,
             true,
             Some(&init_summary),
         );

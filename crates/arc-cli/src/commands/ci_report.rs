@@ -33,6 +33,8 @@ pub struct CiReport {
     pub advisory_warnings: Vec<String>,
     pub passed: bool,
     pub failure_reasons: Vec<String>,
+    #[serde(skip_serializing)]
+    pub audit_report: Option<Box<arc_discover::scanner::AuditReport>>,
 }
 
 fn collect_repo_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -54,7 +56,19 @@ fn collect_repo_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if path.is_dir() {
             collect_repo_files(&path, depth + 1, out);
         } else if path.is_file() {
-            out.push(path);
+            let lower = name.to_ascii_lowercase();
+            let is_generated_report = matches!(
+                lower.as_str(),
+                "sbom-cyclonedx.json"
+                    | "sca-report.html"
+                    | "sca-report.json"
+                    | "sca-report.sarif"
+                    | "ai-bom.json"
+                    | "vexa-ai-bom.json"
+            );
+            if !is_generated_report {
+                out.push(path);
+            }
         }
     }
 }
@@ -228,6 +242,7 @@ pub fn generate_ci_report(
         advisory_warnings,
         passed,
         failure_reasons,
+        audit_report: Some(Box::new(audit)),
     })
 }
 
@@ -346,7 +361,145 @@ pub fn build_vexa_facts_payload(path: &Path, report: &CiReport) -> serde_json::V
     })
 }
 
+/// Builds a zero-code-retention AI-BOM inventory payload for `POST /arc/inventory`
+/// directly from an `AuditReport` (used by `arc audit`, `arc setup`, and `arc ci-report`).
+pub fn build_arc_inventory_payload_from_audit(
+    path: &Path,
+    report: &arc_discover::scanner::AuditReport,
+    is_workstation: bool,
+    unicode_anomalies_count: usize,
+) -> serde_json::Value {
+    let source_type = if is_workstation {
+        "workstation"
+    } else {
+        "repo"
+    };
+
+    let source_name = if is_workstation {
+        let actor = arc_telemetry::sanitize_cloud_actor(&VexaCloudAuth::current_actor());
+        format!("workstation:{actor}")
+    } else {
+        std::env::var("VEXA_PROJECT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("GITHUB_REPOSITORY")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                path.canonicalize()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            })
+            .unwrap_or_else(|| "workspace".to_string())
+    };
+
+    let lockfile_path = path.join(".arc").join("mcp-pins.lock");
+    let mut seen_mcp = std::collections::HashSet::new();
+    let mut mcp_servers = Vec::new();
+    let mut unpinned_mcp_count = 0usize;
+
+    for srv in &report.mcp_servers {
+        let key = (srv.name.clone(), srv.transport.clone());
+        if !seen_mcp.insert(key) {
+            continue;
+        }
+        let lock_pin = if !is_workstation {
+            load_mcp_pin_from_lockfile(&lockfile_path, &srv.name)
+        } else {
+            None
+        };
+        let schema_hash = srv.schema_hash.clone().or(lock_pin);
+        let pinned = schema_hash.is_some();
+        if !pinned {
+            unpinned_mcp_count += 1;
+        }
+        let mut entry = serde_json::json!({
+            "name": srv.name,
+            "transport": srv.transport,
+            "risk_band": format!("{:?}", srv.profile.band).to_lowercase(),
+            "risk_score": srv.profile.composite_risk_score,
+            "pinned": pinned,
+        });
+        if let Some(hash) = schema_hash {
+            entry["schema_hash"] = serde_json::Value::String(hash);
+        }
+        mcp_servers.push(entry);
+    }
+
+    let agent_skills: Vec<serde_json::Value> = report
+        .agent_skills
+        .iter()
+        .map(|sk| {
+            serde_json::json!({
+                "name": sk.name,
+                "content_hash": sk.content_hash,
+                "line_count": sk.line_count,
+            })
+        })
+        .collect();
+
+    let model_assets: Vec<serde_json::Value> = report
+        .model_assets
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "name": m.name,
+                "kind": m.kind,
+                "size_bytes": m.size_bytes,
+            })
+        })
+        .collect();
+
+    let risk_band = if !report.exposed_secrets.is_empty() || unicode_anomalies_count > 0 {
+        "CRITICAL"
+    } else if unpinned_mcp_count > 0 {
+        "HIGH"
+    } else {
+        match report.overall_risk_band {
+            arc_core::mcp_profile::RiskBand::Critical => "CRITICAL",
+            arc_core::mcp_profile::RiskBand::High => "HIGH",
+            arc_core::mcp_profile::RiskBand::Medium => "MEDIUM",
+            arc_core::mcp_profile::RiskBand::Low => "LOW",
+        }
+    };
+
+    serde_json::json!({
+        "source_type": source_type,
+        "source_name": source_name,
+        "install_id": arc_telemetry::install_id(),
+        "overall_risk_band": risk_band,
+        "mcp_servers": mcp_servers,
+        "agent_skills": agent_skills,
+        "model_assets": model_assets,
+        "exposed_secrets_count": report.exposed_secrets.len(),
+        "unicode_anomalies_count": unicode_anomalies_count,
+        "unpinned_mcp_count": unpinned_mcp_count,
+    })
+}
+
 pub fn build_arc_inventory_payload(path: &Path, report: &CiReport) -> serde_json::Value {
+    if let Some(ref audit) = report.audit_report {
+        let mut payload = build_arc_inventory_payload_from_audit(
+            path,
+            audit,
+            false,
+            report.unicode_anomalies.len(),
+        );
+        payload["exposed_secrets_count"] = serde_json::json!(report.secrets.len());
+        payload["unpinned_mcp_count"] = serde_json::json!(report.unpinned_mcp_servers.len());
+        let risk_band = if !report.secrets.is_empty() || !report.unicode_anomalies.is_empty() {
+            "CRITICAL"
+        } else if !report.unpinned_mcp_servers.is_empty() {
+            "HIGH"
+        } else {
+            "LOW"
+        };
+        payload["overall_risk_band"] = serde_json::json!(risk_band);
+        return payload;
+    }
+
     let project_name = std::env::var("VEXA_PROJECT")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -687,6 +840,20 @@ mod tests {
         assert!(code_findings.iter().any(|f| f["category"] == "SECRET"));
         assert!(code_findings.iter().any(|f| f["rule_id"] == "ARC-UNI-001"));
         assert!(code_findings.iter().any(|f| f["rule_id"] == "ARC-MCP-001"));
+
+        let inv = build_arc_inventory_payload(&dir, &dirty);
+        assert_eq!(inv["source_type"], "repo");
+        assert_eq!(inv["exposed_secrets_count"], 1);
+        assert_eq!(inv["unicode_anomalies_count"], 1);
+        assert_eq!(inv["unpinned_mcp_count"], 1);
+        assert_eq!(inv["mcp_servers"].as_array().unwrap().len(), 1);
+        assert_eq!(inv["mcp_servers"][0]["name"], "github");
+        assert_eq!(inv["mcp_servers"][0]["pinned"], false);
+        assert_eq!(inv["agent_skills"].as_array().unwrap().len(), 1);
+        assert_eq!(inv["agent_skills"][0]["name"], ".cursorrules");
+        // Zero-code-retention: never leak raw secret values or file paths
+        let inv_str = inv.to_string();
+        assert!(!inv_str.contains("AKIAIOSFODNN7EXAMPLE"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

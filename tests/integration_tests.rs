@@ -3735,3 +3735,250 @@ fn test_p0_two_endpoint_signed_policy_sync_rotation_revocation_rollback_and_offl
 
     let _ = fs::remove_dir_all(&root_dir);
 }
+
+#[test]
+fn test_v16_audit_and_setup_cloud_inventory_sync() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let root_dir = std::env::temp_dir().join(format!("arc_v16_sync_{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(root_dir.join(".cursor")).unwrap();
+    fs::create_dir_all(root_dir.join(".sca-cache").join("advisories")).unwrap();
+
+    // Populate MCP server, agent rule, real secret, and ignored noise files
+    fs::write(
+        root_dir.join(".cursor").join("mcp.json"),
+        r#"{"mcpServers":{"github":{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]}}}"#,
+    )
+    .unwrap();
+    fs::write(root_dir.join("CLAUDE.md"), "# Team Rules\n").unwrap();
+    let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
+    fs::write(root_dir.join(".env"), format!("AWS_KEY={fake_aws}\n")).unwrap();
+    fs::write(
+        root_dir.join(".sca-cache").join("advisories").join("GHSA-1.json"),
+        format!(r#"{{"token":"{fake_aws}"}}"#),
+    )
+    .unwrap();
+    fs::write(
+        root_dir.join("sbom-cyclonedx.json"),
+        format!(r#"{{"token":"{fake_aws}"}}"#),
+    )
+    .unwrap();
+
+    let cred_file = root_dir.join("vexa-creds.json");
+    let received_paths: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_for_srv = Arc::clone(&received_paths);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(false).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let api_base = format!("http://{addr}/sca/v1");
+
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_for_srv = Arc::clone(&stop_flag);
+
+    let srv = std::thread::spawn(move || {
+        let _ = listener.set_nonblocking(true);
+        while !stop_for_srv.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    // Read full HTTP/1.1 request (headers + Content-Length body) so split
+                    // TCP segments on Linux/macOS never truncate the JSON body.
+                    let mut raw = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let mut header_end: Option<usize> = None;
+                    let mut content_len: usize = 0;
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                raw.extend_from_slice(&chunk[..n]);
+                                if header_end.is_none() {
+                                    if let Some(pos) =
+                                        raw.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        header_end = Some(pos + 4);
+                                        let hdrs = String::from_utf8_lossy(&raw[..pos]);
+                                        for line in hdrs.lines() {
+                                            if let Some((k, v)) = line.split_once(':') {
+                                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                                    content_len = v.trim().parse().unwrap_or(0);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(h_end) = header_end {
+                                    if raw.len() >= h_end + content_len {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw).to_string();
+                    let first_line = req.lines().next().unwrap_or("").to_string();
+                    let body = header_end
+                        .map(|h| String::from_utf8_lossy(&raw[h..]).to_string())
+                        .unwrap_or_default();
+                    received_for_srv.lock().unwrap().push((first_line.clone(), body));
+
+                    let resp_body = if first_line.contains("/auth/whoami")
+                        || first_line.contains("/auth/status")
+                    {
+                        r#"{"org_slug":"acme","user_email":"dev@acme.io","authenticated":true}"#
+                    } else if first_line.contains("/arc/inventory") {
+                        r#"{"snapshot_id":"snap-test-001","status":"accepted"}"#
+                    } else if first_line.contains("/arc/heartbeat") {
+                        r#"{"status":"ok"}"#
+                    } else {
+                        r#"{"error":"not_found"}"#
+                    };
+                    let status_line = if first_line.contains("/arc/policy/bundle") {
+                        "HTTP/1.1 404 Not Found"
+                    } else {
+                        "HTTP/1.1 200 OK"
+                    };
+                    let resp = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let apply_clean_env = |cmd: &mut Command| {
+        cmd.env("VEXA_CREDENTIALS_PATH", &cred_file)
+            .env_remove("ARC_OFFLINE")
+            .env_remove("VEXA_FIREWALL_OFFLINE")
+            .env_remove("VEXA_API_URL")
+            .env_remove("VEXA_API_BASE_URL")
+            .env_remove("VEXA_TOKEN")
+            .env_remove("VEXA_API_KEY")
+            .env_remove("VEXA_SCA_SECURITY_API_KEY")
+            .env_remove("VEXA_SECURITY_API_KEY")
+            .env_remove("VEXA_SCA_API_KEY")
+            .env_remove("ARC_API_TOKEN");
+    };
+
+    // 1. `arc setup --token ... --api-url ...` must send heartbeat AND initial inventory snapshot
+    let mut setup_cmd = Command::new(arc_bin);
+    setup_cmd
+        .args([
+            "setup",
+            "--token",
+            "vexa_pat_test_1234567890",
+            "--api-url",
+            &api_base,
+            "--json",
+        ])
+        .current_dir(&root_dir);
+    apply_clean_env(&mut setup_cmd);
+    let setup_out = setup_cmd.output().unwrap();
+    assert!(
+        setup_out.status.success(),
+        "arc setup failed: {}",
+        String::from_utf8_lossy(&setup_out.stderr)
+    );
+    let setup_json: serde_json::Value =
+        serde_json::from_slice(&setup_out.stdout).expect("setup --json must be valid JSON");
+    assert_eq!(setup_json["heartbeat_ok"], true);
+    assert_eq!(setup_json["inventory_synced"], true);
+
+    // 2. `arc audit` auto-uploads full AI-BOM when credentials exist
+    let count_before_audit = received_paths.lock().unwrap().len();
+    let mut audit_cmd = Command::new(arc_bin);
+    audit_cmd.args([
+        "audit",
+        "--path",
+        root_dir.to_str().unwrap(),
+        "--api-url",
+        &api_base,
+    ]);
+    apply_clean_env(&mut audit_cmd);
+    let audit_out = audit_cmd.output().unwrap();
+    assert!(audit_out.status.success());
+    let audit_stdout = String::from_utf8_lossy(&audit_out.stdout);
+    assert!(
+        audit_stdout.contains("Cloud Sync:"),
+        "expected Cloud Sync line, got:\n{audit_stdout}"
+    );
+    assert!(audit_stdout.contains("snap-test-001"));
+
+    // Verify the uploaded inventory payload has full MCP/skills and excludes .sca-cache & sbom-cyclonedx.json
+    let inv_reqs: Vec<String> = received_paths
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(count_before_audit)
+        .filter(|(line, _)| line.contains("POST /sca/v1/arc/inventory"))
+        .map(|(_, body)| body.clone())
+        .collect();
+    assert_eq!(inv_reqs.len(), 1, "expected 1 /arc/inventory POST from arc audit");
+    let inv_body: serde_json::Value = serde_json::from_str(&inv_reqs[0]).unwrap();
+    assert_eq!(inv_body["exposed_secrets_count"], 1);
+    assert!(inv_body["mcp_servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "github"));
+    assert!(inv_body["agent_skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == "CLAUDE.md"));
+    assert!(!inv_reqs[0].contains(&fake_aws), "raw secret must never leave workstation");
+
+    // 3. `arc audit --no-upload` must NOT hit /arc/inventory
+    let count_before_no_upload = received_paths.lock().unwrap().len();
+    let mut no_up_cmd = Command::new(arc_bin);
+    no_up_cmd.args([
+        "audit",
+        "--path",
+        root_dir.to_str().unwrap(),
+        "--no-upload",
+        "--api-url",
+        &api_base,
+    ]);
+    apply_clean_env(&mut no_up_cmd);
+    let no_up_out = no_up_cmd.output().unwrap();
+    assert!(no_up_out.status.success());
+    assert_eq!(
+        received_paths.lock().unwrap().len(),
+        count_before_no_upload,
+        "--no-upload must skip cloud sync"
+    );
+
+    // 4. `arc audit --json` must remain pure valid JSON even when auto-uploading
+    let mut json_cmd = Command::new(arc_bin);
+    json_cmd.args([
+        "audit",
+        "--path",
+        root_dir.to_str().unwrap(),
+        "--json",
+        "--api-url",
+        &api_base,
+    ]);
+    apply_clean_env(&mut json_cmd);
+    let json_out = json_cmd.output().unwrap();
+    assert!(json_out.status.success());
+    let parsed_audit: serde_json::Value =
+        serde_json::from_slice(&json_out.stdout).expect("arc audit --json must be pure JSON");
+    assert_eq!(parsed_audit["exposed_secrets"].as_array().unwrap().len(), 1);
+
+    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = srv.join();
+    let _ = fs::remove_dir_all(&root_dir);
+}

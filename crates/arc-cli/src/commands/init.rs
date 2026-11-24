@@ -177,6 +177,7 @@ pub struct InitSummary {
     pub overall_risk_band: String,
     pub scan_duration_ms: u64,
     pub truncated: bool,
+    pub audit_report: Option<Box<AuditReport>>,
 }
 
 pub fn execute_init(
@@ -397,6 +398,7 @@ pub fn execute_init(
         overall_risk_band: format!("{:?}", audit_report.overall_risk_band).to_lowercase(),
         scan_duration_ms: audit_report.scan_duration_ms,
         truncated: audit_report.truncated,
+        audit_report: Some(Box::new(audit_report)),
     })
 }
 

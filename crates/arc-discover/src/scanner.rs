@@ -302,7 +302,7 @@ impl DiscoveryScanner {
     /// Opt-in workstation audit mode scanning known host roots across Windows, macOS, and Linux (FR-DISC-002)
     pub fn audit_workstation(&self) -> io::Result<AuditReport> {
         let start = std::time::Instant::now();
-        let mut budget = ScanBudget::bounded(10_000, std::time::Duration::from_secs(10));
+        let overall_deadline = start + std::time::Duration::from_secs(20);
         let mut mcp_servers = Vec::new();
         let mut agent_skills = Vec::new();
         let mut model_assets = Vec::new();
@@ -315,21 +315,35 @@ impl DiscoveryScanner {
 
         let roots = get_workstation_roots();
         let mut all_candidate_files = Vec::new();
+        let mut total_files_scanned = 0usize;
+        let mut any_truncated = false;
+
+        // Fair per-root budget (2,500 files / 3s per root) so a single noisy host directory
+        // (e.g. IDE caches or plugin temp trees) can never starve later roots like `.gemini` or `.cline`.
         for root in roots {
-            if budget.is_exhausted() {
+            if std::time::Instant::now() >= overall_deadline {
+                any_truncated = true;
                 unscanned_locations.push(root);
                 continue;
             }
             if root.exists() && root.is_dir() {
                 scanned_locations.push(root.clone());
+                let remaining = overall_deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(std::time::Duration::from_secs(3));
+                let mut root_budget = ScanBudget::bounded(2_500, remaining);
                 let mut files = self.collect_candidate_files(
                     &root,
-                    &mut budget,
+                    &mut root_budget,
                     &mut scanned_locations,
                     &mut unscanned_locations,
                     &mut excluded_paths,
                     &mut permission_errors,
                 );
+                total_files_scanned += root_budget.files_scanned;
+                if root_budget.truncated {
+                    any_truncated = true;
+                }
                 all_candidate_files.append(&mut files);
             } else {
                 not_installed_locations.push(root);
@@ -338,14 +352,14 @@ impl DiscoveryScanner {
 
         let inspect_timed_out = self.inspect_files_parallel(
             &all_candidate_files,
-            budget.deadline,
+            Some(overall_deadline),
             &mut mcp_servers,
             &mut agent_skills,
             &mut model_assets,
             &mut exposed_secrets,
         );
         if inspect_timed_out {
-            budget.truncated = true;
+            any_truncated = true;
         }
 
         sort_report_vectors(
@@ -385,8 +399,8 @@ impl DiscoveryScanner {
             unscanned_locations,
             excluded_paths,
             permission_errors,
-            truncated: budget.truncated,
-            files_scanned: budget.files_scanned,
+            truncated: any_truncated,
+            files_scanned: total_files_scanned,
         })
     }
 
@@ -435,7 +449,11 @@ impl DiscoveryScanner {
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 if is_dir {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name == ".git" || vexa_core::fs_guard::is_os_heavy_dir(name) {
+                    if name == ".git"
+                        || name.eq_ignore_ascii_case(".sca-cache")
+                        || is_ephemeral_cache_dir(name)
+                        || vexa_core::fs_guard::is_os_heavy_dir(name)
+                    {
                         if let Ok(mut ex) = excluded_for_filter.lock() {
                             ex.push(path.to_path_buf());
                         }
@@ -717,7 +735,16 @@ impl DiscoveryScanner {
                     | "sqlite3"
             )
         );
-        if !is_binary_ext {
+        let is_generated_report = matches!(
+            lower.as_str(),
+            "sbom-cyclonedx.json"
+                | "sca-report.html"
+                | "sca-report.json"
+                | "sca-report.sarif"
+                | "ai-bom.json"
+                | "vexa-ai-bom.json"
+        );
+        if !is_binary_ext && !is_generated_report {
             let within_size = fs::metadata(path)
                 .map(|m| m.len() <= MAX_SECRET_SCAN_BYTES)
                 .unwrap_or(false);
@@ -978,6 +1005,29 @@ fn sort_report_vectors(
     unscanned_locations.sort();
     excluded_paths.sort();
     permission_errors.sort();
+}
+
+/// Returns true for ephemeral IDE/browser/plugin cache or temp directories that never hold
+/// authoritative MCP configs, agent rules, or source code, preventing workstation scans from
+/// starving other host roots across Windows, macOS, and Linux.
+fn is_ephemeral_cache_dir(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        ".tmp"
+            | "tmp"
+            | "cacheddata"
+            | "code cache"
+            | "gpucache"
+            | "dawngpucache"
+            | "dawngraphitecache"
+            | "crashpad"
+            | "logs"
+            | "blob_storage"
+            | "session storage"
+            | "indexeddb"
+            | "local storage"
+    )
 }
 
 #[cfg(test)]
@@ -1292,6 +1342,62 @@ mod tests {
                 .iter()
                 .map(|s| &s.file_path)
                 .collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_excludes_sca_cache_and_generated_reports_from_secret_scan() {
+        let scanner = DiscoveryScanner::new();
+        let temp_dir =
+            std::env::temp_dir().join(format!("vexa_arc_noise_excl_{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(temp_dir.join(".sca-cache").join("advisories")).unwrap();
+
+        let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
+        // Cache advisory and generated reports containing example credentials must be ignored
+        fs::write(
+            temp_dir
+                .join(".sca-cache")
+                .join("advisories")
+                .join("GHSA-test.json"),
+            format!(r#"{{"example":"{fake_aws}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("sbom-cyclonedx.json"),
+            format!(r#"{{"token":"{fake_aws}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("sca-report.html"),
+            format!("<p>{fake_aws}</p>"),
+        )
+        .unwrap();
+        // Real repo file with secret must still be caught
+        fs::write(temp_dir.join("app.env"), format!("AWS_KEY={fake_aws}\n")).unwrap();
+        // Ephemeral IDE/plugin temp/cache directories must be skipped
+        fs::create_dir_all(temp_dir.join(".tmp").join("plugins")).unwrap();
+        fs::write(
+            temp_dir.join(".tmp").join("plugins").join("cached.txt"),
+            format!("KEY={fake_aws}\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(temp_dir.join("GPUCache")).unwrap();
+        fs::write(
+            temp_dir.join("GPUCache").join("index.txt"),
+            format!("KEY={fake_aws}\n"),
+        )
+        .unwrap();
+
+        let report = scanner.audit_directory(&temp_dir).unwrap();
+        assert_eq!(report.exposed_secrets.len(), 1);
+        assert!(
+            report.exposed_secrets[0]
+                .file_path
+                .ends_with("app.env"),
+            "unexpected secret path: {:?}",
+            report.exposed_secrets[0].file_path
         );
 
         let _ = fs::remove_dir_all(&temp_dir);

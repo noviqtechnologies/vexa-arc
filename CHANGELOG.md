@@ -2,6 +2,21 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.6.0] - 2026-11-24
+
+### Automatic Cloud AI-BOM Sync, Fair Workstation Discovery & CLI Ergonomics
+- **Automatic Zero-Code AI-BOM Sync on `arc audit` & `arc setup` (`arc-cli`):**
+  - `arc audit` (both repository and `--workstation` modes) now automatically uploads a zero-code AI-BOM inventory snapshot to `POST /arc/inventory` when authenticated and not in offline mode (`ARC_OFFLINE=1`), with `--no-upload` to opt out and `--api-url` override. Sync is best-effort and non-fatal, prints a concise `Cloud Sync:` status line in terminal mode, and preserves pure JSON stdout under `--json`.
+  - `arc setup` now uploads the initial AI-BOM / MCP inventory snapshot immediately alongside the workstation heartbeat so **MCP & AI-BOM** and **AI-BOM Anomalies** populate right after onboarding, and keeps `arc setup --token ... --json` stdout strictly valid JSON.
+  - Upgraded `build_arc_inventory_payload` (shared across `arc audit`, `arc setup`, and `arc ci-report --upload`) to report full deduplicated `mcp_servers` (including `transport`, `risk_band`, `risk_score`, `pinned`, `schema_hash`), `agent_skills`, `model_assets`, and anomaly counts with zero raw secret or home-path egress.
+- **Fair Per-Root Workstation Discovery & Actionable Reporting (`arc-discover`, `arc-cli`):**
+  - Replaced the single shared workstation scan budget with a fair per-root budget (`2,500` files / `3s` per host root, `20s` overall cap) so a single noisy host directory can never starve later roots (such as `.gemini` or `.cline`).
+  - Excluded legacy `.sca-cache/`, ephemeral IDE/plugin cache directories (`.tmp`, `tmp`, `CachedData`, `Code Cache`, `GPUCache`, `DawnGPUCache`, `DawnGraphiteCache`, `Crashpad`, `logs`, `blob_storage`, `Session Storage`, `IndexedDB`, `Local Storage`), and generated report artifacts (`sbom-cyclonedx.json`, `sca-report.{html,json,sarif}`, `ai-bom.json`, `vexa-ai-bom.json`) from secret scanning across Windows, macOS, and Linux.
+  - Added capped (top 25 per section) discovered MCP server, agent skill, AI model, and exposed secret summaries to `arc audit --workstation` terminal output.
+- **`arc intercept eval` Ergonomics & Cross-OS Stack Hardening (`arc-cli`):**
+  - Added `--tool` (alias for `--kind`, normalizing `Bash`/`pwsh`/`powershell`/`sh`/`exec` → `shell`, `Read` → `file_read`, `Write`/`Edit` → `file_write`) and `--cmd` (alias for `--target`) to `arc intercept eval`.
+  - Added `crates/arc-cli/build.rs` setting an 8 MiB stack on Windows MSVC (`/STACK:8388608`), Windows GNU (`-Wl,--stack,8388608`), and Linux musl (`-Wl,-z,stack-size=8388608`), matching macOS/Linux glibc defaults.
+
 ## [1.5.1] - 2026-11-24
 
 ### Zero-Prerequisite Native Sigstore Verification in `@vexasec/arc`

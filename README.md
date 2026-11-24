@@ -497,7 +497,7 @@ All commands support relative and absolute paths, cross-platform path separators
 | `arc allow` | Add a scoped allowlist exception to `.arc/policy.json` | `--rule <ID>`, `--target <STR>`, `--ttl-hours <N>` | `arc allow --rule ARC-PKG-001 --target my-pkg` |
 | `arc mcp-server` | Run stdio MCP server (`scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets`) | `-p, --path <PATH>` | `arc mcp-server` |
 | `arc ci-report` | Generate Markdown/JSON PR security report and optionally sync to Vexa Cloud | `--sca`, `--fail-on <SEV>`, `--upload`, `--api-url <URL>`, `--markdown-out <PATH>`, `--json-out <PATH>` | `arc ci-report --sca --fail-on high --upload` |
-| `arc audit` | Scan project or workstation for AI assets, rules, and MCP configs | `--workstation`, `--json`, `--output-bom <PATH>` | `arc audit --output-bom ai-bom.json` |
+| `arc audit` | Scan project or workstation for AI assets, rules, and MCP configs (auto-syncs zero-code AI-BOM when connected) | `--workstation`, `--json`, `--output-bom <PATH>`, `--no-upload`, `--api-url <URL>` | `arc audit --output-bom ai-bom.json` |
 | `arc bom` | Export CycloneDX v1.6 AI-BOM | `-p, --path <PATH>`, `-o, --out <PATH>` | `arc bom --out ai-bom.json` |
 | `arc sca` | Consensual, disposable-worktree SCA scanning & PR remediation | `audit`, `fix [--dry-run \| --open-pr]` | `arc sca audit --sarif audit.sarif --sanitize-locations` |
 | `arc shield` | Live cached registry checks (npm, PyPI, crates.io) + exact-version OSV check | `check <PKG>`, `run <CMD>`, `--show-recommendation`, `--fail-on-risk` | `arc shield run --fail-on-risk -- npm install package` |

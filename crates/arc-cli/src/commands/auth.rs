@@ -2,6 +2,15 @@ use arc_telemetry::VexaCloudAuth;
 use std::time::Duration;
 
 pub fn run_auth_login(token_opt: Option<&str>, api_url: Option<&str>, json: bool) -> bool {
+    run_auth_login_with_quiet(token_opt, api_url, json, false)
+}
+
+pub fn run_auth_login_with_quiet(
+    token_opt: Option<&str>,
+    api_url: Option<&str>,
+    json: bool,
+    quiet: bool,
+) -> bool {
     let base_url = VexaCloudAuth::resolve_api_base_url(api_url);
 
     let token = match token_opt.map(str::trim).filter(|s| !s.is_empty()) {
@@ -74,6 +83,10 @@ pub fn run_auth_login(token_opt: Option<&str>, api_url: Option<&str>, json: bool
             return false;
         }
     };
+
+    if quiet {
+        return true;
+    }
 
     if json {
         println!(
