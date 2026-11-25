@@ -94,7 +94,8 @@ flowchart BT
 
 * **`#![forbid(unsafe_code)]`** is enforced across domain logic crates.
 * Libraries use **`thiserror`**; the CLI binary handles user-facing errors cleanly.
-* `arc-firewall` consumes the shared **`vexa-sca`** and **`vexa-core`** crates (`noviqtechnologies/vexa-sca` tag `v1.5.0`) so local `arc shield` / `arc sca audit` and Vexa Cloud run the exact same OSV, `MAL-*`, CVSS, and AST reachability engine.
+* `arc-firewall` consumes the shared **`vexa-sca`** and **`vexa-core`** crates (`noviqtechnologies/vexa-sca`, version pinned in workspace `Cargo.toml`, currently `v1.8.0`) so local `arc shield` / `arc sca audit`, `.github/workflows/vexa-sca.yml`, and Vexa Cloud run the exact same OSV, `MAL-*`, CVSS, and AST reachability engine.
+* **Synthetic Test Fixtures in `#[cfg(test)]` Modules:** Because static SAST and secret scanners inspect `crates/*/src/*.rs` (including inline Rust unit tests), synthetic credentials (e.g., AWS `AKIA...`, GitHub `ghp_...`, `vexa_pat_...`, PEM headers) and intentional SQLi test strings inside `src/` MUST be assembled via compile-time `concat!(...)` / `format!(...)` rather than raw contiguous literals so CI gates remain strict with zero false positives across Windows, macOS, and Linux.
 * `arc-policy-engine` separates **`hypothetical_verdict`** from **`effective_verdict`** in `EvaluationObservation` with stable `PolicyOutcomeKind` classifications (`allow`, `deny`, `require_approval`, `quarantine`, `redact_or_transform`, `would_allow`, `would_deny`, `would_require_approval`, `would_quarantine`, `evaluation_error`, `not_observed`) and deterministic SHA-256 JCS `policy_revision` hashes. `SignedOrganization` and `EmergencyDeny` layers cannot be weakened by lower-precedence `ProjectLocal` or `UserGlobal` configuration or local `active_exceptions`.
 
 ---

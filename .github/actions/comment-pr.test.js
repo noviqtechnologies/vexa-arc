@@ -76,6 +76,7 @@ async function run() {
       INPUT_VERSION: "v1.2.4",
       INPUT_FAIL_ON: "high",
       INPUT_FAIL_ON_SECRETS: "true",
+      INPUT_FAIL_ON_UNPINNED_MCP: "true",
       INPUT_RUN_SCA: "false",
       INPUT_RUN_POLICY_TEST: "true",
       INPUT_COMMENT_PR: "true",
@@ -89,6 +90,7 @@ async function run() {
     { INPUT_VERSION: "$(whoami)" },
     { INPUT_FAIL_ON: 'high" && id #' },
     { INPUT_FAIL_ON_SECRETS: "true; rm -rf /" },
+    { INPUT_FAIL_ON_UNPINNED_MCP: "false && whoami" },
     { INPUT_RUN_SCA: "`id`" },
     { INPUT_PATH: "foo\nbar" },
   ];
@@ -538,7 +540,32 @@ async function run() {
   assert.strictEqual(/^\s*overwrite:\s*true\b/m.test(releaseYml), false, "release.yml must not overwrite published releases");
   assert.strictEqual(/^\s*if:.*\bsecrets\./m.test(releaseYml), false, "release.yml must not reference secrets.* directly in step if: expressions");
 
-  console.log("comment-pr.test.js: all assertions (including Phase 0 & P1 installer security gates) passed");
+  // Static security & portability audit of vexa-sca.yml
+  const vexaScaYml = fs.readFileSync(
+    path.join(__dirname, "..", "..", ".github", "workflows", "vexa-sca.yml"),
+    "utf8"
+  );
+  assert.ok(vexaScaYml.includes("contents: read"), "vexa-sca.yml must declare least-privilege contents: read");
+  assert.ok(vexaScaYml.includes("security-events: write"), "vexa-sca.yml must declare security-events: write for SARIF upload");
+  assert.ok(vexaScaYml.includes("Cargo.toml"), "vexa-sca.yml must resolve vexa-sca tag dynamically from Cargo.toml");
+  assert.strictEqual(vexaScaYml.includes("sudo "), false, "vexa-sca.yml must not depend on sudo for cross-OS portability");
+  assert.strictEqual(vexaScaYml.includes("/tmp/vexa-sca"), false, "vexa-sca.yml must use runner.temp instead of hardcoded /tmp");
+  assert.ok(vexaScaYml.includes("--ignore-unfixed"), "vexa-sca.yml must gate on actionable fixed CVEs");
+  assert.ok(vexaScaYml.includes("--sast") && vexaScaYml.includes("--secrets"), "vexa-sca.yml must run separated SAST and Secrets gate");
+  assert.ok(vexaScaYml.includes("github/codeql-action/upload-sarif@"), "vexa-sca.yml must upload SARIF to GitHub Code Scanning");
+  assert.ok(vexaScaYml.includes("--sbom cyclonedx"), "vexa-sca.yml must generate a CycloneDX SBOM");
+  const usesLines = vexaScaYml.match(/^\s*uses:\s*([^\s#]+)/gm) || [];
+  assert.ok(usesLines.length >= 5, "vexa-sca.yml must declare expected workflow actions");
+  for (const line of usesLines) {
+    const ref = line.replace(/^\s*uses:\s*/, "").trim();
+    assert.match(
+      ref,
+      /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)?@[0-9a-f]{40}$/,
+      `All third-party actions in vexa-sca.yml must be pinned to a 40-char commit SHA: ${ref}`
+    );
+  }
+
+  console.log("comment-pr.test.js: all assertions (including Phase 0, P1 installer & SCA workflow security gates) passed");
 }
 
 run().catch((err) => {

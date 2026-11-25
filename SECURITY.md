@@ -6,9 +6,16 @@ Vexa Arc follows semantic versioning and provides security updates for the follo
 
 | Version | Supported          | Security Maintenance Level |
 | ------- | ------------------ | --------------------------- |
-| 1.6.x   | :white_check_mark: | Active security updates     |
-| 1.5.x   | :white_check_mark: | Security fixes only         |
-| < 1.5.0 | :x:                | Deprecated / Not maintained |
+| 1.8.x   | :white_check_mark: | Active security updates     |
+| 1.7.x   | :white_check_mark: | Security fixes only         |
+| < 1.7.0 | :x:                | Deprecated / Not maintained |
+
+### Automated CI Security Gates
+
+Every push, pull request, and daily scheduled run executes `.github/workflows/vexa-sca.yml` with least-privilege permissions (`contents: read`, `security-events: write`) and SHA-pinned actions:
+- **Actionable Dependency SCA:** `vexa-sca ci --fail-on high --ignore-unfixed` with CycloneDX SBOM export.
+- **Code Security (SAST & Secrets):** `vexa-sca ci --sast --secrets --fail-on high` with SARIF upload to GitHub Code Scanning.
+- **Installer & Action Integrity Regression Suite:** `node .github/actions/comment-pr.test.js` runs across Linux, macOS, and Windows in CI to enforce input validation, SHA-256 verification, publisher signature pinning, and workflow hardening invariants.
 
 ---
 

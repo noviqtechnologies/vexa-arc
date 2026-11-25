@@ -169,7 +169,7 @@ Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON 
 arc ci-report --sca --policy-test --fail-on high --fail-on-unpinned-mcp --markdown-out arc-pr-report.md --json-out arc-pr-report.json
 ```
 
-For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.7.1`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
+For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.8.1`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
 
 ### Remote Streamable HTTP / SSE MCP Proxy (`arc protect http`)
 
@@ -856,6 +856,13 @@ arc sca audit --fail-on high
 
 * **Confidentiality & Location Sanitization (`--sanitize-locations`):** Eliminates internal file paths, suppresses physical line/column numbers, strips vulnerable code snippets (`region.snippet`), and pseudonymizes physical URIs into deterministic SHA-256 hashes (`sanitized/<hash>.source`).
 * **Policy Failure Gating (`--fail-on <severity>`):** Gates CI/CD and terminal workflows by exiting with status code 1 if the highest detected vulnerability meets or exceeds the threshold (`critical`, `high`, `medium`, `low`).
+
+#### CI/CD Security Gating Best Practices (SCA, SAST & Secrets)
+
+When integrating `vexa-sca` and `arc` into GitHub Actions (see `.github/workflows/vexa-sca.yml` and `action.yml`), separate enforcement by engine rather than relying on one monolithic gate:
+* **Actionable Dependency SCA (`--fail-on high --ignore-unfixed`):** Fail PRs on High/Critical vulnerabilities that have an actionable fix, while reporting unmaintained or no-fix transitive advisories in a non-blocking HTML/SARIF visibility report (`--no-fail`) and daily scheduled drift scan.
+* **Code Security (`--sast --secrets --fail-on high`):** Enforce zero hardcoded secrets and zero High/Critical SAST findings independently, uploading SARIF reports (`vexa-sca-deps.sarif`, `vexa-sca-code.sarif`) to GitHub Code Scanning for inline PR annotations alongside CycloneDX SBOM artifacts.
+* **Cross-OS Portability & Version Pinning:** Resolve the `vexa-sca` tag dynamically from `Cargo.toml`, cache the compiled binary under `${{ runner.temp }}` (avoiding hardcoded `/tmp` or `sudo`), and pin all third-party GitHub Actions to full 40-character commit SHAs.
 
 #### Dry-Run Scratch Diff Proposal (`arc sca fix --dry-run`)
 

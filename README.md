@@ -562,7 +562,7 @@ jobs:
     runs-on: ubuntu-latest # also supports macos-latest and windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: noviqtechnologies/vexa-arc@v1.7.1
+      - uses: noviqtechnologies/vexa-arc@v1.8.1
         with:
           fail-on: high
           fail-on-secrets: 'true'
@@ -571,6 +571,13 @@ jobs:
           run-policy-test: 'true'
           comment-pr: 'true'
 ```
+
+#### Repository SCA, SAST & Secrets CI Architecture (`.github/workflows/vexa-sca.yml`)
+
+Vexa Arc's own CI pipeline implements separated, cross-OS security gates rather than a single monolithic check:
+- **Gate 1 — Actionable Dependency SCA:** Runs `vexa-sca ci . --fail-on high --ignore-unfixed` with CycloneDX SBOM export (`vexa-sca-sbom.cdx.json`) so high/critical CVEs with known fixes block merges while unfixable/unmaintained transitive advisories do not cause false build outages.
+- **Gate 2 — Code Security (SAST & Secrets):** Runs `vexa-sca ci . --sast --secrets --fail-on high --ignore-unfixed` to block hardcoded credentials and high/critical code vulnerabilities.
+- **Full Visibility & GitHub Code Scanning:** Generates a non-blocking full HTML/SARIF advisory report (`--no-fail`), uploads `vexa-sca-deps.sarif` and `vexa-sca-code.sarif` to GitHub Code Scanning (`github/codeql-action/upload-sarif`), runs on a daily CVE-drift schedule, and dynamically resolves + caches the `vexa-sca` tag pinned in `Cargo.toml` without OS-specific `sudo` or `/tmp` assumptions.
 
 ---
 

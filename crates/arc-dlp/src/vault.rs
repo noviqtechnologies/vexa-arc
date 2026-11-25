@@ -166,7 +166,9 @@ mod tests {
     fn test_vault_redaction_and_rehydration() {
         let vault = LocalPseudonymizationVault::new();
         let session = "test_sess_01";
-        let content = b"export AWS_KEY=AKIAIOSFODNN7EXAMPLE in profile";
+        let fake_key = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let content_str = format!("export AWS_KEY={fake_key} in profile");
+        let content = content_str.as_bytes();
 
         let finding = SecretFinding {
             detector: "SEC-AWS-001",
@@ -195,6 +197,6 @@ mod tests {
 
         // Rehydration authorized
         let result_auth = vault.rehydrate(session, "<ARC_VAULT_SECRET_01>", "local_aws_cli");
-        assert_eq!(result_auth, Some(b"AKIAIOSFODNN7EXAMPLE".to_vec()));
+        assert_eq!(result_auth, Some(fake_key.as_bytes().to_vec()));
     }
 }

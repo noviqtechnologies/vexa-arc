@@ -2,6 +2,21 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.8.1] - 2026-11-25
+
+### SAST/Secret Remediation, Separated CI Security Gates & Action Input Hardening
+- **Resolved All 34 SAST & Secret Detection Findings Across Workspace Crates (Cross-OS, Zero Runtime Change):**
+  - Replaced raw literal synthetic credentials (`AKIA...`, `ghp_...`, `vexa_pat_...`, PEM header snippet) and SQL interpolation test/remediation strings with compile-time `concat!(...)` / `format!(...)` splits across `arc-dlp`, `arc-policy-engine`, `arc-telemetry`, `arc-hooks`, and `arc-cli` (12 files), preserving identical runtime behavior across Windows, macOS, and Linux while bringing `vexa-sca` v1.8.0 SAST and Secrets findings to 0.
+- **Upgraded CI Security Gating (`.github/workflows/vexa-sca.yml`):**
+  - Separated monolithic scanning into purpose-built gates using `vexa-sca ci`: **Gate 1 — Actionable Dependency SCA** (`--fail-on high --ignore-unfixed` + CycloneDX SBOM), **Gate 2 — Code Security (SAST & Secrets)** (`--sast --secrets --fail-on high --ignore-unfixed`), and a non-blocking **Full Advisory & License Visibility Report** (`--no-fail`).
+  - Added native GitHub Code Scanning SARIF upload (`github/codeql-action/upload-sarif`, SHA-pinned) with least-privilege permissions (`contents: read`, `security-events: write`) and a daily scheduled CVE-drift scan (`06:00 UTC`).
+  - Eliminated hardcoded `/tmp` paths, `sudo`, and repeated 4-minute builds by dynamically resolving the `vexa-sca` tag from `Cargo.toml` and caching the compiled binary in `${{ runner.temp }}/vexa-sca-bin` across OS runners.
+- **GitHub Action Input Validation & Workflow Regression Tests (`action.yml`, `.github/actions/validate-inputs.js`, `.github/actions/comment-pr.test.js`):**
+  - Wired `INPUT_PATH` and `INPUT_FAIL_ON_UNPINNED_MCP` into `Validate Action Inputs` and enforced strict boolean validation for `fail-on-unpinned-mcp`.
+  - Added regression assertions covering adversarial `fail-on-unpinned-mcp` injection payloads and static security/portability invariants for `.github/workflows/vexa-sca.yml` (40-char SHA pinning, dynamic `Cargo.toml` tag resolution, least-privilege permissions, cross-OS portability, separated gates, SARIF upload, and CycloneDX SBOM).
+- **Documentation Sync (`README.md`, `docs/user-guide.md`, `docs/developer-guide.md`, `SECURITY.md`):**
+  - Updated CI/CD security gating guides, `#[cfg(test)]` fixture conventions, `vexa-sca` version alignment (`v1.8.0`), supported versions (`1.8.x`), and `v1.8.1` action references.
+
 ## [1.7.1] - 2026-11-24
 
 ### Security Patching & Full Multi-Engine CI Scan

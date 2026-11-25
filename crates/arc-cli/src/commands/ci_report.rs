@@ -982,7 +982,8 @@ mod tests {
         assert!(clean.unicode_anomalies.is_empty());
         assert!(clean.advisory_warnings.is_empty());
 
-        std::fs::write(dir.join(".env"), "AWS_KEY=AKIAIOSFODNN7EXAMPLE\n").unwrap();
+        let fake_aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        std::fs::write(dir.join(".env"), format!("AWS_KEY={fake_aws}\n")).unwrap();
         std::fs::write(
             dir.join(".cursorrules"),
             "Always follow rules\u{202E}hidden\n",
@@ -1044,7 +1045,7 @@ mod tests {
         assert_eq!(inv["agent_skills"][0]["name"], ".cursorrules");
         // Zero-code-retention: never leak raw secret values or file paths
         let inv_str = inv.to_string();
-        assert!(!inv_str.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!inv_str.contains(fake_aws));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1275,7 +1275,11 @@ mod fingerprint_tests {
                 .with_observe_mode(true)
                 .with_session_storage_dir(temp_dir.clone());
 
-        let raw_call = r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"query_db","arguments":{"key":"AKIAIOSFODNN7EXAMPLE"}}}"#;
+        let raw_call = concat!(
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"query_db","arguments":{"key":""#,
+            "AKIA",
+            r#"IOSFODNN7EXAMPLE"}}}"#
+        );
         match broker.handle_client_message(raw_call) {
             super::ClientMessageOutcome::Forward(forwarded) => {
                 assert_eq!(

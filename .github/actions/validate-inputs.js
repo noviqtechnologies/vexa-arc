@@ -21,6 +21,7 @@ function validateActionInputs(env = process.env) {
 
   const boolFields = [
     ["fail-on-secrets", env.INPUT_FAIL_ON_SECRETS ?? "true"],
+    ["fail-on-unpinned-mcp", env.INPUT_FAIL_ON_UNPINNED_MCP ?? "false"],
     ["run-sca", env.INPUT_RUN_SCA ?? "true"],
     ["run-policy-test", env.INPUT_RUN_POLICY_TEST ?? "false"],
     ["comment-pr", env.INPUT_COMMENT_PR ?? "true"],

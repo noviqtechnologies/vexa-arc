@@ -5,47 +5,142 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  schedule:
+    # Daily CVE & advisory drift scan (06:00 UTC)
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
+  security-events: write
 
 jobs:
   vexa-sca-scan:
-    name: Vexa SCA Scan
+    name: Vexa SCA, SAST & Secrets Gate
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install Rust toolchain
+      - name: Resolve pinned vexa-sca version from Cargo.toml
+        id: sca-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(node -e '
+            const fs = require("fs");
+            const toml = fs.readFileSync("Cargo.toml", "utf8");
+            const m = toml.match(/vexa-sca\s*=\s*\{[^}]*tag\s*=\s*"([^"]+)"/);
+            if (!m) {
+              console.error("Failed to resolve vexa-sca tag from Cargo.toml");
+              process.exit(1);
+            }
+            const tag = m[1];
+            if (!/^v\d+\.\d+\.\d+(-[A-Za-z0-9._-]+)?$/.test(tag)) {
+              console.error(`Invalid vexa-sca tag: ${tag}`);
+              process.exit(1);
+            }
+            process.stdout.write(tag);
+          ')
+          echo "Resolved vexa-sca tag: ${TAG}"
+          printf 'tag=%s\n' "${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache compiled vexa-sca binary
+        id: cache-vexa-sca
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vexa-sca-bin
+          key: vexa-sca-${{ runner.os }}-${{ runner.arch }}-${{ steps.sca-version.outputs.tag }}
+
+      - name: Install Rust toolchain (cache miss only)
+        if: steps.cache-vexa-sca.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - name: Build and install Vexa SCA CLI
+      - name: Build and install vexa-sca (cross-OS, cache miss only)
+        if: steps.cache-vexa-sca.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          VEXA_SCA_TAG: ${{ steps.sca-version.outputs.tag }}
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
         run: |
-          git clone --depth 1 --branch v1.8.0 https://github.com/noviqtechnologies/vexa-sca.git /tmp/vexa-sca
-          cargo build --locked --release --manifest-path /tmp/vexa-sca/Cargo.toml
-          sudo cp /tmp/vexa-sca/target/release/vexa-sca /usr/local/bin/vexa-sca
-          rm -rf /tmp/vexa-sca
+          set -euo pipefail
+          SRC_DIR="${RUNNER_TEMP_DIR}/vexa-sca-src"
+          BIN_DIR="${RUNNER_TEMP_DIR}/vexa-sca-bin"
+          rm -rf "${SRC_DIR}"
+          mkdir -p "${BIN_DIR}"
+          git clone --depth 1 --branch "${VEXA_SCA_TAG}" https://github.com/noviqtechnologies/vexa-sca.git "${SRC_DIR}"
+          cargo build --locked --release --manifest-path "${SRC_DIR}/Cargo.toml"
+          EXE_EXT=""
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            EXE_EXT=".exe"
+          fi
+          cp "${SRC_DIR}/target/release/vexa-sca${EXE_EXT}" "${BIN_DIR}/vexa-sca${EXE_EXT}"
+          chmod +x "${BIN_DIR}/vexa-sca${EXE_EXT}" || true
+          rm -rf "${SRC_DIR}"
 
-      - name: Run Vexa SCA Scan
+      - name: Add vexa-sca to PATH
+        shell: bash
+        env:
+          BIN_DIR: ${{ runner.temp }}/vexa-sca-bin
         run: |
-          vexa-sca scan . \
-            --sast \
-            --secrets \
+          set -euo pipefail
+          printf '%s\n' "${BIN_DIR}" >> "$GITHUB_PATH"
+
+      - name: Gate 1 — Actionable Dependency SCA (High/Critical with known fix)
+        shell: bash
+        run: |
+          vexa-sca ci . \
             --fail-on high \
-            --html-file vexa-sca-report.html \
-            --sarif-file vexa-sca-report.sarif \
+            --ignore-unfixed \
+            --sarif-file vexa-sca-deps.sarif \
             --sbom cyclonedx \
             --sbom-file vexa-sca-sbom.cdx.json
 
-      - name: Archive Scan Reports
+      - name: Gate 2 — Code Security (SAST & Secrets)
+        shell: bash
+        run: |
+          vexa-sca ci . \
+            --sast \
+            --secrets \
+            --fail-on high \
+            --ignore-unfixed \
+            --sarif-file vexa-sca-code.sarif
+
+      - name: Full Advisory & License Visibility Report (Non-blocking)
+        if: always()
+        shell: bash
+        run: |
+          vexa-sca scan . \
+            --no-fail \
+            --html-file vexa-sca-report.html \
+            --sarif-file vexa-sca-full.sarif
+
+      - name: Upload Dependency SCA SARIF to GitHub Code Scanning
+        if: always() && hashFiles('vexa-sca-deps.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          sarif_file: vexa-sca-deps.sarif
+          category: vexa-sca-deps
+
+      - name: Upload Code Security SARIF to GitHub Code Scanning
+        if: always() && hashFiles('vexa-sca-code.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          sarif_file: vexa-sca-code.sarif
+          category: vexa-sca-code
+
+      - name: Archive Scan Reports & SBOM
         if: always()
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: vexa-sca-reports
+          if-no-files-found: ignore
           path: |
             vexa-sca-report.html
-            vexa-sca-report.sarif
+            vexa-sca-deps.sarif
+            vexa-sca-code.sarif
+            vexa-sca-full.sarif
             vexa-sca-sbom.cdx.json

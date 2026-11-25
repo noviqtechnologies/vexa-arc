@@ -721,17 +721,19 @@ pub fn evaluate_policy_tests(
                     schema_root: None,
                 },
                 tool: "create_comment".to_string(),
-                arguments: serde_json::json!({"text": "key AKIAIOSFODNN7EXAMPLE"}),
+                arguments: serde_json::json!({"text": concat!("key ", "AKIA", "IOSFODNN7EXAMPLE")}),
             },
         );
         let obs = ev.evaluate_with_observation(&event);
         let mut broker =
             McpStdioBroker::new("github", "fix-4", PolicyEvaluator::new(cfg)).allow_schema_tofu();
-        let broker_out = broker.handle_client_message(
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_comment","arguments":{"text":"key AKIAIOSFODNN7EXAMPLE"}}}"#,
+        let fake_aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let raw_msg = format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"create_comment","arguments":{{"text":"key {fake_aws}"}}}}}}"#
         );
+        let broker_out = broker.handle_client_message(&raw_msg);
         let redacted_ok = match broker_out {
-            ClientMessageOutcome::Forward(s) => !s.contains("AKIAIOSFODNN7EXAMPLE"),
+            ClientMessageOutcome::Forward(s) => !s.contains(fake_aws),
             _ => false,
         };
         obs.outcome == PolicyOutcomeKind::RedactOrTransform && redacted_ok

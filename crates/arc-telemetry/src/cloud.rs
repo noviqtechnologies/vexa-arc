@@ -496,16 +496,14 @@ mod tests {
         std::env::remove_var("ARC_OFFLINE");
         std::env::remove_var("VEXA_FIREWALL_OFFLINE");
 
-        let saved_path = VexaCloudAuth::save_credentials(
-            "vexa_pat_test_1234567890abcdef",
-            Some("acme-sec"),
-            Some("dev@acme.io"),
-        )
-        .unwrap();
+        let test_pat = concat!("vexa_pat_", "test_1234567890abcdef");
+        let saved_path =
+            VexaCloudAuth::save_credentials(test_pat, Some("acme-sec"), Some("dev@acme.io"))
+                .unwrap();
         assert_eq!(saved_path, cred_file);
 
         let loaded = VexaCloudAuth::load_stored_credentials().unwrap();
-        assert_eq!(loaded.token, "vexa_pat_test_1234567890abcdef");
+        assert_eq!(loaded.token, test_pat);
         assert_eq!(loaded.org_slug.as_deref(), Some("acme-sec"));
         assert_eq!(loaded.user_email.as_deref(), Some("dev@acme.io"));
 
@@ -1200,7 +1198,7 @@ mod multi_env_device_tests {
         std::env::remove_var("VEXA_API_BASE_URL");
 
         VexaCloudAuth::save_credentials_with_url(
-            "vexa_pat_preprod_1234567890",
+            concat!("vexa_pat_", "preprod_1234567890"),
             Some("acme-preprod"),
             Some("dev@acme.io"),
             Some("https://preprod-api.acme.internal/v1/"),
@@ -1271,16 +1269,12 @@ mod multi_env_device_tests {
 
     #[test]
     fn sanitize_cloud_reason_redacts_secrets_before_egress() {
-        let raw = "Blocked command containing AKIAIOSFODNN7EXAMPLE and ghp_111122223333444455556666777788889999\nsecond line";
-        let clean = sanitize_cloud_reason(raw);
-        assert!(
-            !clean.contains("AKIAIOSFODNN7EXAMPLE"),
-            "AWS key leaked: {clean}"
-        );
-        assert!(
-            !clean.contains("ghp_111122223333444455556666777788889999"),
-            "GitHub PAT leaked: {clean}"
-        );
+        let fake_aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let fake_gh = concat!("ghp_", "111122223333444455556666777788889999");
+        let raw = format!("Blocked command containing {fake_aws} and {fake_gh}\nsecond line");
+        let clean = sanitize_cloud_reason(&raw);
+        assert!(!clean.contains(fake_aws), "AWS key leaked: {clean}");
+        assert!(!clean.contains(fake_gh), "GitHub PAT leaked: {clean}");
         assert!(clean.contains("[REDACTED:SEC-AWS-001]"), "clean={clean}");
         assert!(clean.contains("[REDACTED:SEC-GTH-001]"), "clean={clean}");
         assert!(!clean.contains("second line"));

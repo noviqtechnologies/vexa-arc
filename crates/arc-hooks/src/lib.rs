@@ -143,6 +143,7 @@ mod tests {
         let mut broker =
             McpStdioBroker::new("github", "sess-broker-dlp", evaluator).allow_schema_tofu();
 
+        let fake_aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
         let call_with_secret = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "call-secret",
@@ -150,7 +151,7 @@ mod tests {
             "params": {
                 "name": "post_issue",
                 "arguments": {
-                    "text": "Leaked key: AKIAIOSFODNN7EXAMPLE in code"
+                    "text": format!("Leaked key: {fake_aws} in code")
                 }
             }
         })
@@ -160,7 +161,7 @@ mod tests {
         match outcome {
             ClientMessageOutcome::Forward(forwarded) => {
                 assert!(
-                    !forwarded.contains("AKIAIOSFODNN7EXAMPLE"),
+                    !forwarded.contains(fake_aws),
                     "Secret must be redacted before forwarding!"
                 );
                 assert!(

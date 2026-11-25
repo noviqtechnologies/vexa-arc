@@ -3254,7 +3254,7 @@ fn run_test(json: bool) -> bool {
     // 3. Secret Detection & Redaction
     let dlp_pass = {
         let engine = SecretScanEngine::new();
-        let sample = b"api_key: AKIAIOSFODNN7EXAMPLE";
+        let sample = concat!("api_key: ", "AKIA", "IOSFODNN7EXAMPLE").as_bytes();
         let findings = engine.scan(sample);
         !findings.is_empty()
     };

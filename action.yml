@@ -63,8 +63,10 @@ runs:
       shell: bash
       env:
         INPUT_VERSION: ${{ inputs.version }}
+        INPUT_PATH: ${{ inputs.path }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_FAIL_ON_SECRETS: ${{ inputs.fail-on-secrets }}
+        INPUT_FAIL_ON_UNPINNED_MCP: ${{ inputs.fail-on-unpinned-mcp }}
         INPUT_RUN_SCA: ${{ inputs.run-sca }}
         INPUT_RUN_POLICY_TEST: ${{ inputs.run-policy-test }}
         INPUT_COMMENT_PR: ${{ inputs.comment-pr }}

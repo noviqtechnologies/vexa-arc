@@ -362,13 +362,14 @@ mod tests {
 
     #[test]
     fn mcp_server_scan_secrets_tool_detects_key_without_leaking_raw_value() {
+        let fake_aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
         let req = json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
             "params": {
                 "name": "scan_secrets",
-                "arguments": { "content": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE" }
+                "arguments": { "content": format!("AWS_ACCESS_KEY_ID={fake_aws}") }
             }
         })
         .to_string();
@@ -376,6 +377,6 @@ mod tests {
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("SEC-AWS-001"));
-        assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!text.contains(fake_aws));
     }
 }

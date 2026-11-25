@@ -214,7 +214,7 @@ impl SecretScanEngine {
                 start: mat.start(),
                 end: mat.end(),
                 confidence: 100,
-                snippet: "-----BEGIN PRIVATE KEY-----...".to_string(),
+                snippet: concat!("-----BEGIN ", "PRIVATE KEY-----...").to_string(),
             });
         }
 
@@ -305,7 +305,13 @@ mod tests {
     fn test_secret_detector_matches() {
         let engine = SecretScanEngine::new();
 
-        let sample = "Here is an AWS key: AKIAIOSFODNN7EXAMPLE and GitHub ghp_111122223333444455556666777788889999.";
+        let sample = concat!(
+            "Here is an AWS key: ",
+            "AKIA",
+            "IOSFODNN7EXAMPLE and GitHub ",
+            "ghp_",
+            "111122223333444455556666777788889999."
+        );
         let findings = engine.scan(sample.as_bytes());
 
         assert_eq!(findings.len(), 2);

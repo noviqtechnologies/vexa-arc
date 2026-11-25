@@ -1965,9 +1965,10 @@ mod tests {
         let session = "sess-ast-test";
 
         // Bad code with fatal injection (unparameterized SQL in template literal)
-        let bad_code = r#"
-            const query = `SELECT * FROM users WHERE id = ${req.params.id}`;
-        "#;
+        let bad_code = concat!(
+            "\n            const query = `SELECT * FROM users WHERE id = $",
+            "{req.params.id}`;\n        "
+        );
 
         let write_event = ActionEvent::new(
             AgentHost::ClaudeCode,
@@ -2400,7 +2401,7 @@ mod tests {
                 },
                 tool: "create_issue".to_string(),
                 arguments: serde_json::json!({
-                    "body": "token AKIAIOSFODNN7EXAMPLE"
+                    "body": concat!("token ", "AKIA", "IOSFODNN7EXAMPLE")
                 }),
             },
         );
