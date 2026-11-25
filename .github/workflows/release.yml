@@ -358,12 +358,31 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Publish @vexasec/arc to npm (if NPM_TOKEN configured)
-        if: env.NODE_AUTH_TOKEN != ''
+      - name: Publish @vexasec/arc to npm
         working-directory: npm
+        shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+          NPM_TRUSTED_PUBLISHING: ${{ vars.NPM_TRUSTED_PUBLISHING }}
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+
+          if [ -z "${NODE_AUTH_TOKEN:-}" ] && [ "${NPM_TRUSTED_PUBLISHING:-false}" != "true" ]; then
+            echo "::notice::Skipping npm publish: configure secrets.NPM_TOKEN or set vars.NPM_TRUSTED_PUBLISHING=true for OIDC Trusted Publishing."
+            exit 0
+          fi
+
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG_NAME}@${PKG_VERSION} is already published on npm; skipping."
+            exit 0
+          fi
+
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            unset NODE_AUTH_TOKEN
+          fi
+
+          npm publish --provenance --access public
