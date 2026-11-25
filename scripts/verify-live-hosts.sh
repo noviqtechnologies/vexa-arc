@@ -24,6 +24,20 @@ trap 'rm -rf "$TMP_DIR"' EXIT
   set +e
   RM_ERR="$(printf '{"hook_event_name":"beforeShellExecution","conversation_id":"live-v1","command":"rm -rf /tmp/prod","cwd":"%s"}' "$TMP_DIR" | "$ARC_BIN" intercept hook --host cursor 2>&1)"
   RM_CODE=$?
+  COPILOT_OUT="$(printf '{"hookEventName":"preToolUse","sessionId":"live-v1","toolName":"bash","toolArgs":{"command":"rm -rf /tmp/prod"},"cwd":"%s"}' "$TMP_DIR" | "$ARC_BIN" intercept hook --host github-copilot 2>&1)"
+  COPILOT_CODE=$?
+  CODEX_OUT="$(printf '{"hook_event_name":"PreToolUse","session_id":"live-v1","tool_name":"shell","tool_input":{"command":"rm -rf /tmp/prod"},"cwd":"%s"}' "$TMP_DIR" | "$ARC_BIN" intercept hook --host codex-cli 2>&1)"
+  CODEX_CODE=$?
+  GEMINI_OUT="$(printf '{"hook_event_name":"BeforeTool","session_id":"live-v1","tool_name":"run_shell_command","tool_input":{"command":"rm -rf /tmp/prod"},"cwd":"%s"}' "$TMP_DIR" | "$ARC_BIN" intercept hook --host gemini-cli 2>&1)"
+  GEMINI_CODE=$?
+  WINDSURF_OUT="$(printf '{"agent_action_name":"pre_run_command","trajectory_id":"live-v1","tool_info":{"command_line":"rm -rf /tmp/prod","cwd":"%s"}}' "$TMP_DIR" | "$ARC_BIN" intercept hook --host windsurf 2>&1)"
+  WINDSURF_CODE=$?
+  CLINE_OUT="$(printf '{"hookName":"PreToolUse","taskId":"live-v1","workspaceRoots":["%s"],"preToolUse":{"toolName":"execute_command","parameters":{"command":"rm -rf /tmp/prod"}}}' "$TMP_DIR" | "$ARC_BIN" intercept hook --host cline 2>&1)"
+  CLINE_CODE=$?
+  KIRO_OUT="$(printf '{"trigger":"PreToolUse","session_id":"live-v1","tool_name":"shell","tool_input":{"command":"rm -rf /tmp/prod"},"cwd":"%s"}' "$TMP_DIR" | "$ARC_BIN" intercept hook --host kiro 2>&1)"
+  KIRO_CODE=$?
+  OPENCODE_OUT="$(printf '{"event":"tool.execute.before","sessionID":"live-v1","tool":"bash","args":{"command":"rm -rf /tmp/prod"},"cwd":"%s"}' "$TMP_DIR" | "$ARC_BIN" intercept hook --host opencode 2>&1)"
+  OPENCODE_CODE=$?
   set -e
 
   REPORT="# Vexa Arc Live Host Verification Evidence
@@ -34,7 +48,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 - **Claude Code CLI:** $CLAUDE_VER
 - **Cursor CLI:** $CURSOR_VER
 
-## Automated Hook Probes (Fresh \`arc init\` Disposable Project)
+## Automated Hook Probes (Fresh \`arc init --host all\` Disposable Project)
 
 | Scenario | Host | Result |
 | --- | --- | --- |
@@ -42,6 +56,13 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 | \`.env.example\` read (benign template) | claude-code | \`$EX_OUT\` |
 | Unapproved MCP call (\`ARC-MCP-001\`) | cursor | \`$MCP_OUT\` |
 | Destructive \`rm -rf\` (\`ARC-CMD-001\`) | cursor | exit $RM_CODE (\`$RM_ERR\`) |
+| Destructive \`rm -rf\` (\`ARC-CMD-001\`) | github-copilot | exit $COPILOT_CODE (\`$COPILOT_OUT\`) |
+| Destructive \`rm -rf\` (\`ARC-CMD-001\`) | codex-cli | exit $CODEX_CODE (\`$CODEX_OUT\`) |
+| Destructive \`rm -rf\` (\`ARC-CMD-001\`) | gemini-cli | exit $GEMINI_CODE (\`$GEMINI_OUT\`) |
+| Destructive \`rm -rf\` (\`ARC-CMD-001\`) | windsurf | exit $WINDSURF_CODE (\`$WINDSURF_OUT\`) |
+| Destructive \`rm -rf\` (\`ARC-CMD-001\`) | cline | exit $CLINE_CODE (\`$CLINE_OUT\`) |
+| Destructive \`rm -rf\` (\`ARC-CMD-001\`) | kiro | exit $KIRO_CODE (\`$KIRO_OUT\`) |
+| Destructive \`rm -rf\` (\`ARC-CMD-001\`) | opencode | exit $OPENCODE_CODE (\`$OPENCODE_OUT\`) |
 
 ## Interactive Authenticated Session Checklist (Run Manually in Interactive PTY — NOT \`claude -p\`)
 - [ ] \`.env\` read -> user-visible ask/deny

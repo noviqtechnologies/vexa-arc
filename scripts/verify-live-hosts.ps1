@@ -13,6 +13,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$ArcBin = (Get-Command $ArcBin).Source
 $ArcVer = (& $ArcBin --version 2>&1) | Out-String
 $ClaudeCmd = Get-Command claude -ErrorAction SilentlyContinue
 $CursorCmd = Get-Command cursor -ErrorAction SilentlyContinue
@@ -51,6 +52,13 @@ try {
     $ExampleProbe = Invoke-HookProbe "claude-code" "{`"hook_event_name`":`"PreToolUse`",`"session_id`":`"live-v1`",`"tool_name`":`"Read`",`"tool_input`":{`"file_path`":`"$CwdJson\\.env.example`"},`"cwd`":`"$CwdJson`"}"
     $McpProbe = Invoke-HookProbe "cursor" "{`"hook_event_name`":`"beforeMCPExecution`",`"conversation_id`":`"live-v1`",`"server`":`"rogue-unapproved`",`"tool_name`":`"dump`",`"tool_input`":`"{}`",`"cwd`":`"$CwdJson`"}"
     $RmProbe = Invoke-HookProbe "cursor" "{`"hook_event_name`":`"beforeShellExecution`",`"conversation_id`":`"live-v1`",`"command`":`"rm -rf /tmp/prod`",`"cwd`":`"$CwdJson`"}"
+    $CopilotProbe = Invoke-HookProbe "github-copilot" "{`"hookEventName`":`"preToolUse`",`"sessionId`":`"live-v1`",`"toolName`":`"powershell`",`"toolArgs`":`"{\`"command\`":\`"rm -rf /tmp/prod\`"}`",`"cwd`":`"$CwdJson`"}"
+    $CodexProbe = Invoke-HookProbe "codex-cli" "{`"hook_event_name`":`"PreToolUse`",`"session_id`":`"live-v1`",`"tool_name`":`"shell`",`"tool_input`":{`"command`":`"rm -rf /tmp/prod`"},`"cwd`":`"$CwdJson`"}"
+    $GeminiProbe = Invoke-HookProbe "gemini-cli" "{`"hook_event_name`":`"BeforeTool`",`"session_id`":`"live-v1`",`"tool_name`":`"run_shell_command`",`"tool_input`":{`"command`":`"rm -rf /tmp/prod`"},`"cwd`":`"$CwdJson`"}"
+    $WindsurfProbe = Invoke-HookProbe "windsurf" "{`"agent_action_name`":`"pre_run_command`",`"trajectory_id`":`"live-v1`",`"tool_info`":{`"command_line`":`"rm -rf /tmp/prod`",`"cwd`":`"$CwdJson`"}}"
+    $ClineProbe = Invoke-HookProbe "cline" "{`"hookName`":`"PreToolUse`",`"taskId`":`"live-v1`",`"workspaceRoots`":[`"$CwdJson`"],`"preToolUse`":{`"toolName`":`"execute_command`",`"parameters`":{`"command`":`"rm -rf /tmp/prod`"}}}"
+    $KiroProbe = Invoke-HookProbe "kiro" "{`"trigger`":`"PreToolUse`",`"session_id`":`"live-v1`",`"tool_name`":`"shell`",`"tool_input`":{`"command`":`"rm -rf /tmp/prod`"},`"cwd`":`"$CwdJson`"}"
+    $OpenCodeProbe = Invoke-HookProbe "opencode" "{`"event`":`"tool.execute.before`",`"sessionID`":`"live-v1`",`"tool`":`"bash`",`"args`":{`"command`":`"rm -rf /tmp/prod`"},`"cwd`":`"$CwdJson`"}"
 
     $Report = @"
 # Vexa Arc Live Host Verification Evidence
@@ -61,7 +69,7 @@ try {
 - **Claude Code CLI:** $($ClaudeVer.Trim())
 - **Cursor CLI:** $($CursorVer.Trim())
 
-## Automated Hook Probes (Fresh ``arc init`` Disposable Project)
+## Automated Hook Probes (Fresh ``arc init --host all`` Disposable Project)
 
 | Scenario | Host | Exit Code | Output Summary |
 | --- | --- | --- | --- |
@@ -69,6 +77,13 @@ try {
 | ``.env.example`` read (benign template) | claude-code | $($ExampleProbe.Code) | ``$($ExampleProbe.Stdout)`` |
 | Unapproved MCP call (``ARC-MCP-001``) | cursor | $($McpProbe.Code) | ``$($McpProbe.Stdout)`` |
 | Destructive ``rm -rf`` (``ARC-CMD-001``) | cursor | $($RmProbe.Code) | ``$($RmProbe.Stderr)`` |
+| Destructive ``rm -rf`` (``ARC-CMD-001``) | github-copilot | $($CopilotProbe.Code) | ``$($CopilotProbe.Stdout)`` |
+| Destructive ``rm -rf`` (``ARC-CMD-001``) | codex-cli | $($CodexProbe.Code) | ``$($CodexProbe.Stdout)`` |
+| Destructive ``rm -rf`` (``ARC-CMD-001``) | gemini-cli | $($GeminiProbe.Code) | ``$($GeminiProbe.Stdout)`` |
+| Destructive ``rm -rf`` (``ARC-CMD-001``) | windsurf | $($WindsurfProbe.Code) | ``$($WindsurfProbe.Stderr)`` |
+| Destructive ``rm -rf`` (``ARC-CMD-001``) | cline | $($ClineProbe.Code) | ``$($ClineProbe.Stdout)`` |
+| Destructive ``rm -rf`` (``ARC-CMD-001``) | kiro | $($KiroProbe.Code) | ``$($KiroProbe.Stderr)`` |
+| Destructive ``rm -rf`` (``ARC-CMD-001``) | opencode | $($OpenCodeProbe.Code) | ``$($OpenCodeProbe.Stderr)`` |
 
 ## Interactive Authenticated Session Checklist (Run Manually in Interactive PTY — NOT ``claude -p``)
 - [ ] ``.env`` read -> user-visible ask/deny

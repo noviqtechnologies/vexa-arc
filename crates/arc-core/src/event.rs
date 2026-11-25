@@ -11,6 +11,9 @@ pub enum AgentHost {
     Windsurf,
     CodexCli,
     GeminiCli,
+    Cline,
+    Kiro,
+    OpenCode,
     CustomMcpClient,
     Ci,
 }

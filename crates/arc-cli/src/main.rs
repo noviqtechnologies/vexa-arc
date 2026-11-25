@@ -19,9 +19,13 @@ use arc_firewall::proxy::PackageFirewall;
 use arc_firewall::slopsquat::SlopsquatVerdict;
 use arc_hooks::broker::McpStdioBroker;
 use arc_hooks::claude_code::ClaudeCodeAdapter;
+use arc_hooks::cline::ClineAdapter;
 use arc_hooks::codex_cli::CodexCliAdapter;
 use arc_hooks::cursor::CursorAdapter;
 use arc_hooks::gemini_cli::GeminiCliAdapter;
+use arc_hooks::github_copilot::GitHubCopilotAdapter;
+use arc_hooks::kiro::KiroAdapter;
+use arc_hooks::opencode::OpenCodeAdapter;
 use arc_hooks::windsurf::WindsurfAdapter;
 use arc_hooks::HostAdapter;
 use arc_policy_engine::evaluator::{PolicyConfig, PolicyEvaluator};
@@ -218,7 +222,7 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
 
-        /// Target IDE host to configure (auto, claude-code, cursor, all, none)
+        /// Target IDE host to configure (auto, claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode, all, none)
         #[arg(long, default_value = "auto")]
         host: String,
 
@@ -694,7 +698,7 @@ enum SessionAction {
 enum HostAction {
     /// Install Vexa Arc proxy wrapper into host agent config
     Install {
-        /// Target host (claude-code, cursor, codex-cli, gemini-cli, windsurf)
+        /// Target host (claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode)
         #[arg(long, default_value = "claude-code")]
         host: String,
 
@@ -705,7 +709,7 @@ enum HostAction {
 
     /// Check host integration status and detect config bypasses (FR-MCP-005)
     Status {
-        /// Target host (claude-code, cursor, codex-cli, gemini-cli, windsurf)
+        /// Target host (claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode)
         #[arg(long, default_value = "claude-code")]
         host: String,
 
@@ -720,7 +724,7 @@ enum HostAction {
 
     /// Uninstall Vexa Arc proxy wrapper and restore original config
     Uninstall {
-        /// Target host (claude-code, cursor, codex-cli, gemini-cli, windsurf)
+        /// Target host (claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode)
         #[arg(long, default_value = "claude-code")]
         host: String,
 
@@ -897,7 +901,7 @@ enum InterceptAction {
     /// Native host hook entrypoint: reads the host's hook JSON from stdin and answers in the
     /// host's native format (used by `arc host install`). Fails closed on any error.
     Hook {
-        /// Host whose hook payload is on stdin (claude-code, cursor)
+        /// Host whose hook payload is on stdin (claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode)
         #[arg(long)]
         host: String,
 
@@ -2445,10 +2449,13 @@ fn parse_agent_host(host: &str) -> AgentHost {
     match host.to_lowercase().as_str() {
         "claude-code" | "claude" => AgentHost::ClaudeCode,
         "cursor" => AgentHost::Cursor,
-        "vscode" | "vscode-copilot" | "copilot" => AgentHost::VsCodeCopilot,
+        "github-copilot" | "vscode" | "vscode-copilot" | "copilot" => AgentHost::VsCodeCopilot,
         "windsurf" => AgentHost::Windsurf,
         "codex" | "codex-cli" => AgentHost::CodexCli,
         "gemini" | "gemini-cli" => AgentHost::GeminiCli,
+        "cline" => AgentHost::Cline,
+        "kiro" | "aws-kiro" => AgentHost::Kiro,
+        "opencode" => AgentHost::OpenCode,
         "ci" => AgentHost::Ci,
         _ => AgentHost::CustomMcpClient,
     }
@@ -2712,8 +2719,74 @@ fn run_host_install(host: &str, workspace: Option<&Path>) -> bool {
                 false
             }
         },
+        "github-copilot" | "copilot" | "vscode-copilot" | "vscode" => {
+            match GitHubCopilotAdapter::install_integration(root) {
+                Ok(summary) => {
+                    println!(
+                        "✔ Registered GitHub Copilot hooks in {} (cross-platform bash + powershell)",
+                        summary.config_path.display()
+                    );
+                    if let Some(warn) = &summary.volatile_warning {
+                        eprintln!("  [WARN] {warn}");
+                    }
+                    true
+                }
+                Err(e) => {
+                    eprintln!("[Arc Host] Failed to install GitHub Copilot integration: {e}");
+                    false
+                }
+            }
+        }
+        "cline" => match ClineAdapter::install_integration(root) {
+            Ok(summary) => {
+                println!(
+                    "✔ Registered Cline hooks in {} (cross-platform sh + ps1)",
+                    summary.config_path.display()
+                );
+                if let Some(warn) = &summary.volatile_warning {
+                    eprintln!("  [WARN] {warn}");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to install Cline integration: {e}");
+                false
+            }
+        },
+        "kiro" | "aws-kiro" => match KiroAdapter::install_integration(root) {
+            Ok(summary) => {
+                println!(
+                    "✔ Registered AWS Kiro hooks in {}",
+                    summary.config_path.display()
+                );
+                if let Some(warn) = &summary.volatile_warning {
+                    eprintln!("  [WARN] {warn}");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to install AWS Kiro integration: {e}");
+                false
+            }
+        },
+        "opencode" => match OpenCodeAdapter::install_integration(root) {
+            Ok(summary) => {
+                println!(
+                    "✔ Registered OpenCode plugin in {}",
+                    summary.config_path.display()
+                );
+                if let Some(warn) = &summary.volatile_warning {
+                    eprintln!("  [WARN] {warn}");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to install OpenCode integration: {e}");
+                false
+            }
+        },
         _ => {
-            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode");
             false
         }
     }
@@ -2725,11 +2798,17 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
     let status = match host.to_lowercase().as_str() {
         "claude-code" | "claude" => ClaudeCodeAdapter::check_integration(root),
         "cursor" => CursorAdapter::check_integration(root),
+        "github-copilot" | "copilot" | "vscode-copilot" | "vscode" => {
+            GitHubCopilotAdapter::check_integration(root)
+        }
         "codex-cli" | "codex" => CodexCliAdapter::check_integration(root),
         "gemini-cli" | "gemini" => GeminiCliAdapter::check_integration(root),
         "windsurf" => WindsurfAdapter::check_integration(root),
+        "cline" => ClineAdapter::check_integration(root),
+        "kiro" | "aws-kiro" => KiroAdapter::check_integration(root),
+        "opencode" => OpenCodeAdapter::check_integration(root),
         _ => {
-            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode");
             return false;
         }
     };
@@ -2740,6 +2819,7 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
             &[
                 "PreToolUse (Bash, Read, NotebookRead, Write, Edit, MultiEdit, NotebookEdit, WebFetch, mcp__*)",
                 "PostToolUse (WebFetch, WebSearch, mcp__*)",
+                "UserPromptSubmit",
             ],
             &[
                 "Direct editor writes outside agent tools",
@@ -2760,10 +2840,23 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
                 "External terminal commands and direct network egress",
             ],
         ),
+        "github-copilot" | "copilot" | "vscode-copilot" | "vscode" => (
+            &[
+                "preToolUse (bash/powershell, view/read, edit/create, fetch_webpage, mcp__*)",
+                "postToolUse (MCP & web tool results for taint tracking)",
+                "userPromptSubmitted",
+            ],
+            &[
+                "Inline editor completions (Ctrl+I / ghost text) outside Agent Mode",
+                "Direct editor writes outside agent tools",
+                "Unwrapped MCP stdio/HTTP servers",
+            ],
+        ),
         "codex-cli" | "codex" => (
             &[
                 "PreToolUse (Bash, file read/write, MCP tool calls)",
                 "PostToolUse (tool results & taint tracking)",
+                "UserPromptSubmit",
             ],
             &[
                 "Unwrapped MCP stdio/HTTP servers",
@@ -2774,6 +2867,7 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
             &[
                 "BeforeTool (shell, file read/write, web fetch, MCP tool calls)",
                 "AfterTool (tool results & taint tracking)",
+                "BeforeAgent / UserPromptSubmit",
             ],
             &[
                 "Unwrapped MCP stdio/HTTP servers",
@@ -2785,11 +2879,46 @@ fn run_host_status(host: &str, workspace: Option<&Path>, json: bool) -> bool {
                 "pre_run_command (shell execution)",
                 "pre_read_code / pre_write_code (file reads & writes)",
                 "pre_mcp_tool_use / post_mcp_tool_use (MCP calls)",
+                "pre_user_prompt",
             ],
             &[
                 "Direct editor writes outside Cascade hooks",
                 "Unwrapped MCP stdio/HTTP servers",
                 "External terminal commands and direct network egress",
+            ],
+        ),
+        "cline" => (
+            &[
+                "PreToolUse (execute_command, read_file, write_to_file, replace_in_file, use_mcp_tool, web_fetch)",
+                "PostToolUse (MCP & web tool results for taint tracking)",
+                "UserPromptSubmit",
+            ],
+            &[
+                "Direct editor writes outside Cline hooks",
+                "Unwrapped MCP stdio/HTTP servers",
+                "External terminal commands and direct network egress",
+            ],
+        ),
+        "kiro" | "aws-kiro" => (
+            &[
+                "PreToolUse (shell, fs_read, fs_write, web_fetch, mcp__*)",
+                "PostToolUse (MCP & web tool results for taint tracking)",
+                "UserPromptSubmit",
+            ],
+            &[
+                "Direct editor writes outside Kiro hooks",
+                "Unwrapped MCP stdio/HTTP servers",
+                "External terminal commands and direct network egress",
+            ],
+        ),
+        "opencode" => (
+            &[
+                "tool.execute.before (bash, read, write/edit/patch, webfetch, mcp__*)",
+                "tool.execute.after (MCP & web tool results for taint tracking)",
+            ],
+            &[
+                "External terminal commands and direct network egress",
+                "Unwrapped MCP stdio/HTTP servers",
             ],
         ),
         _ => (&[], &[]),
@@ -2931,8 +3060,82 @@ fn run_host_uninstall(host: &str, workspace: Option<&Path>) -> bool {
                 false
             }
         },
+        "github-copilot" | "copilot" | "vscode-copilot" | "vscode" => {
+            match GitHubCopilotAdapter::uninstall_integration(root) {
+                Ok(modified) => {
+                    if modified {
+                        println!(
+                            "[Arc Host] GitHub Copilot integration removed from {}",
+                            root.display()
+                        );
+                    } else {
+                        println!(
+                            "[Arc Host] No Arc hook found in GitHub Copilot config (was not installed)"
+                        );
+                    }
+                    true
+                }
+                Err(e) => {
+                    eprintln!("[Arc Host] Failed to remove GitHub Copilot integration: {e}");
+                    false
+                }
+            }
+        }
+        "cline" => match ClineAdapter::uninstall_integration(root) {
+            Ok(modified) => {
+                if modified {
+                    println!(
+                        "[Arc Host] Cline integration removed from {}",
+                        root.display()
+                    );
+                } else {
+                    println!("[Arc Host] No Arc hook found in Cline config (was not installed)");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to remove Cline integration: {e}");
+                false
+            }
+        },
+        "kiro" | "aws-kiro" => match KiroAdapter::uninstall_integration(root) {
+            Ok(modified) => {
+                if modified {
+                    println!(
+                        "[Arc Host] AWS Kiro integration removed from {}",
+                        root.display()
+                    );
+                } else {
+                    println!("[Arc Host] No Arc hook found in AWS Kiro config (was not installed)");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to remove AWS Kiro integration: {e}");
+                false
+            }
+        },
+        "opencode" => match OpenCodeAdapter::uninstall_integration(root) {
+            Ok(modified) => {
+                if modified {
+                    println!(
+                        "[Arc Host] OpenCode integration removed from {}",
+                        root.display()
+                    );
+                } else {
+                    println!(
+                        "[Arc Host] No Arc plugin found in OpenCode config (was not installed)"
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("[Arc Host] Failed to remove OpenCode integration: {e}");
+                false
+            }
+        },
         _ => {
-            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
+            eprintln!("Error: Unknown host '{host}'. Supported: claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode");
             false
         }
     }
@@ -4309,11 +4512,17 @@ fn run_intercept_hook(host: &str, session_dir: Option<&Path>, project_local: boo
     let adapter: Box<dyn HostAdapter> = match host.to_lowercase().as_str() {
         "claude-code" | "claude" => Box::new(ClaudeCodeAdapter),
         "cursor" => Box::new(CursorAdapter),
+        "github-copilot" | "copilot" | "vscode-copilot" | "vscode" => {
+            Box::new(GitHubCopilotAdapter)
+        }
         "codex-cli" | "codex" => Box::new(CodexCliAdapter),
         "gemini-cli" | "gemini" => Box::new(GeminiCliAdapter),
         "windsurf" => Box::new(WindsurfAdapter),
+        "cline" => Box::new(ClineAdapter),
+        "kiro" | "aws-kiro" => Box::new(KiroAdapter),
+        "opencode" => Box::new(OpenCodeAdapter),
         other => {
-            eprintln!("[Arc Hook] Unknown host '{other}'. Supported: claude-code, cursor, codex-cli, gemini-cli, windsurf");
+            eprintln!("[Arc Hook] Unknown host '{other}'. Supported: claude-code, cursor, github-copilot, codex-cli, gemini-cli, windsurf, cline, kiro, opencode");
             return 2;
         }
     };

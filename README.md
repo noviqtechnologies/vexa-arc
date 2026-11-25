@@ -60,10 +60,10 @@ Vexa Arc is designed for **pre-execution checks on explicitly mediated paths**; 
 | Security Dimension | Threat Vector Addressed | Vexa Arc Mechanism | CLI Command |
 | :--- | :--- | :--- | :--- |
 | **Observed Taint Checks** | Mediated private-data + untrusted-context flows (excluding benign templates like `.env.example`) | Session Taint DAG with keyed HMAC-SHA256 fail-closed integrity (`~/.arc/session.key` / `ARC_SESSION_HMAC_KEY`) and heuristic classification of selected sinks | `arc intercept eval --session s1` |
-| **Selected Agent Hooks** | Configured Claude Code (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`), Cursor, Codex CLI, Gemini CLI, and Windsurf lifecycle events | Host hooks enforce `ARC-DLP-001` (fail-closed secret blocking), `ARC-FS-001` (sensitive path protection), `ARC-CMD-001` (destructive command blocking), `ARC-MCP-001` (unapproved MCP gating), and `ARC-PKG-001` (package checks) | `arc init` / `arc host install --host claude-code` |
+| **Selected Agent Hooks** | Configured **Claude Code**, **Cursor**, **GitHub Copilot**, **Codex CLI**, **Gemini CLI**, **Windsurf**, **Cline**, **AWS Kiro**, and **OpenCode** lifecycle events | Cross-platform host hooks enforce `ARC-DLP-001` (fail-closed secret blocking), `ARC-FS-001` (sensitive path protection), `ARC-CMD-001` (destructive command blocking), `ARC-MCP-001` (unapproved MCP gating), and `ARC-PKG-001` (package checks) | `arc init` / `arc host install --host <name>` |
 | **Package Risk Check** | OpenSSF `MAL-*` malware, slopsquatting, malicious install scripts, 404s, and known vulnerabilities | Live cached npm, PyPI, crates.io, and Go module proxy (`proxy.golang.org`) lookups + live OSV `MAL-*` malware gate (`CompoundMalwareGate`), real npm Sigstore/PyPI PEP 740 attestation checks (zero fabricated scores), and compound shell command parsing (`&&`, `;`, `\|`, `sh -c`, `npx`/`bun`/`poetry`/`uvx`) | `arc shield check lodash@4.17.21` |
 | **Wrapped MCP Schema Pinning & Tool Poisoning Defense** | Schema rug-pulls, day-1 MCP tool-description poisoning (`<IMPORTANT>`, hidden credential exfil prompts), invisible Unicode smuggling, and cross-tool shadowing | RFC 8785 JCS hashing + `ARC-MCP-POISON-001` pre-pin quarantine; `Transfer-Encoding: chunked` + cross-chunk SSE mediation; local `.arc/mcp-pins.lock`, signed org policy pin, or `--allow-tofu` | `arc protect stdio --server github -- npx ...` |
-| **Local MCP Security Server** | Agents without native hooks (Codex, Gemini CLI, Windsurf, Cline) | Stdio MCP server exposing `scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets` | `arc mcp-server` |
+| **Local MCP Security Server** | Any MCP-capable agent (or alongside native hooks in Claude Code, Cursor, GitHub Copilot, Codex CLI, Gemini CLI, Windsurf, Cline, Kiro, OpenCode) | Stdio MCP server exposing `scan_secrets`, `check_package`, `sca_audit`, `audit_ai_assets` | `arc mcp-server` |
 | **Process Lifecycle Controls** | Some child-process lifetime/resource risks in the wrapped broker | OS-specific lifecycle/resource controls; not sandboxing or network isolation | `arc protect stdio --max-memory-mb 512` |
 | **Secret Scanning** | Supported secret patterns across all non-binary repo files (<=2 MB) and mediated hook/MCP inputs | Unified zero-allocation Aho-Corasick + regex/entropy engine across `scan-secrets`, `ci-report`, `audit`, `mcp-server`, and fail-closed native hooks (`ARC-DLP-001`) | `arc scan-secrets --path . --redact` |
 | **Targeted Code-Pattern Scan** | Selected risky code patterns on a mediated file-write event | Aho-Corasick prefilter + Tree-sitter AST verification (JS/TS/Python) skipping comments/doc strings | `arc intercept eval --kind file_write` |
@@ -191,19 +191,26 @@ Arc lexically recognizes selected command and interpreter signatures. This is he
 
 ### 2. Hardened Host Onboarding & Runtime Hooks (`arc host install`)
 
-Vexa Arc provides hardened host onboarding for **Claude Code** and **Cursor IDE**. Hook installation is designed with defensive execution preflights:
-1. **Canonical Absolute Binary Path:** `arc host install` resolves `std::env::current_exe()?.canonicalize()` to ensure background hooks execute reliably even when the host IDE is launched from desktop shortcuts or GUI launchers with a minimal environment lacking shell `PATH` exports (e.g. missing `~/.cargo/bin`).
-2. **Safe Path Escaping & Quoting:** Binary paths containing spaces (e.g., `C:\Users\Jane Doe\...` or `/Users/jane doe/...`), quotes, or Unicode are properly shell-quoted so subprocess tokenization never splits the executable path.
-3. **Byte-for-Byte Backup:** Creates verified backups (`settings.json.arc.bak` or `hooks.json.arc.bak`) before modifying files.
-4. **Safe Structural JSON Merging:** Preserves all foreign hooks and user keys; aborts cleanly without clobbering if an existing `hooks` structure is non-object (e.g. malformed string or array).
+Vexa Arc provides hardened cross-platform host onboarding for **9 native coding agents**: **Claude Code**, **Cursor**, **GitHub Copilot** (VS Code Agent Mode & Copilot CLI), **Codex CLI**, **Gemini CLI**, **Windsurf**, **Cline**, **AWS Kiro**, and **OpenCode**. Hook installation is designed with defensive execution preflights:
+1. **Canonical Absolute Binary Path:** `arc host install` resolves `std::env::current_exe()?.canonicalize()` and validates the path against control characters to ensure background hooks execute reliably even when the host IDE is launched from desktop shortcuts or GUI launchers with a minimal environment lacking shell `PATH` exports (e.g. missing `~/.cargo/bin`).
+2. **Safe Path Escaping & Quoting:** Binary paths containing spaces (e.g., `C:\Users\Jane Doe\...` or `/Users/jane doe/...`), quotes, `$`, or Unicode are properly POSIX single-quoted, PowerShell single-quoted, or JSON-escaped (zero shell invocation for OpenCode's `spawnSync` plugin).
+3. **Byte-for-Byte Backup:** Creates verified backups (`settings.json.arc.bak` or `hooks.json.arc.bak`) before modifying JSON files, and refuses to clobber non-Arc user-written hook scripts (Cline / OpenCode).
+4. **Safe Structural JSON Merging:** Preserves all foreign hooks and user keys; aborts cleanly without clobbering if an existing `hooks` structure is malformed.
 
 ```bash
-# Automatically install hardened hooks into .claude/settings.json or .cursor/hooks.json:
+# Automatically install hardened hooks for any supported host (or `--host all` via `arc init`):
 arc host install --host claude-code
 arc host install --host cursor
+arc host install --host github-copilot
+arc host install --host codex-cli
+arc host install --host gemini-cli
+arc host install --host windsurf
+arc host install --host cline
+arc host install --host kiro
+arc host install --host opencode
 
 # Inspect active status and detect unauthorized configuration bypasses:
-arc host status --host claude-code --json
+arc host status --host github-copilot --json
 ```
 
 #### Claude Code Integration (`.claude/settings.json`)

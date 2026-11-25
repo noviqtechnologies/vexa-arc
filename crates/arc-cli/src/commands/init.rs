@@ -1,8 +1,12 @@
 use arc_discover::scanner::{AuditReport, DiscoveryScanner};
 use arc_hooks::claude_code::ClaudeCodeAdapter;
+use arc_hooks::cline::ClineAdapter;
 use arc_hooks::codex_cli::CodexCliAdapter;
 use arc_hooks::cursor::CursorAdapter;
 use arc_hooks::gemini_cli::GeminiCliAdapter;
+use arc_hooks::github_copilot::GitHubCopilotAdapter;
+use arc_hooks::kiro::KiroAdapter;
+use arc_hooks::opencode::OpenCodeAdapter;
 use arc_hooks::windsurf::WindsurfAdapter;
 use arc_policy_engine::evaluator::{PolicyConfig, PolicyMode};
 use std::path::Path;
@@ -218,28 +222,73 @@ pub fn execute_init(
     let host_lower = host.to_lowercase();
     let has_claude = path.join(".claude").exists();
     let has_cursor = path.join(".cursor").exists();
+    let has_copilot = path.join(".github").join("hooks").exists()
+        || path
+            .join(".github")
+            .join("copilot-instructions.md")
+            .exists()
+        || path.join(".vscode").exists();
     let has_codex = path.join(".codex").exists();
     let has_gemini = path.join(".gemini").exists();
     let has_windsurf = path.join(".windsurf").exists();
+    let has_cline = path.join(".clinerules").exists() || path.join(".cline").exists();
+    let has_kiro = path.join(".kiro").exists();
+    let has_opencode = path.join(".opencode").exists() || path.join("opencode.json").exists();
 
-    let (install_claude, install_cursor, install_codex, install_gemini, install_windsurf) =
-        match host_lower.as_str() {
-            "none" => (false, false, false, false, false),
-            "claude-code" | "claude" => (true, false, false, false, false),
-            "cursor" => (false, true, false, false, false),
-            "codex-cli" | "codex" => (false, false, true, false, false),
-            "gemini-cli" | "gemini" => (false, false, false, true, false),
-            "windsurf" => (false, false, false, false, true),
-            "all" => (true, true, true, true, true),
-            _ => {
-                // auto: install for detected hosts, or Claude + Cursor if none exist yet
-                if !has_claude && !has_cursor && !has_codex && !has_gemini && !has_windsurf {
-                    (true, true, false, false, false)
-                } else {
-                    (has_claude, has_cursor, has_codex, has_gemini, has_windsurf)
-                }
+    let (
+        install_claude,
+        install_cursor,
+        install_copilot,
+        install_codex,
+        install_gemini,
+        install_windsurf,
+        install_cline,
+        install_kiro,
+        install_opencode,
+    ) = match host_lower.as_str() {
+        "none" => (
+            false, false, false, false, false, false, false, false, false,
+        ),
+        "claude-code" | "claude" => (true, false, false, false, false, false, false, false, false),
+        "cursor" => (false, true, false, false, false, false, false, false, false),
+        "github-copilot" | "copilot" | "vscode-copilot" | "vscode" => {
+            (false, false, true, false, false, false, false, false, false)
+        }
+        "codex-cli" | "codex" => (false, false, false, true, false, false, false, false, false),
+        "gemini-cli" | "gemini" => (false, false, false, false, true, false, false, false, false),
+        "windsurf" => (false, false, false, false, false, true, false, false, false),
+        "cline" => (false, false, false, false, false, false, true, false, false),
+        "kiro" | "aws-kiro" => (false, false, false, false, false, false, false, true, false),
+        "opencode" => (false, false, false, false, false, false, false, false, true),
+        "all" => (true, true, true, true, true, true, true, true, true),
+        _ => {
+            // auto: install for detected hosts, or Claude + Cursor if none exist yet
+            if !has_claude
+                && !has_cursor
+                && !has_copilot
+                && !has_codex
+                && !has_gemini
+                && !has_windsurf
+                && !has_cline
+                && !has_kiro
+                && !has_opencode
+            {
+                (true, true, false, false, false, false, false, false, false)
+            } else {
+                (
+                    has_claude,
+                    has_cursor,
+                    has_copilot,
+                    has_codex,
+                    has_gemini,
+                    has_windsurf,
+                    has_cline,
+                    has_kiro,
+                    has_opencode,
+                )
             }
-        };
+        }
+    };
 
     let mut installed_hosts = Vec::new();
     let mut hook_warnings = Vec::new();
@@ -267,6 +316,19 @@ pub fn execute_init(
             }
             Err(e) => {
                 eprintln!("[Arc Init] Warning: Cursor hook install failed: {e}");
+            }
+        }
+    }
+    if install_copilot {
+        match GitHubCopilotAdapter::install_integration(path) {
+            Ok(summary) => {
+                installed_hosts.push("github-copilot");
+                if let Some(w) = summary.volatile_warning {
+                    hook_warnings.push(w);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Arc Init] Warning: GitHub Copilot hook install failed: {e}");
             }
         }
     }
@@ -306,6 +368,45 @@ pub fn execute_init(
             }
             Err(e) => {
                 eprintln!("[Arc Init] Warning: Windsurf hook install failed: {e}");
+            }
+        }
+    }
+    if install_cline {
+        match ClineAdapter::install_integration(path) {
+            Ok(summary) => {
+                installed_hosts.push("cline");
+                if let Some(w) = summary.volatile_warning {
+                    hook_warnings.push(w);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Arc Init] Warning: Cline hook install failed: {e}");
+            }
+        }
+    }
+    if install_kiro {
+        match KiroAdapter::install_integration(path) {
+            Ok(summary) => {
+                installed_hosts.push("kiro");
+                if let Some(w) = summary.volatile_warning {
+                    hook_warnings.push(w);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Arc Init] Warning: AWS Kiro hook install failed: {e}");
+            }
+        }
+    }
+    if install_opencode {
+        match OpenCodeAdapter::install_integration(path) {
+            Ok(summary) => {
+                installed_hosts.push("opencode");
+                if let Some(w) = summary.volatile_warning {
+                    hook_warnings.push(w);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Arc Init] Warning: OpenCode plugin install failed: {e}");
             }
         }
     }

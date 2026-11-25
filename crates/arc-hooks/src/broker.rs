@@ -210,6 +210,9 @@ impl McpStdioBroker {
             AgentHost::CodexCli => "codex_cli",
             AgentHost::GeminiCli => "gemini_cli",
             AgentHost::Windsurf => "windsurf",
+            AgentHost::Cline => "cline",
+            AgentHost::Kiro => "kiro",
+            AgentHost::OpenCode => "opencode",
             AgentHost::CustomMcpClient => "custom_mcp",
             AgentHost::Ci => "ci",
         }

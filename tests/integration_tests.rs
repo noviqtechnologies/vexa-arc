@@ -3994,3 +3994,171 @@ fn test_v16_audit_and_setup_cloud_inventory_sync() {
     let _ = srv.join();
     let _ = fs::remove_dir_all(&root_dir);
 }
+
+#[test]
+fn test_all_nine_native_host_adapters_e2e_lifecycle_and_enforcement() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let arc_bin = env!("CARGO_BIN_EXE_arc");
+    let temp_dir = std::env::temp_dir().join(format!("arc_all9_adapters_{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let cwd_str = temp_dir.to_string_lossy().to_string();
+
+    // 1. `arc init --host all --json` installs all 9 native adapters
+    let init_out = Command::new(arc_bin)
+        .args(["init", "--path", &cwd_str, "--host", "all", "--json"])
+        .output()
+        .expect("arc init --host all failed");
+    assert!(
+        init_out.status.success(),
+        "arc init --host all stderr: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+    let init_json: serde_json::Value = serde_json::from_slice(&init_out.stdout).unwrap();
+    let installed = init_json["installed_hosts"].as_array().unwrap();
+    let all_hosts = [
+        "claude-code",
+        "cursor",
+        "github-copilot",
+        "codex-cli",
+        "gemini-cli",
+        "windsurf",
+        "cline",
+        "kiro",
+        "opencode",
+    ];
+    for host in all_hosts {
+        assert!(
+            installed.iter().any(|h| h.as_str() == Some(host)),
+            "expected '{host}' in installed_hosts: {installed:?}"
+        );
+
+        // 2. `arc host status --host <host> --json` reports installed=true
+        let status_out = Command::new(arc_bin)
+            .args([
+                "host",
+                "status",
+                "--host",
+                host,
+                "--workspace",
+                &cwd_str,
+                "--json",
+            ])
+            .output()
+            .expect("arc host status failed");
+        assert!(status_out.status.success());
+        let status_json: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+        assert_eq!(
+            status_json["installed"], true,
+            "host '{host}' should report installed=true: {status_json}"
+        );
+    }
+
+    // 3. `arc intercept hook` blocks destructive `rm -rf` across all 4 new adapters
+    let run_hook = |host: &str, payload: serde_json::Value| {
+        let mut child = Command::new(arc_bin)
+            .args(["intercept", "hook", "--host", host])
+            .current_dir(&temp_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn arc intercept hook");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let copilot_rm = run_hook(
+        "github-copilot",
+        serde_json::json!({
+            "hookEventName": "preToolUse",
+            "sessionId": "e2e-cp",
+            "toolName": "powershell",
+            "toolArgs": "{\"command\":\"rm -rf /tmp/prod\"}",
+            "cwd": cwd_str
+        }),
+    );
+    assert_eq!(copilot_rm.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&copilot_rm.stdout).contains("\"deny\""));
+    assert!(String::from_utf8_lossy(&copilot_rm.stderr).contains("ARC-CMD-001"));
+
+    let cline_rm = run_hook(
+        "cline",
+        serde_json::json!({
+            "hookName": "PreToolUse",
+            "taskId": "e2e-cline",
+            "workspaceRoots": [cwd_str],
+            "preToolUse": {"toolName": "execute_command", "parameters": {"command": "rm -rf /tmp/prod"}}
+        }),
+    );
+    assert_eq!(cline_rm.status.code(), Some(0));
+    let cline_json: serde_json::Value = serde_json::from_slice(&cline_rm.stdout).unwrap();
+    assert_eq!(cline_json["cancel"], true);
+    assert!(cline_json["errorMessage"]
+        .as_str()
+        .unwrap_or("")
+        .contains("ARC-CMD-001"));
+
+    let kiro_rm = run_hook(
+        "kiro",
+        serde_json::json!({
+            "trigger": "PreToolUse",
+            "session_id": "e2e-kiro",
+            "tool_name": "shell",
+            "tool_input": {"command": "rm -rf /tmp/prod"},
+            "cwd": cwd_str
+        }),
+    );
+    assert_eq!(kiro_rm.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&kiro_rm.stderr).contains("ARC-CMD-001"));
+
+    let opencode_rm = run_hook(
+        "opencode",
+        serde_json::json!({
+            "event": "tool.execute.before",
+            "sessionID": "e2e-oc",
+            "tool": "bash",
+            "args": {"command": "rm -rf /tmp/prod"},
+            "cwd": cwd_str
+        }),
+    );
+    assert_eq!(opencode_rm.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&opencode_rm.stderr).contains("ARC-CMD-001"));
+
+    // 4. Clean uninstall of all 9 adapters
+    for host in all_hosts {
+        let uninstall_out = Command::new(arc_bin)
+            .args(["host", "uninstall", "--host", host, "--workspace", &cwd_str])
+            .output()
+            .expect("arc host uninstall failed");
+        assert!(
+            uninstall_out.status.success(),
+            "uninstall failed for {host}"
+        );
+        let status_after = Command::new(arc_bin)
+            .args([
+                "host",
+                "status",
+                "--host",
+                host,
+                "--workspace",
+                &cwd_str,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_after.stdout).unwrap();
+        assert_eq!(
+            status_json["installed"], false,
+            "host '{host}' should report installed=false after uninstall"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

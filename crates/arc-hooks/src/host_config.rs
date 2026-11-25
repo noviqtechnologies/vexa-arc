@@ -90,26 +90,102 @@ pub fn resolve_canonical_arc_binary() -> std::io::Result<(PathBuf, Option<String
     Ok((canonical, warning))
 }
 
+/// Validates that a binary path contains no ASCII control characters (including NUL, CR, LF)
+/// that could break shell/script generation or enable command injection.
+pub fn validate_binary_path_safe(binary_path: &Path) -> std::io::Result<PathBuf> {
+    let clean = clean_canonical_path(binary_path);
+    let s = clean.to_string_lossy();
+    if s.is_empty() || s.chars().any(|c| c.is_control()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Arc binary path is empty or contains disallowed control characters",
+        ));
+    }
+    Ok(clean)
+}
+
+/// Escapes a string as a POSIX single-quoted shell token (`'...'`, with `'` -> `'\''`).
+/// Prevents any `$`, `` ` ``, `\`, `"`, `;`, `|`, or `&` expansion in bash/sh.
+pub fn quote_posix_shell(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Escapes a string as a PowerShell single-quoted literal (`'...'`, with `'` -> `''`).
+/// Prevents any `$`, `` ` ``, `;`, `|`, `&`, or subexpression expansion in PowerShell.
+pub fn quote_powershell(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Formats a hook command with proper shell quoting and argument escaping.
 pub fn format_hook_command(binary_path: &Path, host_arg: &str) -> String {
     let clean = clean_canonical_path(binary_path);
     format!("\"{}\" intercept hook --host {}", clean.display(), host_arg)
 }
 
+/// Formats a POSIX shell hook command using single-quote escaping so metacharacters
+/// (`$`, `` ` ``, spaces, quotes) in the binary path cannot be expanded by bash/sh.
+pub fn format_posix_hook_command(binary_path: &Path, host_arg: &str) -> String {
+    let clean = clean_canonical_path(binary_path);
+    format!(
+        "{} intercept hook --host {}",
+        quote_posix_shell(&clean.to_string_lossy()),
+        host_arg
+    )
+}
+
+/// Formats a PowerShell hook command using the call operator `&` and single-quote escaping.
+pub fn format_powershell_hook_command(binary_path: &Path, host_arg: &str) -> String {
+    let clean = clean_canonical_path(binary_path);
+    format!(
+        "& {} intercept hook --host {}",
+        quote_powershell(&clean.to_string_lossy()),
+        host_arg
+    )
+}
+
 /// Returns true if the hook command string invokes the Arc hook entrypoint.
 ///
 /// Handles bare invocations (`arc intercept hook`), quoted paths (`"/path/to/arc" intercept hook`),
-/// Windows `.exe` paths (`"C:\path\arc.exe" intercept hook`), and canonical paths with spaces.
+/// POSIX single-quoted paths (`'/path/to/arc' intercept hook`), PowerShell call operator
+/// (`& 'C:\path\arc.exe' intercept hook`), Windows `.exe` paths, and canonical paths with spaces.
 pub fn is_arc_command(cmd: &str) -> bool {
     if !cmd.contains("intercept hook") {
         return false;
     }
     if let Some((exe_part, _)) = cmd.split_once("intercept hook") {
-        let trimmed = exe_part.trim().trim_matches('"').trim_matches('\'');
-        let exe_name = trimmed
+        let mut trimmed = exe_part.trim();
+        if let Some(after_amp) = trimmed.strip_prefix('&') {
+            trimmed = after_amp.trim();
+        }
+        let unquoted = trimmed
+            .trim_matches('"')
+            .trim_matches('\'')
+            .replace("''", "'")
+            .replace("'\\''", "'");
+        let exe_name = unquoted
             .split(['/', '\\'])
             .rfind(|s| !s.is_empty())
-            .unwrap_or(trimmed);
+            .unwrap_or(&unquoted);
         exe_name == "arc" || exe_name == "arc.exe" || exe_name.starts_with("arc")
     } else {
         false
@@ -202,11 +278,19 @@ pub fn write_json_atomic(path: &Path, value: &Value) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Returns true if a Claude-style matcher group (`{"matcher":..,"hooks":[{"command":..}]}`)
-/// or a Cursor-style flat entry (`{"command":..}`) invokes Arc.
+/// Returns true if a Claude-style matcher group (`{"matcher":..,"hooks":[{"command":..}]}`),
+/// a Cursor/Windsurf flat entry (`{"command":..}`), a GitHub Copilot entry (`{"bash":..,"powershell":..}`),
+/// or a Kiro entry (`{"action":{"command":..}}`) invokes Arc.
 pub fn entry_is_arc(entry: &Value) -> bool {
-    if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
-        if is_arc_command(cmd) {
+    for key in ["command", "bash", "powershell"] {
+        if let Some(cmd) = entry.get(key).and_then(|c| c.as_str()) {
+            if is_arc_command(cmd) {
+                return true;
+            }
+        }
+    }
+    if let Some(action) = entry.get("action") {
+        if entry_is_arc(action) {
             return true;
         }
     }
@@ -219,9 +303,18 @@ pub fn entry_is_arc(entry: &Value) -> bool {
 /// Finds the first Arc hook command inside an array of hook entries.
 pub fn find_arc_command(entries: &Value) -> Option<String> {
     for entry in entries.as_array()? {
-        if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
-            if is_arc_command(cmd) {
-                return Some(cmd.to_string());
+        for key in ["command", "bash", "powershell"] {
+            if let Some(cmd) = entry.get(key).and_then(|c| c.as_str()) {
+                if is_arc_command(cmd) {
+                    return Some(cmd.to_string());
+                }
+            }
+        }
+        if let Some(action) = entry.get("action") {
+            if let Some(cmd) = action.get("command").and_then(|c| c.as_str()) {
+                if is_arc_command(cmd) {
+                    return Some(cmd.to_string());
+                }
             }
         }
         if let Some(inner) = entry.get("hooks") {
@@ -278,6 +371,27 @@ mod tests {
         assert!(!is_arc_command("search-tool --flag"));
         assert!(!is_arc_command("unrelated intercept hook --host cursor"));
         assert!(!is_arc_command("arc status"));
+        assert!(is_arc_command(
+            "& 'C:\\Users\\O''Brien\\arc.exe' intercept hook --host github-copilot"
+        ));
+        assert!(is_arc_command(
+            "'/Users/jane doe/arc' intercept hook --host github-copilot"
+        ));
+    }
+
+    #[test]
+    fn shell_quoting_and_path_validation_prevent_injection() {
+        assert_eq!(
+            quote_posix_shell("/tmp/o'brien/$HOME/`id`/arc"),
+            "'/tmp/o'\\''brien/$HOME/`id`/arc'"
+        );
+        assert_eq!(
+            quote_powershell(r"C:\Users\O'Brien\$env:SECRET\arc.exe"),
+            r"'C:\Users\O''Brien\$env:SECRET\arc.exe'"
+        );
+        assert!(validate_binary_path_safe(Path::new("/usr/local/bin/arc")).is_ok());
+        assert!(validate_binary_path_safe(Path::new("/tmp/bad\nrm -rf /")).is_err());
+        assert!(validate_binary_path_safe(Path::new("")).is_err());
     }
 
     #[test]

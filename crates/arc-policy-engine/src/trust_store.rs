@@ -299,6 +299,35 @@ impl PolicyTrustStore {
         Ok((policy, seq))
     }
 
+    /// Detects a legacy v1 `.arc/policy-state.json` (which stored `trusted_key` without
+    /// `format_version` or `state_sha256`). Returns the persisted `min_sequence` (defaulting to 0)
+    /// when the content matches the legacy v1 schema.
+    pub fn detect_legacy_v1_str(content: &str) -> Option<u64> {
+        let val: serde_json::Value = serde_json::from_str(content).ok()?;
+        let obj = val.as_object()?;
+        if obj.contains_key("format_version") || obj.contains_key("state_sha256") {
+            return None;
+        }
+        if obj.get("trusted_key").and_then(|v| v.as_str()).is_some() {
+            let min_seq = obj
+                .get("min_sequence")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            return Some(min_seq);
+        }
+        None
+    }
+
+    /// Detects a legacy v1 `.arc/policy-state.json` on disk (refusing symlinks).
+    pub fn detect_legacy_v1_file(path: &Path) -> Option<u64> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+        let content = fs::read_to_string(path).ok()?;
+        Self::detect_legacy_v1_str(&content)
+    }
+
     /// Load and verify a persisted trust store from disk (rejecting symlinks and integrity mismatches).
     pub fn load_verified(path: &Path) -> Result<Self, String> {
         if !path.exists() {
@@ -317,8 +346,21 @@ impl PolicyTrustStore {
         }
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
-        let store: Self = serde_json::from_str(&content)
-            .map_err(|e| format!("Malformed policy trust state '{}': {e}", path.display()))?;
+        let store: Self = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                if Self::detect_legacy_v1_str(&content).is_some() {
+                    return Err(format!(
+                        "Legacy v1 policy trust state '{}' is incompatible with v2 integrity verification (missing format_version/state_sha256). Re-bootstrap with `arc policy trust-init --root-key <key-id:hex> --force` or `arc setup --root-key <key-id:hex>`.",
+                        path.display()
+                    ));
+                }
+                return Err(format!(
+                    "Malformed policy trust state '{}': {e}",
+                    path.display()
+                ));
+            }
+        };
         store.verify_integrity()?;
         Ok(store)
     }
@@ -601,6 +643,35 @@ mod tests {
         assert!(
             tamper_err.contains("integrity check failed"),
             "err={tamper_err}"
+        );
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_verified_reports_actionable_error_for_legacy_v1_state() {
+        let tmp =
+            std::env::temp_dir().join(format!("arc_trust_legacy_v1_{}.json", uuid::Uuid::now_v7()));
+        fs::write(
+            &tmp,
+            r#"{
+  "min_sequence": 4,
+  "synced_at": "2026-11-20T15:38:45Z",
+  "trusted_key": "vexa-org:0130edd539192513284ad4446293a1b52b2d92db5e84a3bdfb441978293eece7"
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(PolicyTrustStore::detect_legacy_v1_file(&tmp), Some(4));
+
+        let err = PolicyTrustStore::load_verified(&tmp).unwrap_err();
+        assert!(
+            err.contains("Legacy v1 policy trust state"),
+            "unexpected err={err}"
+        );
+        assert!(
+            err.contains("arc policy trust-init --root-key"),
+            "missing remediation hint in err={err}"
         );
 
         let _ = fs::remove_file(&tmp);

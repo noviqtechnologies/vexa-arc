@@ -57,6 +57,29 @@ fn try_open_browser(url: &str) -> bool {
     }
 }
 
+/// Bootstraps `.arc/policy-state.json` from an administrator-supplied `--root-key` when no
+/// trust store exists yet, or upgrades a legacy v1 trust state file (preserving `min_sequence`).
+/// Existing v2 trust stores are never silently overwritten.
+fn bootstrap_or_upgrade_trust_root(project_dir: &Path, root_key: &str) -> Result<bool, String> {
+    let state_path = project_dir.join(".arc").join("policy-state.json");
+    let min_seq = if !state_path.exists() {
+        0
+    } else if let Some(legacy_min_seq) =
+        arc_policy_engine::PolicyTrustStore::detect_legacy_v1_file(&state_path)
+    {
+        legacy_min_seq
+    } else {
+        return Ok(false);
+    };
+
+    let store = arc_policy_engine::PolicyTrustStore::from_root_keys_str(root_key, min_seq)
+        .map_err(|e| format!("Invalid --root-key specification: {e}"))?;
+    store
+        .save_atomic(&state_path)
+        .map_err(|e| format!("Failed to persist trust root: {e}"))?;
+    Ok(true)
+}
+
 /// Reads the persisted `min_sequence` from `.arc/policy-state.json` (or `~/.arc/policy-state.json`).
 pub fn read_active_policy_sequence(project_dir: &Path) -> i64 {
     let project_state = project_dir.join(".arc").join("policy-state.json");
@@ -99,34 +122,31 @@ pub fn detect_installed_host_adapters(project_dir: &Path) -> Vec<String> {
     type AdapterCheck = (&'static str, fn(&Path) -> bool);
     let checks: &[AdapterCheck] = &[
         ("claude-code", |dir| {
-            let p = dir.join(".claude").join("settings.json");
-            std::fs::read_to_string(p)
-                .map(|c| c.contains("intercept hook"))
-                .unwrap_or(false)
+            arc_hooks::ClaudeCodeAdapter::check_integration(dir).is_configured
         }),
         ("cursor", |dir| {
-            let p = dir.join(".cursor").join("hooks.json");
-            std::fs::read_to_string(p)
-                .map(|c| c.contains("intercept hook"))
-                .unwrap_or(false)
+            arc_hooks::CursorAdapter::check_integration(dir).is_configured
+        }),
+        ("github-copilot", |dir| {
+            arc_hooks::GitHubCopilotAdapter::check_integration(dir).is_configured
         }),
         ("codex-cli", |dir| {
-            let p = dir.join(".codex").join("hooks.json");
-            std::fs::read_to_string(p)
-                .map(|c| c.contains("intercept hook"))
-                .unwrap_or(false)
+            arc_hooks::CodexCliAdapter::check_integration(dir).is_configured
         }),
         ("gemini-cli", |dir| {
-            let p = dir.join(".gemini").join("settings.json");
-            std::fs::read_to_string(p)
-                .map(|c| c.contains("intercept hook"))
-                .unwrap_or(false)
+            arc_hooks::GeminiCliAdapter::check_integration(dir).is_configured
         }),
         ("windsurf", |dir| {
-            let p = dir.join(".windsurf").join("hooks.json");
-            std::fs::read_to_string(p)
-                .map(|c| c.contains("intercept hook"))
-                .unwrap_or(false)
+            arc_hooks::WindsurfAdapter::check_integration(dir).is_configured
+        }),
+        ("cline", |dir| {
+            arc_hooks::ClineAdapter::check_integration(dir).is_configured
+        }),
+        ("kiro", |dir| {
+            arc_hooks::KiroAdapter::check_integration(dir).is_configured
+        }),
+        ("opencode", |dir| {
+            arc_hooks::OpenCodeAdapter::check_integration(dir).is_configured
         }),
     ];
 
@@ -321,22 +341,12 @@ pub fn run_setup(
     }
 
     // 2.5. If administrator supplied `--root-key` (or ARC_POLICY_TRUSTED_PUBLIC_KEYS),
-    //      bootstrap `.arc/policy-state.json` atomically when no trust store exists yet.
+    //      bootstrap `.arc/policy-state.json` atomically when no trust store exists yet
+    //      or upgrade a legacy v1 trust state file while preserving `min_sequence`.
     if let Some(rk) = root_key.map(str::trim).filter(|s| !s.is_empty()) {
-        let state_path = project_dir.join(".arc").join("policy-state.json");
-        if !state_path.exists() {
-            match arc_policy_engine::PolicyTrustStore::from_root_keys_str(rk, 0) {
-                Ok(store) => {
-                    if let Err(e) = store.save_atomic(&state_path) {
-                        eprintln!("[Arc Setup] Failed to persist trust root: {e}");
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[Arc Setup] Invalid --root-key specification: {e}");
-                    return false;
-                }
-            }
+        if let Err(e) = bootstrap_or_upgrade_trust_root(project_dir, rk) {
+            eprintln!("[Arc Setup] {e}");
+            return false;
         }
     }
 
@@ -605,5 +615,40 @@ mod tests {
             !out.contains("Run `arc setup`"),
             "arc setup output must not tell the user to run arc setup again"
         );
+    }
+
+    #[test]
+    fn bootstrap_or_upgrade_trust_root_upgrades_legacy_v1_and_preserves_v2() {
+        let tmp = std::env::temp_dir().join(format!("arc_v1_upgrade_{}", uuid::Uuid::now_v7()));
+        let arc_dir = tmp.join(".arc");
+        std::fs::create_dir_all(&arc_dir).unwrap();
+        let state_path = arc_dir.join("policy-state.json");
+
+        // 1. Legacy v1 file with min_sequence=5 is upgraded to v2 when --root-key is provided
+        std::fs::write(
+            &state_path,
+            r#"{"min_sequence":5,"synced_at":"2026-11-20T15:38:45Z","trusted_key":"old:aa"}"#,
+        )
+        .unwrap();
+
+        let key1 = format!("org-k1:{}", "11".repeat(32));
+        let upgraded = bootstrap_or_upgrade_trust_root(&tmp, &key1).unwrap();
+        assert!(upgraded);
+
+        let store = arc_policy_engine::PolicyTrustStore::load_verified(&state_path).unwrap();
+        assert_eq!(store.format_version, 2);
+        assert_eq!(store.min_sequence, 5);
+        assert!(store.active_keys.contains_key("org-k1"));
+
+        // 2. Existing v2 trust store is NOT overwritten by a subsequent call
+        let key2 = format!("org-k2:{}", "22".repeat(32));
+        let overwritten = bootstrap_or_upgrade_trust_root(&tmp, &key2).unwrap();
+        assert!(!overwritten);
+
+        let store_after = arc_policy_engine::PolicyTrustStore::load_verified(&state_path).unwrap();
+        assert!(store_after.active_keys.contains_key("org-k1"));
+        assert!(!store_after.active_keys.contains_key("org-k2"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

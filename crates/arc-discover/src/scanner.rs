@@ -143,6 +143,8 @@ pub fn get_workstation_roots() -> Vec<PathBuf> {
             roots.push(userprofile.join(".codex"));
             roots.push(userprofile.join(".gemini"));
             roots.push(userprofile.join(".cline"));
+            roots.push(userprofile.join(".kiro"));
+            roots.push(userprofile.join(".opencode"));
         }
     }
 
@@ -164,6 +166,7 @@ pub fn get_workstation_roots() -> Vec<PathBuf> {
                 roots.push(config.join("Cursor"));
                 roots.push(config.join("Code").join("User"));
                 roots.push(config.join("Windsurf"));
+                roots.push(config.join("opencode"));
             }
             roots.push(home.join(".cursor"));
             roots.push(home.join(".claude"));
@@ -172,6 +175,8 @@ pub fn get_workstation_roots() -> Vec<PathBuf> {
             roots.push(home.join(".codex"));
             roots.push(home.join(".gemini"));
             roots.push(home.join(".cline"));
+            roots.push(home.join(".kiro"));
+            roots.push(home.join(".opencode"));
         }
     }
 

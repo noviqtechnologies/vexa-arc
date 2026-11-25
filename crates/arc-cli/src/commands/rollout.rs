@@ -162,7 +162,11 @@ pub fn build_host_coverage_contracts(project_dir: &Path) -> Vec<HostCoverageCont
         },
         HostCoverageContract {
             integration: "gemini-cli".to_string(),
-            event_types: vec!["BeforeTool".to_string(), "AfterTool".to_string()],
+            event_types: vec![
+                "BeforeTool".to_string(),
+                "AfterTool".to_string(),
+                "BeforeAgent".to_string(),
+            ],
             interception_point: "pre_and_post_hook".to_string(),
             known_bypasses: vec![
                 "Direct terminal shell commands outside Gemini CLI".to_string(),
@@ -171,6 +175,85 @@ pub fn build_host_coverage_contracts(project_dir: &Path) -> Vec<HostCoverageCont
             required_config: ".gemini/settings.json (`arc init --host gemini-cli` or `arc host install --host gemini-cli`)"
                 .to_string(),
             coverage_status: if installed.iter().any(|h| h == "gemini-cli") {
+                active_status.to_string()
+            } else {
+                "unknown".to_string()
+            },
+        },
+        HostCoverageContract {
+            integration: "github-copilot".to_string(),
+            event_types: vec![
+                "preToolUse".to_string(),
+                "postToolUse".to_string(),
+                "userPromptSubmitted".to_string(),
+            ],
+            interception_point: "pre_and_post_hook".to_string(),
+            known_bypasses: vec![
+                "Inline editor ghost-text completions outside Copilot Agent Mode".to_string(),
+                "Direct terminal shell commands outside Copilot".to_string(),
+            ],
+            required_config: ".github/hooks/vexa-arc.json (`arc init --host github-copilot` or `arc host install --host github-copilot`)"
+                .to_string(),
+            coverage_status: if installed.iter().any(|h| h == "github-copilot") {
+                active_status.to_string()
+            } else {
+                "unknown".to_string()
+            },
+        },
+        HostCoverageContract {
+            integration: "cline".to_string(),
+            event_types: vec![
+                "PreToolUse".to_string(),
+                "PostToolUse".to_string(),
+                "UserPromptSubmit".to_string(),
+            ],
+            interception_point: "pre_and_post_hook".to_string(),
+            known_bypasses: vec![
+                "Direct editor writes outside Cline hooks".to_string(),
+                "Unwrapped MCP servers if Cline hooks are disabled".to_string(),
+            ],
+            required_config: ".clinerules/hooks/PreToolUse(.ps1) (`arc init --host cline` or `arc host install --host cline`)"
+                .to_string(),
+            coverage_status: if installed.iter().any(|h| h == "cline") {
+                active_status.to_string()
+            } else {
+                "unknown".to_string()
+            },
+        },
+        HostCoverageContract {
+            integration: "kiro".to_string(),
+            event_types: vec![
+                "PreToolUse".to_string(),
+                "PostToolUse".to_string(),
+                "UserPromptSubmit".to_string(),
+            ],
+            interception_point: "pre_and_post_hook".to_string(),
+            known_bypasses: vec![
+                "Direct editor writes outside Kiro hooks".to_string(),
+                "Unwrapped MCP servers if Kiro hooks are disabled".to_string(),
+            ],
+            required_config: ".kiro/hooks/vexa-arc.json (`arc init --host kiro` or `arc host install --host kiro`)"
+                .to_string(),
+            coverage_status: if installed.iter().any(|h| h == "kiro") {
+                active_status.to_string()
+            } else {
+                "unknown".to_string()
+            },
+        },
+        HostCoverageContract {
+            integration: "opencode".to_string(),
+            event_types: vec![
+                "tool.execute.before".to_string(),
+                "tool.execute.after".to_string(),
+            ],
+            interception_point: "pre_and_post_hook".to_string(),
+            known_bypasses: vec![
+                "Direct terminal shell commands outside OpenCode".to_string(),
+                "Unwrapped MCP servers if OpenCode plugin is disabled".to_string(),
+            ],
+            required_config: ".opencode/plugins/vexa-arc.js (`arc init --host opencode` or `arc host install --host opencode`)"
+                .to_string(),
+            coverage_status: if installed.iter().any(|h| h == "opencode") {
                 active_status.to_string()
             } else {
                 "unknown".to_string()

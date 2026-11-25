@@ -888,7 +888,7 @@ pub fn render_markdown_report(report: &CiReport) -> String {
         }
     }
 
-    md.push_str("\n💻 Catch issues earlier locally with `npx @vexasec/arc init` (Claude Code, Cursor, Codex CLI, Gemini CLI, Windsurf).\n");
+    md.push_str("\n💻 Catch issues earlier locally with `npx @vexasec/arc init` (Claude Code, Cursor, GitHub Copilot, Codex CLI, Gemini CLI, Windsurf, Cline, Kiro, OpenCode).\n");
     md
 }
 

@@ -99,7 +99,7 @@ To ensure clarity across security, DevOps, and AI development teams, the table b
 
 ### First-Run Onboarding (`arc init`, `arc auth`, & `arc allow`)
 
-Run `arc init` in your repository root to create `.arc/policy.json`, install hooks for detected hosts (`claude-code`, `cursor`, `codex-cli`, `gemini-cli`, `windsurf`, or `--host all`), auto-register `arc mcp-server` in `.cursor/mcp.json` / `.mcp.json`, install Secure-at-Inception directives (`.cursor/rules/vexa-arc-security.mdc` / `CLAUDE.md` / `.windsurfrules`), and run an immediate deterministic AI asset + secret discovery scan. Discovery respects `.gitignore` and optional `.arcignore` rules across Windows, macOS, and Linux while still checking high-signal local files (`.env*`, IDE MCP configs, and agent rules) even when gitignored; repeated `arc init` runs exclude Vexa Arc's own self-managed entries from the baseline `AI Assets` summary and render `N+ finding(s)` if a large monorepo reaches the 5,000-file quick-scan cap (run `arc audit` for an unbounded full scan):
+Run `arc init` in your repository root to create `.arc/policy.json`, install hooks for detected hosts (`claude-code`, `cursor`, `github-copilot`, `codex-cli`, `gemini-cli`, `windsurf`, `cline`, `kiro`, `opencode`, or `--host all`), auto-register `arc mcp-server` in `.cursor/mcp.json` / `.mcp.json`, install Secure-at-Inception directives (`.cursor/rules/vexa-arc-security.mdc` / `CLAUDE.md` / `.windsurfrules`), and run an immediate deterministic AI asset + secret discovery scan. Discovery respects `.gitignore` and optional `.arcignore` rules across Windows, macOS, and Linux while still checking high-signal local files (`.env*`, IDE MCP configs, and agent rules) even when gitignored; repeated `arc init` runs exclude Vexa Arc's own self-managed entries from the baseline `AI Assets` summary and render `N+ finding(s)` if a large monorepo reaches the 5,000-file quick-scan cap (run `arc audit` for an unbounded full scan):
 
 ```bash
 # Standard enforcement (with IDE confirmation prompts for Lethal Trifecta)
@@ -128,7 +128,7 @@ arc mcp rollout --stage enforce
 Run one command (`arc setup`) to authenticate via OAuth 2.0 Device Flow in your browser (issuing a revocable per-workstation token), install IDE hooks, sync your organization's signed policy, and register your workstation in **Endpoint Posture**:
 
 * **Multi-environment support (zero hardcoded URLs):** Pass `--api-url https://<env-api>/v1` once for `dev`, `test`, `pre-prod`, or self-hosted deployments. The URL is persisted in `~/.vexa/credentials.json` (`%USERPROFILE%\.vexa\credentials.json` on Windows) so all future IDE hooks and background syncs automatically target that environment.
-* **Dynamic posture & zero-secret telemetry:** `arc setup` dynamically detects installed IDE adapters (`claude-code`, `cursor`, `codex-cli`, `gemini-cli`, `windsurf`) and policy health (`healthy` / `unconfigured` / `degraded`), while cloud telemetry redacts any detected secrets before egress and never panics when invoked from async transports.
+* **Dynamic posture & zero-secret telemetry:** `arc setup` dynamically detects installed IDE adapters (`claude-code`, `cursor`, `github-copilot`, `codex-cli`, `gemini-cli`, `windsurf`, `cline`, `kiro`, `opencode`) and policy health (`healthy` / `unconfigured` / `degraded`), while cloud telemetry redacts any detected secrets before egress and never panics when invoked from async transports.
 * **Tamper-resistant session state:** Persisted session DAGs are authenticated with a per-workstation HMAC-SHA256 key (`~/.arc/session.key`, mode `0600` on Unix, or `ARC_SESSION_HMAC_KEY` in CI) and fail closed if the integrity tag is missing or altered.
 * **MCP Tool-Description Poisoning & Cross-Tool Shadowing Quarantine (`ARC-MCP-POISON-001`):** Before pinning or forwarding any MCP `tools/list` schema (including `--allow-tofu`), `arc-dlp` inspects every tool `description` and recursive `inputSchema` field for hidden LLM instructions (`<IMPORTANT>`, `<SYSTEM>`, secrecy directives), credential-exfiltration prompts (`.ssh/id_rsa`, `.aws/credentials`, `.env`), cross-tool shadowing, and invisible Unicode tag/Bidi smuggling — quarantining poisoned servers before the LLM sees them.
 * **Anti-Malware & Compound Shell Package Shield:** `arc shield` and `ARC-PKG-001` query live npm, PyPI, crates.io, and Go module proxy (`proxy.golang.org`) metadata with zero fabricated provenance/star/download scores, check real npm Sigstore (`dist.attestations`) and PyPI PEP 740 provenance, immediately block OpenSSF Malicious Packages (`MAL-*`) via `CompoundMalwareGate` even for previously established names, and parse compound shell chains (`&&`, `||`, `;`, `|`, `sh -c`/`bash -c`/`cmd /c`, `ENV=val`, `npx`, `bun`, `bunx`, `poetry`, `pipx`, `uvx`).
@@ -148,7 +148,7 @@ arc ci-report --sca --upload
 
 ### Local Stdio MCP Server (`arc mcp-server`)
 
-For agents without native hook integrations (e.g. Cline, VS Code Copilot) — or alongside native hooks in Claude Code, Cursor, Codex CLI, Gemini CLI, and Windsurf — register `arc mcp-server` as a stdio MCP server in your client config to expose `scan_secrets`, `check_package`, `sca_audit`, and `audit_ai_assets`:
+For any MCP-capable agent without a native hook adapter — or alongside native hooks in Claude Code, Cursor, GitHub Copilot, Codex CLI, Gemini CLI, Windsurf, Cline, AWS Kiro, and OpenCode — register `arc mcp-server` as a stdio MCP server in your client config to expose `scan_secrets`, `check_package`, `sca_audit`, and `audit_ai_assets`:
 
 ```json
 {
@@ -169,7 +169,7 @@ Run `arc ci-report` locally or in CI to generate a consolidated Markdown + JSON 
 arc ci-report --sca --policy-test --fail-on high --fail-on-unpinned-mcp --markdown-out arc-pr-report.md --json-out arc-pr-report.json
 ```
 
-For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.8.1`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
+For GitHub Actions, use the root `action.yml` (`noviqtechnologies/vexa-arc@v1.9.0`) with `pull-requests: write` permission to automatically post and update a single deduplicated PR summary comment across `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
 
 ### Remote Streamable HTTP / SSE MCP Proxy (`arc protect http`)
 
@@ -907,21 +907,26 @@ arc sca fix --open-pr --base main --run-tests
 
 ## 4. Host Agent & IDE Integration (FR-MCP-005)
 
-Vexa Arc provides native host adapter integrations for **Claude Code** and **Cursor IDE** with automated installation, health verification, and bypass detection.
+Vexa Arc provides native cross-platform host adapter integrations for **9 AI coding agents**: **Claude Code**, **Cursor**, **GitHub Copilot** (VS Code Agent Mode & Copilot CLI), **Codex CLI**, **Gemini CLI**, **Windsurf**, **Cline**, **AWS Kiro**, and **OpenCode** — with automated installation, health verification, and bypass detection.
 
 ### Automated Host Installation
 
-Instead of editing JSON configuration files manually, Arc automates installation and configuration via `arc host`:
+Instead of editing configuration files manually, Arc automates installation and configuration via `arc host`:
 
 ```bash
-# 1. Install Arc protection into Claude Code:
+# Install Arc protection into any supported host:
 arc host install --host claude-code
-
-# 2. Install Arc protection into Cursor IDE:
 arc host install --host cursor
+arc host install --host github-copilot
+arc host install --host codex-cli
+arc host install --host gemini-cli
+arc host install --host windsurf
+arc host install --host cline
+arc host install --host kiro
+arc host install --host opencode
 
-# 3. Target a specific workspace root:
-arc host install --host claude-code --workspace /path/to/project
+# Target a specific workspace root:
+arc host install --host github-copilot --workspace /path/to/project
 ```
 
 #### Hardened Host Onboarding Guarantees
@@ -1047,15 +1052,20 @@ arc host uninstall --host cursor
 
 > [!TIP]
 > **Native Stdin Intercept Hook (`arc intercept hook`):**
-> Claude Code, Cursor, Codex CLI, Gemini CLI, and Windsurf communicate directly with `arc intercept hook --host <claude-code|cursor|codex-cli|gemini-cli|windsurf>` over standard I/O using their native hook schemas. Any execution error or malformed payload exits with code `2`, safely failing closed to prevent unauthorized actions.
+> All 9 native host adapters (`claude-code`, `cursor`, `github-copilot`, `codex-cli`, `gemini-cli`, `windsurf`, `cline`, `kiro`, `opencode`) communicate directly with `arc intercept hook --host <name>` over standard I/O using their native hook schemas. Any execution error or malformed payload fails closed to prevent unauthorized actions.
 
-### Editors Without Native Hook APIs (Cline, VS Code Copilot)
+### Cross-Platform Hook Configs for Additional Native Hosts
 
-Some AI coding environments (e.g. Cline, VS Code Copilot) do not currently provide documented pre-execution hook APIs for intercepting internal editor commands, file reads, or shell tasks before they execute.
+- **GitHub Copilot (`.github/hooks/vexa-arc.json`):** Installs both `bash` (Linux/macOS) and `powershell` (Windows) entries for `preToolUse`, `postToolUse`, and `userPromptSubmitted`, returning `permissionDecision` (`allow`, `deny`, `ask`). Inline completions (`Ctrl+I` / ghost text) outside Agent Mode are not mediated.
+- **Cline (`.clinerules/hooks/`):** Installs Arc-managed POSIX scripts (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, mode `0755` on Unix) and Windows PowerShell scripts (`*.ps1`), returning `{"cancel": true|false, "errorMessage": "..."}`. Refuses to overwrite non-Arc user hook scripts.
+- **AWS Kiro (`.kiro/hooks/vexa-arc.json`):** Installs `version: "v1"` entries for `PreToolUse`, `PostToolUse`, and `UserPromptSubmit`, blocking policy violations with exit code `2` and stderr feedback.
+- **OpenCode (`.opencode/plugins/vexa-arc.js`):** Installs a zero-dependency ESM plugin using `node:child_process` `spawnSync` (no shell invocation) for `tool.execute.before` and `tool.execute.after`.
 
-In these environments:
-- **MCP Brokering (`arc protect stdio`) & Schema Pinning (`arc mcp inspect-schema`):** An explicitly launched stdio server can be wrapped via `arc protect stdio --server <NAME> -- <COMMAND>`. To bootstrap a verified JCS SHA-256 schema pin for a `SignedOrganization` policy without executing any tools, run `arc mcp inspect-schema --server <NAME> -- <COMMAND>`. Outside managed policy, supply `--pin-schema <HASH>`. `--allow-tofu` is development/bootstrap only and is rejected when signed organization policy is active.
-- **Direct Editor Terminal / File Writes:** Cursor's installed hooks mediate selected shell, MCP, and read events, but there is no configured pre-file-write event (`bypass_risk: true`); direct editor writes bypass ARC-AST-001 and file-write DLP. Writes through scripts/processes also exceed the scanner's mediated `FileWrite` path. Cline and VS Code Copilot have no native adapters here; only MCP traffic explicitly wrapped by `arc protect stdio` is mediated.
+### Editors Without Native Hook APIs & Out-of-Boundary Surfaces
+
+For any custom MCP client or editor without a native hook API:
+- **MCP Brokering (`arc protect stdio` / `arc protect http`) & Schema Pinning (`arc mcp inspect-schema`):** Wrap any stdio or remote HTTP/SSE MCP server directly. To bootstrap a verified JCS SHA-256 schema pin for a `SignedOrganization` policy without executing any tools, run `arc mcp inspect-schema --server <NAME> -- <COMMAND>`. Outside managed policy, supply `--pin-schema <HASH>`. `--allow-tofu` is development/bootstrap only and is rejected when signed organization policy is active.
+- **Direct Editor Terminal / File Writes:** Cursor's installed hooks mediate selected shell, MCP, and read events, but there is no configured pre-file-write event (`bypass_risk: true`); direct editor writes outside agent hooks bypass `ARC-AST-001` and file-write DLP.
 
 ### Generic Model Context Protocol (MCP) JSON-RPC
 

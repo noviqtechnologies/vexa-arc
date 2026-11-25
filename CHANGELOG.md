@@ -2,6 +2,22 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.9.0] - 2026-11-25
+
+### 9 Native Host Adapters (GitHub Copilot, Cline, AWS Kiro, OpenCode) & Cross-OS Hardening
+- **New Native Host Hook Adapters (`arc-hooks`, `arc-core`, `arc-cli`):**
+  - **GitHub Copilot (`github-copilot`):** Installs cross-platform `.github/hooks/vexa-arc.json` (`version: 1`) with both POSIX `bash` and Windows `powershell` entries for `preToolUse`, `postToolUse`, and `userPromptSubmitted`, supporting JSON-string or object `toolArgs` and `permissionDecision` (`allow`/`deny`/`ask`).
+  - **Cline (`cline`):** Installs Arc-managed POSIX (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, mode `0755` on Unix) and Windows PowerShell (`*.ps1`) wrappers in `.clinerules/hooks/`, refusing to clobber non-Arc user scripts and encoding Cline's `{"cancel": true|false, "errorMessage": "..."}` protocol.
+  - **AWS Kiro (`kiro`):** Installs `.kiro/hooks/vexa-arc.json` (`version: "v1"`) preserving foreign hooks with `.arc.bak` backup and exit-code-2 blocking for `PreToolUse`, `PostToolUse`, and `UserPromptSubmit`.
+  - **OpenCode (`opencode`):** Installs zero-dependency ESM plugin `.opencode/plugins/vexa-arc.js` using `node:child_process` `spawnSync` (no shell invocation) for `tool.execute.before` and `tool.execute.after`.
+- **Hardened Existing Adapters & Injection-Safe Path Quoting:**
+  - Added `validate_binary_path_safe`, `quote_posix_shell`, and `quote_powershell` in `host_config.rs` to prevent shell/script metacharacter injection across Windows, macOS, and Linux.
+  - Added prompt-submission decoding (`UserPromptSubmit` / `BeforeAgent` / `pre_user_prompt`) and fail-closed malformed/DLP tests to `codex-cli`, `gemini-cli`, and `windsurf`.
+- **Unified CLI, Telemetry, Discovery & Verification Harness:**
+  - Wired all 9 native adapters into `arc init`, `arc host install|status|uninstall`, `arc intercept hook`, `arc mcp rollout`, `arc setup` (`detect_installed_host_adapters`), `arc-discover` (`.kiro`, `.opencode`), and `scripts/verify-live-hosts.{ps1,sh}`.
+  - Added legacy v1 `policy-state.json` trust-store upgrade detection (`PolicyTrustStore::detect_legacy_v1_file`).
+  - Synced `COMPATIBILITY_MATRIX.md`, `README.md`, and `docs/user-guide.md`.
+
 ## [1.8.1] - 2026-11-25
 
 ### SAST/Secret Remediation, Separated CI Security Gates & Action Input Hardening

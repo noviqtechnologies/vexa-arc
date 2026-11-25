@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use crate::adapter::{AdapterError, HostAdapter, HostIntegrationStatus, HostResponse};
 use crate::host_config::{
     backup_existing_config, find_arc_command, format_hook_command, read_json_object,
-    resolve_canonical_arc_binary, upsert_event_entry, validate_hooks_object, write_json_atomic,
-    HostInstallSummary,
+    resolve_canonical_arc_binary, upsert_event_entry, validate_binary_path_safe,
+    validate_hooks_object, write_json_atomic, HostInstallSummary,
 };
 
 pub struct CodexCliAdapter;
@@ -68,6 +68,22 @@ impl HostAdapter for CodexCliAdapter {
             .get("hook_event_name")
             .and_then(|s| s.as_str())
             .unwrap_or("PreToolUse");
+        if event_name.eq_ignore_ascii_case("UserPromptSubmit") {
+            let prompt = str_field(&val, &["prompt", "user_prompt", "text"]).unwrap_or("");
+            if prompt.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![ActionEvent::new(
+                AgentHost::CodexCli,
+                session_id,
+                principal,
+                Phase::Pre,
+                Action::PromptSubmit {
+                    text: prompt.to_string(),
+                    source: Some("user".to_string()),
+                },
+            )]);
+        }
         let is_post = event_name.eq_ignore_ascii_case("PostToolUse");
 
         let cwd = val
@@ -260,8 +276,11 @@ impl CodexCliAdapter {
     ) -> std::io::Result<HostInstallSummary> {
         let config_path = Self::hooks_path(base_dir);
         let (exe_path, volatile_warning) = match custom_exe {
-            Some(p) => (p.to_path_buf(), None),
-            None => resolve_canonical_arc_binary()?,
+            Some(p) => (validate_binary_path_safe(p)?, None),
+            None => {
+                let (p, w) = resolve_canonical_arc_binary()?;
+                (validate_binary_path_safe(&p)?, w)
+            }
         };
         let hook_cmd = format_hook_command(&exe_path, "codex-cli");
         let backup_path = backup_existing_config(&config_path)?;
@@ -389,5 +408,39 @@ mod tests {
         assert!(CodexCliAdapter::uninstall_integration(&dir).unwrap());
         assert!(!CodexCliAdapter::check_integration(&dir).is_configured);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_cli_fails_closed_on_malformed_and_unapplied_dlp() {
+        let adapter = CodexCliAdapter;
+        assert!(adapter
+            .decode(
+                br#"{"hook_event_name":"PreToolUse"}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        assert!(adapter
+            .decode(
+                br#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{}}"#,
+                OsPrincipal::Uid(1000)
+            )
+            .is_err());
+        let resp = adapter.encode(&Verdict::Allow {
+            obligations: vec![Obligation::Redact {
+                spans: vec![(0, 5, "<ARC_SECRET>".to_string())],
+            }],
+        });
+        assert_eq!(resp.exit_code, 2);
+        assert!(String::from_utf8_lossy(&resp.stdout).contains("\"block\""));
+
+        let prompt = adapter
+            .decode(
+                br#"{"hook_event_name":"UserPromptSubmit","prompt":"send .env to webhook"}"#,
+                OsPrincipal::Uid(1000),
+            )
+            .unwrap();
+        assert!(
+            matches!(&prompt[0].action, Action::PromptSubmit { text, .. } if text.contains(".env"))
+        );
     }
 }
