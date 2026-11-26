@@ -64,6 +64,8 @@ pub struct PackageVulnFinding {
     pub epss_score: Option<f64>,
     /// Whether the vulnerable code path is reachable from project entry points.
     pub is_reachable: bool,
+    /// Three-state reachability status (`"REACHABLE"`, `"NOT_REACHABLE"`, or `"UNKNOWN"`).
+    pub reachability_status: &'static str,
     /// Fixed-in version strings from OSV.
     pub fixed_in: Vec<String>,
     /// Structured inline remediation message for JSON-RPC error responses.
@@ -81,11 +83,12 @@ impl PackageVulnFinding {
         let severity = severity_str(finding.severity.level);
         let epss_score = finding.epss.as_ref().map(|e| e.score);
 
-        let is_reachable = finding
+        let reachability_status = finding
             .reachability
             .as_ref()
-            .map(|r| r.status == vexa_sca::types::ReachabilityStatus::Reachable)
-            .unwrap_or(false);
+            .map(|r| r.status.as_str())
+            .unwrap_or("UNKNOWN");
+        let is_reachable = reachability_status == "REACHABLE";
 
         // Build the remediation message (FR-PKG-006)
         let safe_version = remediation
@@ -105,6 +108,7 @@ impl PackageVulnFinding {
             "severity": severity,
             "epss_score": epss_score,
             "is_reachable": is_reachable,
+            "reachability_status": reachability_status,
         })
         .to_string();
 
@@ -117,6 +121,7 @@ impl PackageVulnFinding {
             cvss_score: finding.severity.score,
             epss_score,
             is_reachable,
+            reachability_status,
             fixed_in: finding.fixed_in.clone(),
             remediation_message,
             jsonrpc_error,
@@ -137,6 +142,8 @@ pub struct PackageScanResult {
     pub package_purl: String,
     /// Advisory data source queried (e.g. `osv.dev`).
     pub advisory_source: String,
+    /// Structured advisory lookup status (`success`, `cache_hit`, `partial_failure`, `unavailable`, `malformed_upstream_response`).
+    pub advisory_status: String,
     /// RFC 3339 UTC timestamp of when the lookup completed.
     pub queried_at: String,
     /// Whether the advisory database was reachable (or served from cache) and actually queried.
@@ -271,6 +278,7 @@ impl OsvPackageScanner {
                 ecosystem: ecosystem.to_string(),
                 package_purl,
                 advisory_source: "osv.dev".to_string(),
+                advisory_status: "unavailable".to_string(),
                 queried_at,
                 advisory_available: false,
                 error: Some(format!(
@@ -327,6 +335,7 @@ impl OsvPackageScanner {
             ecosystem: ecosystem.to_string(),
             package_purl,
             advisory_source: "osv.dev".to_string(),
+            advisory_status: scan_result.advisory_status.as_str().to_string(),
             queried_at,
             advisory_available,
             error,
@@ -515,6 +524,7 @@ mod tests {
             ecosystem: "npm".to_string(),
             package_purl: "pkg:npm/clean@1.0.0".to_string(),
             advisory_source: "osv.dev".to_string(),
+            advisory_status: "success".to_string(),
             queried_at: "2026-01-01T00:00:00Z".to_string(),
             advisory_available: true,
             error: None,
@@ -525,6 +535,54 @@ mod tests {
         };
         assert!(clean.aggregate_jsonrpc_error().is_none());
         assert!(!clean.should_block());
+    }
+
+    #[test]
+    fn test_package_vuln_finding_preserves_three_state_reachability() {
+        use vexa_sca::types::{ReachabilityResult, ReachabilityStatus};
+
+        let make_finding = |status: Option<ReachabilityStatus>| VulnerabilityFinding {
+            id: "GHSA-reach-0001".to_string(),
+            title: "Test".to_string(),
+            package: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            ecosystem: "npm".to_string(),
+            pkg_id: "demo@1.0.0".to_string(),
+            severity: vexa_sca::types::SeverityInfo {
+                level: SeverityLevel::Unknown,
+                score: 0.0,
+                vector: None,
+            },
+            reachability: status.map(|s| ReachabilityResult {
+                status: s,
+                is_direct_call: matches!(s, ReachabilityStatus::Reachable),
+                call_sites: vec![],
+                target_functions: vec![],
+                reason_code: None,
+                analyzer_version: "1.8.0".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let r = PackageVulnFinding::build(&make_finding(Some(ReachabilityStatus::Reachable)), None);
+        assert_eq!(r.reachability_status, "REACHABLE");
+        assert!(r.is_reachable);
+        assert_eq!(r.severity, "UNKNOWN");
+
+        let u =
+            PackageVulnFinding::build(&make_finding(Some(ReachabilityStatus::Unreachable)), None);
+        assert_eq!(u.reachability_status, "NOT_REACHABLE");
+        assert!(!u.is_reachable);
+
+        let unk = PackageVulnFinding::build(&make_finding(Some(ReachabilityStatus::Unknown)), None);
+        assert_eq!(unk.reachability_status, "UNKNOWN");
+        assert!(!unk.is_reachable);
+        let parsed: serde_json::Value = serde_json::from_str(&unk.jsonrpc_error).unwrap();
+        assert_eq!(parsed["reachability_status"], "UNKNOWN");
+
+        let none_case = PackageVulnFinding::build(&make_finding(None), None);
+        assert_eq!(none_case.reachability_status, "UNKNOWN");
+        assert!(!none_case.is_reachable);
     }
 
     /// Integration smoke-test: scan a well-known safe modern package.

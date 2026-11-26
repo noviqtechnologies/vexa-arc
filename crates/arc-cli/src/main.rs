@@ -1853,15 +1853,32 @@ fn run_sca_audit_cmd(
                 println!("═══════════════════════════════════════════════════════════════════════");
                 println!(" Project:       {}", res.project_dir);
                 println!(
-                    " Manifest:      {} ({})",
-                    res.manifest_file, res.manifest_type
+                    " Manifest:      {} ({}, tier: {})",
+                    res.manifest_file,
+                    res.manifest_type,
+                    if res.support_tier == "tier1_ga" {
+                        "Tier 1 GA"
+                    } else {
+                        "Tier 2 Preview"
+                    }
+                );
+                println!(
+                    " Scan Status:   {} (advisory: {}, packages: {})",
+                    res.scan_status, res.advisory_status, res.scanned_packages_count
                 );
                 println!(" Vulnerabilities: {}", res.total_vulnerabilities);
                 println!("   ├─ Critical: {}", res.critical_count);
                 println!("   ├─ High:     {}", res.high_count);
                 println!("   ├─ Medium:   {}", res.medium_count);
-                println!("   └─ Low:      {}", res.low_count);
-                println!(" Reachable:     {}", res.reachable_count);
+                println!("   ├─ Low:      {}", res.low_count);
+                println!("   └─ Unknown:  {}", res.unknown_severity_count);
+                println!(
+                    " Reachability:  {} reachable, {} not reachable, {} unknown",
+                    res.reachable_count, res.unreachable_count, res.unknown_reachability_count
+                );
+                if !res.limits_hit.is_empty() {
+                    println!(" Coverage Limits Hit: {}", res.limits_hit.join(", "));
+                }
                 if let Some(ref s) = res.sarif_path {
                     println!(" SARIF Report:  {s}");
                     if opts.sanitize_locations {
@@ -4319,6 +4336,7 @@ fn run_shield_check(
                 serde_json::json!({
                     "status": osv_status,
                     "advisory_source": r.advisory_source,
+                    "advisory_status": r.advisory_status,
                     "queried_at": r.queried_at,
                     "package_purl": r.package_purl,
                     "advisory_available": r.advisory_available,
@@ -4335,6 +4353,7 @@ fn run_shield_check(
                         "cvss_score": f.cvss_score,
                         "epss_score": f.epss_score,
                         "is_reachable": f.is_reachable,
+                        "reachability_status": f.reachability_status,
                         "fixed_in": f.fixed_in,
                         "remediation_message": f.remediation_message,
                     })).collect::<Vec<_>>(),
@@ -4525,7 +4544,11 @@ fn run_shield_check(
                     .epss_score
                     .map(|s| format!(", EPSS: {:.1}%", s * 100.0))
                     .unwrap_or_default();
-                let reach_str = if f.is_reachable { " [REACHABLE]" } else { "" };
+                let reach_str = match f.reachability_status {
+                    "REACHABLE" => " [REACHABLE]",
+                    "NOT_REACHABLE" => " [NOT_REACHABLE]",
+                    _ => " [REACHABILITY: UNKNOWN]",
+                };
                 println!(
                     "  🔴 {} – {} (CVSS: {:.1}{epss_str}){reach_str}",
                     f.advisory_id, f.severity, f.cvss_score

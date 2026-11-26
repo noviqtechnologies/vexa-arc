@@ -27,7 +27,8 @@ use uuid::Uuid;
 use vexa_sca::parsers::detector::ManifestType;
 use vexa_sca::patcher::{apply_fixes, PrCreator, PrResult};
 use vexa_sca::reporters::sarif::format_sarif_report;
-use vexa_sca::types::SeverityLevel;
+use vexa_sca::scanner::vuln_scanner::ScanResult;
+use vexa_sca::types::{ReachabilityStatus, ScanStatus, SeverityLevel};
 use vexa_sca::{scan_project, ScanOptions};
 
 // ---------------------------------------------------------------------------
@@ -108,22 +109,163 @@ pub struct ScaLicenseSummary {
     pub unknown: usize,
 }
 
+/// Maps a detected [`ManifestType`] to its declared Vexa SCA support tier.
+///
+/// - `tier1_ga`: Node.js npm (`package-lock.json`, `npm-shrinkwrap.json`) and pnpm (`pnpm-lock.yaml`).
+/// - `tier2_preview`: Yarn, Python, Cargo/Rust, Go, and Java Maven.
+pub fn manifest_support_tier(manifest_type: &ManifestType) -> &'static str {
+    match manifest_type {
+        ManifestType::NpmShrinkwrap | ManifestType::NpmPackageLock | ManifestType::PnpmLock => {
+            "tier1_ga"
+        }
+        ManifestType::YarnLock
+        | ManifestType::PythonRequirements
+        | ManifestType::RustCargoLock
+        | ManifestType::GoModSum
+        | ManifestType::JavaMavenPom => "tier2_preview",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScaAuditResult {
     pub project_dir: String,
     pub manifest_file: String,
     pub manifest_type: String,
+    #[serde(default)]
+    pub support_tier: String,
+    #[serde(default)]
+    pub scanned_packages_count: usize,
     pub total_vulnerabilities: usize,
     pub reachable_count: usize,
+    #[serde(default)]
+    pub unreachable_count: usize,
+    #[serde(default)]
+    pub unknown_reachability_count: usize,
     pub critical_count: usize,
     pub high_count: usize,
     pub medium_count: usize,
     pub low_count: usize,
+    #[serde(default)]
+    pub unknown_severity_count: usize,
+    #[serde(default)]
+    pub scan_status: String,
+    #[serde(default)]
+    pub advisory_status: String,
+    #[serde(default)]
+    pub limits_hit: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub licenses: Option<ScaLicenseSummary>,
     pub sarif_path: Option<String>,
     pub should_fail: bool,
     pub failure_reason: Option<String>,
+}
+
+/// Summarizes a `vexa_sca::ScanResult` without collapsing `UNKNOWN` severity into `low_count`
+/// or `UNKNOWN` reachability into `NOT_REACHABLE`, and enforces fail-closed semantics on
+/// `INCOMPLETE` scans unless `options.allow_unavailable` is true.
+pub(crate) fn summarize_scan_result(
+    project_dir: &Path,
+    manifest_file: &Path,
+    manifest_type: &ManifestType,
+    scan_result: &ScanResult,
+    licenses: Option<ScaLicenseSummary>,
+    sarif_path: Option<String>,
+    options: &ScaAuditOptions,
+) -> ScaAuditResult {
+    let mut critical_count = 0usize;
+    let mut high_count = 0usize;
+    let mut medium_count = 0usize;
+    let mut low_count = 0usize;
+    let mut unknown_severity_count = 0usize;
+    let mut reachable_count = 0usize;
+    let mut unreachable_count = 0usize;
+    let mut unknown_reachability_count = 0usize;
+
+    for vuln in &scan_result.vulnerabilities {
+        match vuln.severity.level {
+            SeverityLevel::Critical => critical_count += 1,
+            SeverityLevel::High => high_count += 1,
+            SeverityLevel::Medium => medium_count += 1,
+            SeverityLevel::Low => low_count += 1,
+            SeverityLevel::Unknown => unknown_severity_count += 1,
+        }
+        match vuln.reachability.as_ref().map(|r| r.status) {
+            Some(ReachabilityStatus::Reachable) => reachable_count += 1,
+            Some(ReachabilityStatus::Unreachable) => unreachable_count += 1,
+            Some(ReachabilityStatus::Unknown) | None => unknown_reachability_count += 1,
+        }
+    }
+
+    let total_vulnerabilities = scan_result.vulnerabilities.len();
+    let scan_status = scan_result.scan_status.as_str().to_string();
+    let advisory_status = scan_result.advisory_status.as_str().to_string();
+    let limits_hit = scan_result.completeness.limits_hit.clone();
+
+    // Check policy failure gate (--fail-on) and fail-closed INCOMPLETE semantics
+    let mut should_fail = false;
+    let mut failure_reasons: Vec<String> = Vec::new();
+
+    if !options.allow_unavailable
+        && (scan_result.scan_status == ScanStatus::Incomplete
+            || scan_result.advisory_status.has_unreliable_data())
+    {
+        should_fail = true;
+        let limits_detail = if limits_hit.is_empty() {
+            String::new()
+        } else {
+            format!("; limits_hit=[{}]", limits_hit.join(", "))
+        };
+        failure_reasons.push(format!(
+            "SCA scan incomplete (scan_status={scan_status}, advisory_status={advisory_status}{limits_detail}); pass --allow-unavailable to allow degraded coverage"
+        ));
+    }
+
+    if let Some(ref threshold) = options.fail_on {
+        let th_lower = threshold.to_lowercase();
+        let matched = match th_lower.as_str() {
+            "critical" => critical_count > 0,
+            "high" => critical_count > 0 || high_count > 0,
+            "medium" => critical_count > 0 || high_count > 0 || medium_count > 0,
+            "low" => total_vulnerabilities > 0,
+            _ => false,
+        };
+        if matched {
+            should_fail = true;
+            failure_reasons.push(format!(
+                "Vulnerability count meets or exceeds fail threshold '{threshold}'"
+            ));
+        }
+    }
+
+    let failure_reason = if failure_reasons.is_empty() {
+        None
+    } else {
+        Some(failure_reasons.join("; "))
+    };
+
+    ScaAuditResult {
+        project_dir: project_dir.display().to_string(),
+        manifest_file: manifest_file.display().to_string(),
+        manifest_type: format!("{manifest_type:?}"),
+        support_tier: manifest_support_tier(manifest_type).to_string(),
+        scanned_packages_count: scan_result.scanned_packages_count,
+        total_vulnerabilities,
+        reachable_count,
+        unreachable_count,
+        unknown_reachability_count,
+        critical_count,
+        high_count,
+        medium_count,
+        low_count,
+        unknown_severity_count,
+        scan_status,
+        advisory_status,
+        limits_hit,
+        licenses,
+        sarif_path,
+        should_fail,
+        failure_reason,
+    }
 }
 
 /// Runs a scoped SCA audit on the target project directory, produces structured
@@ -142,55 +284,6 @@ pub async fn run_sca_audit(
     let scan_out = scan_project(project_dir, scan_opts)
         .await
         .map_err(ScaRemediationError::ScanError)?;
-
-    let mut critical_count = 0;
-    let mut high_count = 0;
-    let mut medium_count = 0;
-    let mut low_count = 0;
-    let mut reachable_count = 0;
-
-    for vuln in &scan_out.scan_result.vulnerabilities {
-        match vuln.severity.level {
-            SeverityLevel::Critical => critical_count += 1,
-            SeverityLevel::High => high_count += 1,
-            SeverityLevel::Medium => medium_count += 1,
-            SeverityLevel::Low | SeverityLevel::Unknown => low_count += 1,
-        }
-        if vuln
-            .reachability
-            .as_ref()
-            .map(|r| r.status == vexa_sca::types::ReachabilityStatus::Reachable)
-            .unwrap_or(false)
-        {
-            reachable_count += 1;
-        }
-    }
-
-    let total_vulnerabilities = scan_out.scan_result.vulnerabilities.len();
-
-    // Check policy failure gate (--fail-on)
-    let (should_fail, failure_reason) = if let Some(ref threshold) = options.fail_on {
-        let th_lower = threshold.to_lowercase();
-        let matched = match th_lower.as_str() {
-            "critical" => critical_count > 0,
-            "high" => critical_count > 0 || high_count > 0,
-            "medium" => critical_count > 0 || high_count > 0 || medium_count > 0,
-            "low" => total_vulnerabilities > 0,
-            _ => false,
-        };
-        if matched {
-            (
-                true,
-                Some(format!(
-                    "Vulnerability count meets or exceeds fail threshold '{threshold}'"
-                )),
-            )
-        } else {
-            (false, None)
-        }
-    } else {
-        (false, None)
-    };
 
     // Generate SARIF report if requested
     let sarif_path = if let Some(ref path) = options.sarif_out {
@@ -226,21 +319,15 @@ pub async fn run_sca_audit(
             unknown: audit.summary.unknown,
         });
 
-    Ok(ScaAuditResult {
-        project_dir: project_dir.display().to_string(),
-        manifest_file: scan_out.manifest_file.display().to_string(),
-        manifest_type: format!("{:?}", scan_out.manifest_type),
-        total_vulnerabilities,
-        reachable_count,
-        critical_count,
-        high_count,
-        medium_count,
-        low_count,
+    Ok(summarize_scan_result(
+        project_dir,
+        &scan_out.manifest_file,
+        &scan_out.manifest_type,
+        &scan_out.scan_result,
         licenses,
         sarif_path,
-        should_fail,
-        failure_reason,
-    })
+        options,
+    ))
 }
 
 /// Sanitizes an OASIS SARIF v2.1.0 document:
@@ -1433,6 +1520,186 @@ mod tests {
         assert!(
             !candidate_dir.exists(),
             "Stale orphaned worktree must be safely deleted"
+        );
+    }
+
+    #[test]
+    fn test_manifest_support_tier_classification() {
+        assert_eq!(
+            manifest_support_tier(&ManifestType::NpmPackageLock),
+            "tier1_ga"
+        );
+        assert_eq!(
+            manifest_support_tier(&ManifestType::NpmShrinkwrap),
+            "tier1_ga"
+        );
+        assert_eq!(manifest_support_tier(&ManifestType::PnpmLock), "tier1_ga");
+        assert_eq!(
+            manifest_support_tier(&ManifestType::YarnLock),
+            "tier2_preview"
+        );
+        assert_eq!(
+            manifest_support_tier(&ManifestType::PythonRequirements),
+            "tier2_preview"
+        );
+        assert_eq!(
+            manifest_support_tier(&ManifestType::RustCargoLock),
+            "tier2_preview"
+        );
+        assert_eq!(
+            manifest_support_tier(&ManifestType::GoModSum),
+            "tier2_preview"
+        );
+        assert_eq!(
+            manifest_support_tier(&ManifestType::JavaMavenPom),
+            "tier2_preview"
+        );
+    }
+
+    #[test]
+    fn test_summarize_preserves_unknown_severity_and_three_state_reachability() {
+        use vexa_sca::types::{
+            AdvisoryStatus, ReachabilityResult, SeverityInfo, VulnerabilityFinding,
+        };
+
+        let mk = |id: &str, sev: SeverityLevel, reach: Option<ReachabilityStatus>| {
+            VulnerabilityFinding {
+                id: id.to_string(),
+                package: "pkg".to_string(),
+                version: "1.0.0".to_string(),
+                ecosystem: "npm".to_string(),
+                pkg_id: "pkg@1.0.0".to_string(),
+                severity: SeverityInfo {
+                    level: sev,
+                    score: 0.0,
+                    vector: None,
+                },
+                reachability: reach.map(|status| ReachabilityResult {
+                    status,
+                    is_direct_call: matches!(status, ReachabilityStatus::Reachable),
+                    call_sites: vec![],
+                    target_functions: vec![],
+                    reason_code: None,
+                    analyzer_version: "1.8.0".to_string(),
+                }),
+                ..Default::default()
+            }
+        };
+
+        let scan = ScanResult {
+            scanned_packages_count: 42,
+            vulnerabilities_count: 5,
+            vulnerabilities: vec![
+                mk(
+                    "GHSA-1",
+                    SeverityLevel::Critical,
+                    Some(ReachabilityStatus::Reachable),
+                ),
+                mk(
+                    "GHSA-2",
+                    SeverityLevel::High,
+                    Some(ReachabilityStatus::Unreachable),
+                ),
+                mk(
+                    "GHSA-3",
+                    SeverityLevel::Medium,
+                    Some(ReachabilityStatus::Unknown),
+                ),
+                mk("GHSA-4", SeverityLevel::Low, None),
+                mk("GHSA-5", SeverityLevel::Unknown, None),
+            ],
+            advisory_status: AdvisoryStatus::Success,
+            scan_status: ScanStatus::Pass,
+            ..Default::default()
+        };
+
+        let summary = summarize_scan_result(
+            Path::new("."),
+            Path::new("package-lock.json"),
+            &ManifestType::NpmPackageLock,
+            &scan,
+            None,
+            None,
+            &ScaAuditOptions::default(),
+        );
+
+        assert_eq!(summary.support_tier, "tier1_ga");
+        assert_eq!(summary.scanned_packages_count, 42);
+        assert_eq!(summary.total_vulnerabilities, 5);
+        assert_eq!(summary.critical_count, 1);
+        assert_eq!(summary.high_count, 1);
+        assert_eq!(summary.medium_count, 1);
+        assert_eq!(
+            summary.low_count, 1,
+            "SeverityLevel::Unknown must NOT be folded into low_count"
+        );
+        assert_eq!(summary.unknown_severity_count, 1);
+        assert_eq!(summary.reachable_count, 1);
+        assert_eq!(summary.unreachable_count, 1);
+        assert_eq!(summary.unknown_reachability_count, 3);
+        assert_eq!(summary.scan_status, "PASS");
+        assert_eq!(summary.advisory_status, "success");
+        assert!(!summary.should_fail);
+    }
+
+    #[test]
+    fn test_summarize_fails_closed_on_incomplete_scan_and_surfaces_limits() {
+        use vexa_sca::types::{AdvisoryStatus, CompletenessReport};
+
+        let scan = ScanResult {
+            scanned_packages_count: 10,
+            advisory_status: AdvisoryStatus::PartialFailure,
+            scan_status: ScanStatus::Incomplete,
+            completeness: CompletenessReport {
+                limits_hit: vec!["sast_depth_limit_exceeded: deep/dir".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let strict_opts = ScaAuditOptions {
+            allow_unavailable: false,
+            ..Default::default()
+        };
+        let strict = summarize_scan_result(
+            Path::new("."),
+            Path::new("Cargo.lock"),
+            &ManifestType::RustCargoLock,
+            &scan,
+            None,
+            None,
+            &strict_opts,
+        );
+        assert!(
+            strict.should_fail,
+            "INCOMPLETE scan must fail closed when allow_unavailable is false"
+        );
+        assert_eq!(strict.support_tier, "tier2_preview");
+        assert_eq!(strict.scan_status, "INCOMPLETE");
+        assert_eq!(strict.advisory_status, "partial_failure");
+        assert_eq!(strict.limits_hit.len(), 1);
+        assert!(strict
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("sast_depth_limit_exceeded"));
+
+        let permissive_opts = ScaAuditOptions {
+            allow_unavailable: true,
+            ..Default::default()
+        };
+        let permissive = summarize_scan_result(
+            Path::new("."),
+            Path::new("Cargo.lock"),
+            &ManifestType::RustCargoLock,
+            &scan,
+            None,
+            None,
+            &permissive_opts,
+        );
+        assert!(
+            !permissive.should_fail,
+            "allow_unavailable=true permits degraded scan without hard fail"
         );
     }
 }

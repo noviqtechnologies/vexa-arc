@@ -2,6 +2,23 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.9.2] - 2026-11-26
+
+### GA Verdict Integrity: 3-State Reachability, Explicit `UNKNOWN` Severity & SCA Completeness
+- **Preserved 3-State Reachability & Advisory Status (`arc-firewall`):**
+  - Added `reachability_status` (`"REACHABLE"`, `"NOT_REACHABLE"`, `"UNKNOWN"`) to `PackageVulnFinding` and its JSON-RPC remediation payload in `osv_scanner.rs`, preventing `UNKNOWN` reachability from being silently collapsed into `false`.
+  - Added structured `advisory_status` (`success`, `cache_hit`, `partial_failure`, `unavailable`, `malformed_upstream_response`) to `PackageScanResult`.
+- **Eliminated `UNKNOWN` Severity Folding & Added Fail-Closed Completeness (`arc-firewall`):**
+  - Added `unknown_severity_count` to `ScaAuditResult` in `remediation.rs` (stopped folding `SeverityLevel::Unknown` into `low_count`).
+  - Added 3-state reachability counts (`reachable_count`, `unreachable_count`, `unknown_reachability_count`), `scanned_packages_count`, `support_tier` (`tier1_ga` for npm/pnpm vs. `tier2_preview` for Yarn/Python/Cargo/Go/Maven), `scan_status`, `advisory_status`, and `limits_hit`.
+  - Enforced fail-closed behavior on `INCOMPLETE` or degraded advisory scans unless `--allow-unavailable` is explicitly passed.
+- **Real SCA Metrics & Completeness in CLI & CI Reports (`arc-cli`):**
+  - Replaced hardcoded zero placeholders in `build_vexa_facts_payload` (`ci_report.rs`) with real `scanned_packages_count`, 3-state reachability counts, `unknown_severity_vulnerabilities`, `support_tier`, `scan_status`, `advisory_status`, and `limits_hit`.
+  - Surfaced SCA audit errors, `INCOMPLETE` scans, and `limits_hit` in `advisory_warnings`, GitHub step summaries, `arc sca audit`, and `arc shield check` output.
+- **Tests & Documentation Sync:**
+  - Added unit tests for 3-state reachability, `unknown_severity_count`, fail-closed `INCOMPLETE` gating, support tier classification, and `VexaFactsPayload` accuracy.
+  - Updated `README.md`, `COMPATIBILITY_MATRIX.md`, and `docs/user-guide.md` with SCA support tiers, verdict integrity semantics, `--sanitize-locations` URI format (`sanitized/<hash>.source`), and the distinction between `arc-dlp` and `vexa-sca --secrets`.
+
 ## [1.9.1] - 2026-11-26
 
 ### WorkspaceAudit Precision Scanning, `vexa-sca` Supply-Chain Alignment & Resilient Cloud Sync

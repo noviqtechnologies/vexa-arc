@@ -124,6 +124,7 @@ pub fn generate_ci_report_with_options(
         }
     }
 
+    let mut sca_error: Option<String> = None;
     let sca = if run_sca {
         let opts = ScaAuditOptions {
             dev: true,
@@ -137,7 +138,13 @@ pub fn generate_ci_report_with_options(
             .enable_all()
             .build()
             .map_err(|e| format!("Failed to initialize async runtime: {e}"))?;
-        rt.block_on(run_sca_audit(path, &opts)).ok()
+        match rt.block_on(run_sca_audit(path, &opts)) {
+            Ok(res) => Some(res),
+            Err(e) => {
+                sca_error = Some(e.to_string());
+                None
+            }
+        }
     } else {
         None
     };
@@ -194,7 +201,22 @@ pub fn generate_ci_report_with_options(
             ));
         }
     }
+    if let Some(ref err) = sca_error {
+        advisory_warnings.push(format!("SCA audit could not complete: {err}"));
+    }
     if let Some(ref sca_res) = sca {
+        if sca_res.scan_status == "INCOMPLETE" {
+            advisory_warnings.push(format!(
+                "SCA scan completed with INCOMPLETE status (advisory_status={})",
+                sca_res.advisory_status
+            ));
+        }
+        if !sca_res.limits_hit.is_empty() {
+            advisory_warnings.push(format!(
+                "SCA completeness limits hit: {}",
+                sca_res.limits_hit.join(", ")
+            ));
+        }
         if sca_res.should_fail {
             failure_reasons.push(
                 sca_res
@@ -297,13 +319,45 @@ pub fn build_vexa_facts_payload(path: &Path, report: &CiReport) -> serde_json::V
         }));
     }
 
-    let (total_vulns, reachable_vulns, ecosystem) = match &report.sca {
+    let (
+        total_packages,
+        total_vulns,
+        reachable_vulns,
+        unreachable_vulns,
+        unknown_reachability_vulns,
+        unknown_severity_vulns,
+        ecosystem,
+        support_tier,
+        scan_status,
+        advisory_status,
+        limits_hit,
+    ) = match &report.sca {
         Some(sca) => (
+            sca.scanned_packages_count,
             sca.total_vulnerabilities,
             sca.reachable_count,
+            sca.unreachable_count,
+            sca.unknown_reachability_count,
+            sca.unknown_severity_count,
             sca.manifest_type.clone(),
+            sca.support_tier.clone(),
+            sca.scan_status.clone(),
+            sca.advisory_status.clone(),
+            sca.limits_hit.clone(),
         ),
-        None => (0, 0, "AI-Workspace".to_string()),
+        None => (
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            "AI-Workspace".to_string(),
+            String::new(),
+            "PASS".to_string(),
+            String::new(),
+            Vec::new(),
+        ),
     };
 
     let branch = std::env::var("GITHUB_HEAD_REF")
@@ -326,13 +380,18 @@ pub fn build_vexa_facts_payload(path: &Path, report: &CiReport) -> serde_json::V
         "project_name": project_name,
         "project_version": "1.0.0",
         "ecosystem": ecosystem,
-        "total_packages": 0,
+        "support_tier": support_tier,
+        "scan_status": scan_status,
+        "advisory_status": advisory_status,
+        "limits_hit": limits_hit,
+        "total_packages": total_packages,
         "direct_dependencies": 0,
         "transitive_dependencies": 0,
         "packages": [],
         "reachable_vulnerabilities": reachable_vulns,
-        "unreachable_vulnerabilities": 0,
-        "unknown_reachability_vulnerabilities": total_vulns.saturating_sub(reachable_vulns),
+        "unreachable_vulnerabilities": unreachable_vulns,
+        "unknown_reachability_vulnerabilities": unknown_reachability_vulns,
+        "unknown_severity_vulnerabilities": unknown_severity_vulns,
         "total_vulnerabilities": total_vulns,
         "findings": [],
         "code_findings": code_findings,
@@ -708,15 +767,31 @@ pub fn render_markdown_report(report: &CiReport) -> String {
     if let Some(ref sca) = report.sca {
         let sca_status = if sca.should_fail {
             "❌"
-        } else if sca_total > 0 {
+        } else if sca_total > 0 || sca.scan_status == "INCOMPLETE" || !sca.limits_hit.is_empty() {
             "⚠️"
         } else {
             "✅"
         };
-        let sca_total_cell = if sca_total > 0 && sca.reachable_count > 0 {
-            format!("{sca_total} issues ({} reachable)", sca.reachable_count)
-        } else {
+        let mut details = Vec::new();
+        if sca_total > 0 && sca.reachable_count > 0 {
+            details.push(format!("{} reachable", sca.reachable_count));
+        }
+        if sca.unknown_reachability_count > 0 {
+            details.push(format!(
+                "{} unknown reachability",
+                sca.unknown_reachability_count
+            ));
+        }
+        if sca.unknown_severity_count > 0 {
+            details.push(format!("{} unknown severity", sca.unknown_severity_count));
+        }
+        if sca.scan_status == "INCOMPLETE" {
+            details.push("INCOMPLETE".to_string());
+        }
+        let sca_total_cell = if details.is_empty() {
             format!("{sca_total} issues")
+        } else {
+            format!("{sca_total} issues ({})", details.join(", "))
         };
         md.push_str(&format!(
             "| {sca_status} | **Open Source Security (SCA)** | {sca_crit} | {sca_high} | {sca_med} | {sca_low} | {sca_total_cell} |\n"
@@ -1021,13 +1096,21 @@ mod tests {
         report.sca = Some(arc_firewall::remediation::ScaAuditResult {
             project_dir: ".".to_string(),
             manifest_file: "Cargo.lock".to_string(),
-            manifest_type: "CargoLock".to_string(),
+            manifest_type: "RustCargoLock".to_string(),
+            support_tier: "tier2_preview".to_string(),
+            scanned_packages_count: 12,
             total_vulnerabilities: 4,
             reachable_count: 1,
+            unreachable_count: 3,
+            unknown_reachability_count: 0,
             critical_count: 1,
             high_count: 1,
             medium_count: 1,
             low_count: 1,
+            unknown_severity_count: 0,
+            scan_status: "FAIL".to_string(),
+            advisory_status: "success".to_string(),
+            limits_hit: vec![],
             licenses: Some(arc_firewall::remediation::ScaLicenseSummary {
                 total: 5,
                 permissive: 3,
@@ -1046,6 +1129,25 @@ mod tests {
         ));
         assert!(full_md.contains("| ⚠️ | **Licenses** | 0 | 1 | 1 | 0 | 2 issues |"));
         assert!(full_md.contains("Total (6)"));
+
+        // Verify facts payload emits real SCA package, 3-state reachability, and completeness fields
+        report.sca.as_mut().unwrap().unknown_reachability_count = 2;
+        report.sca.as_mut().unwrap().unknown_severity_count = 1;
+        report.sca.as_mut().unwrap().limits_hit = vec!["sast_depth_limit_exceeded".to_string()];
+        let facts = build_vexa_facts_payload(&dir, &report);
+        assert_eq!(facts["total_packages"], 12);
+        assert_eq!(facts["reachable_vulnerabilities"], 1);
+        assert_eq!(facts["unreachable_vulnerabilities"], 3);
+        assert_eq!(facts["unknown_reachability_vulnerabilities"], 2);
+        assert_eq!(facts["unknown_severity_vulnerabilities"], 1);
+        assert_eq!(facts["support_tier"], "tier2_preview");
+        assert_eq!(facts["scan_status"], "FAIL");
+        assert_eq!(facts["advisory_status"], "success");
+        assert_eq!(facts["limits_hit"][0], "sast_depth_limit_exceeded");
+
+        let unknown_md = render_markdown_report(&report);
+        assert!(unknown_md.contains("2 unknown reachability"));
+        assert!(unknown_md.contains("1 unknown severity"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

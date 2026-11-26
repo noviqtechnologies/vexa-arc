@@ -393,7 +393,9 @@ arc sca audit
 arc sca audit --sarif audit.sarif --sanitize-locations --fail-on high
 ```
 
-- **Confidentiality Invariant (`--sanitize-locations`):** Eliminates internal source code snippets, suppresses physical line/column numbers, and pseudonymizes file paths into hashed URIs (`file:///arc-scrubbed-<sha256>`).
+- **Support Tiers:** **Tier 1 GA** for npm (`package-lock.json` v2/v3, `npm-shrinkwrap.json`) and pnpm (`pnpm-lock.yaml` v5/v6/v9); **Tier 2 Preview** for Yarn, Python (`uv.lock`, `poetry.lock`, `Pipfile.lock`, `requirements.txt`), Cargo (`Cargo.lock`), Go (`go.mod`/`go.sum`), and Java Maven (`pom.xml`, `gradle.lockfile`).
+- **Verdict Integrity & 3-State Reachability:** Preserves `unknown_severity_count` separately from `low_count`, reports 3-state reachability (`reachable_count`, `unreachable_count`, `unknown_reachability_count`), surfaces `scan_status`, `advisory_status`, `support_tier`, and `limits_hit`, and fails closed on `INCOMPLETE` scans unless `--allow-unavailable` is explicitly passed.
+- **Confidentiality Invariant (`--sanitize-locations`):** Eliminates internal source code snippets, suppresses physical line/column numbers, and pseudonymizes file paths into deterministic SHA-256 URIs (`sanitized/<hash>.source`).
 - **Policy Failure Gating (`--fail-on <severity>`):** Returns an exit code of 1 if any vulnerability meets or exceeds the specified threshold (`critical`, `high`, `medium`, `low`).
 
 #### Dry-Run Scratch Diff Proposal (`arc sca fix --dry-run`)

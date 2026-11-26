@@ -463,9 +463,10 @@ Vault Tokens Registered (1):
 ```
 
 > [!TIP]
-> **`arc scan-secrets` vs. `arc audit`:**
+> **`arc scan-secrets` vs. `arc audit` vs. `vexa-sca --secrets`:**
 > * Use `arc audit` for fast (`<= 1.2s` target) repository/workstation posture assessment across AI assets (MCP servers, Agent skills/rules, Model checkpoints), `vexa-sca` supply-chain signals, and **production** exposed credentials (`file:line`). `arc audit` automatically excludes `vendor/`/build/lockfiles, filters canonical doc placeholders (`AKIAIOSFODNN7EXAMPLE`, local `localhost` DB URIs, stub PEMs) and inline `arc:ignore` lines, and separates test/doc/`#[cfg(test)]` matches into informational `test_or_doc_secrets` so fixtures do not falsely inflate risk. If Vexa Cloud is temporarily unreachable, snapshots are retried once on transient errors and spooled locally for `arc telemetry flush`.
-> * Use `arc scan-secrets` when you need strict, fail-closed Runtime DLP inspection across raw streams or files (no placeholder or test-path filtering) or to pseudonymize streams with local vault tokens (`<ARC_VAULT_SECRET_XX>`).
+> * Use `arc scan-secrets` when you need strict, fail-closed Runtime DLP inspection (`arc-dlp`) across raw streams or files (no placeholder or test-path filtering) or to pseudonymize streams with local vault tokens (`<ARC_VAULT_SECRET_XX>`).
+> * Note: `vexa-sca --secrets` uses `vexa-sca`'s standalone `SecretScanner` (separate rule set and depth/size caps from `arc-dlp`), so detector IDs and counts should be reconciled per engine rather than merged blindly.
 
 ---
 
@@ -854,6 +855,8 @@ arc sca audit --sarif audit.sarif --sanitize-locations
 arc sca audit --fail-on high
 ```
 
+* **Support Tiers & Completeness Transparency:** Reports `support_tier` (`tier1_ga` for npm/pnpm lockfiles; `tier2_preview` for Yarn, Python, Cargo, Go, and Maven), `scan_status` (`PASS` / `FAIL` / `INCOMPLETE`), `advisory_status`, and `limits_hit`. Incomplete or degraded advisory scans fail closed unless `--allow-unavailable` is explicitly passed.
+* **Accurate Severity & 3-State Reachability:** Preserves `unknown_severity_count` separately from `low_count` and reports 3-state reachability (`reachable_count`, `unreachable_count`, `unknown_reachability_count`) without collapsing `UNKNOWN` into safe/not-reachable.
 * **Confidentiality & Location Sanitization (`--sanitize-locations`):** Eliminates internal file paths, suppresses physical line/column numbers, strips vulnerable code snippets (`region.snippet`), and pseudonymizes physical URIs into deterministic SHA-256 hashes (`sanitized/<hash>.source`).
 * **Policy Failure Gating (`--fail-on <severity>`):** Gates CI/CD and terminal workflows by exiting with status code 1 if the highest detected vulnerability meets or exceeds the threshold (`critical`, `high`, `medium`, `low`).
 
