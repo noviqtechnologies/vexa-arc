@@ -155,37 +155,56 @@ pub fn run_auth_status(api_url: Option<&str>, json: bool) -> bool {
             let status_url = format!("{}/auth/status", base_url.trim_end_matches('/'));
             rt.block_on(async {
                 if let Ok(client) = reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(5))
                     .timeout(Duration::from_secs(10))
                     .build()
                 {
-                    if let Ok(resp) = client
-                        .get(&status_url)
-                        .header("Authorization", format!("Bearer {tok}"))
-                        .send()
-                        .await
-                    {
-                        if resp.status().is_success() {
-                            if let Ok(info) = resp.json::<serde_json::Value>().await {
-                                let is_auth = info
-                                    .get("authenticated")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(true);
-                                if is_auth {
-                                    cloud_verified = true;
-                                    if let Some(o) = info.get("org_slug").and_then(|v| v.as_str()) {
-                                        org_slug = Some(o.to_string());
-                                    }
-                                    if let Some(e) = info.get("user_email").and_then(|v| v.as_str())
+                    for attempt in 1..=2 {
+                        match client
+                            .get(&status_url)
+                            .header("Authorization", format!("Bearer {tok}"))
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status().is_success() => {
+                                if let Ok(info) = resp.json::<serde_json::Value>().await {
+                                    let is_auth = info
+                                        .get("authenticated")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(true);
+                                    if is_auth {
+                                        cloud_verified = true;
+                                        if let Some(o) =
+                                            info.get("org_slug").and_then(|v| v.as_str())
+                                        {
+                                            org_slug = Some(o.to_string());
+                                        }
+                                        if let Some(e) =
+                                            info.get("user_email").and_then(|v| v.as_str())
+                                        {
+                                            user_email = Some(e.to_string());
+                                        }
+                                        if let Some(t) = info.get("tier").and_then(|v| v.as_str()) {
+                                            tier = Some(t.to_string());
+                                        }
+                                    } else if let Some(t) =
+                                        info.get("tier").and_then(|v| v.as_str())
                                     {
-                                        user_email = Some(e.to_string());
-                                    }
-                                    if let Some(t) = info.get("tier").and_then(|v| v.as_str()) {
                                         tier = Some(t.to_string());
                                     }
-                                } else if let Some(t) = info.get("tier").and_then(|v| v.as_str()) {
-                                    tier = Some(t.to_string());
                                 }
+                                break;
                             }
+                            Ok(resp)
+                                if attempt < 2
+                                    && matches!(resp.status().as_u16(), 429 | 502 | 503 | 504) =>
+                            {
+                                tokio::time::sleep(Duration::from_millis(600)).await;
+                            }
+                            Err(_) if attempt < 2 => {
+                                tokio::time::sleep(Duration::from_millis(600)).await;
+                            }
+                            _ => break,
                         }
                     }
                 }

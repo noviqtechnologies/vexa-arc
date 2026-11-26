@@ -227,6 +227,8 @@ mod tests {
             agent_skills: vec![],
             model_assets: vec![],
             exposed_secrets: vec![],
+            test_or_doc_secrets: vec![],
+            supply_chain_signals: vec![],
             overall_risk_band: arc_core::mcp_profile::RiskBand::Low,
             total_assets: 1,
             scanned_locations: vec![PathBuf::from("c:/project")],

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const DEFAULT_VEXA_API_BASE_URL: &str = "https://api.vexasec.io/sca/v1";
+pub const DEFAULT_VEXA_API_BASE_URL: &str = "https://app.vexasec.io/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredVexaCredentials {
@@ -795,6 +795,168 @@ pub fn emit_cloud_heartbeat(hb: &CloudArcHeartbeat, api_base_url: Option<&str>) 
     .unwrap_or(false)
 }
 
+/// Formats a `reqwest::Error` with its full `std::error::Error::source()` chain so users
+/// see actionable network diagnostics (e.g., DNS failure, connect timeout, TLS reset)
+/// instead of the generic `error sending request for url (...)`.
+pub fn format_reqwest_error_chain(err: &reqwest::Error) -> String {
+    use std::error::Error;
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(s) = source {
+        let msg = s.to_string();
+        if !parts.iter().any(|p| p == &msg) {
+            parts.push(msg);
+        }
+        source = s.source();
+    }
+    parts.join(": ")
+}
+
+/// Returns `true` for transient transport errors (TCP connect reset, TLS EOF, timeout,
+/// or temporary DNS `WSATRY_AGAIN` / `EAI_AGAIN`) while failing fast on permanent DNS
+/// resolution failures (`NXDOMAIN` / `WSAHOST_NOT_FOUND`) so offline workstations never stall.
+fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    let full = format_reqwest_error_chain(err).to_ascii_lowercase();
+    let is_temporary_dns = full.contains("os error 11002")
+        || full.contains("temporary")
+        || full.contains("try again")
+        || full.contains("eai_again");
+    let is_permanent_dns = !is_temporary_dns
+        && (full.contains("dns error")
+            || full.contains("failed to lookup address")
+            || full.contains("no such host")
+            || full.contains("name or service not known")
+            || full.contains("nodename nor servname")
+            || full.contains("os error 11001"));
+    if is_permanent_dns {
+        return false;
+    }
+    is_temporary_dns || err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 502 | 503 | 504)
+}
+
+pub fn cloud_inventory_spool_path() -> PathBuf {
+    crate::default_spool_dir().join("arc_inventory_queue.jsonl")
+}
+
+/// Persists a failed AI-BOM inventory snapshot locally (deduplicated by `(source_type, source_name)`,
+/// capped to 10 snapshots) so `arc telemetry flush` can deliver it on the next online run.
+pub fn spool_arc_inventory(payload: &serde_json::Value) -> Result<(), String> {
+    let path = cloud_inventory_spool_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create inventory spool dir: {e}"))?;
+    }
+    if path.exists() {
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err("Inventory spool path is a symlink; refusing to write".to_string());
+            }
+        }
+    }
+
+    let new_key = (
+        payload
+            .get("source_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        payload
+            .get("source_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    );
+
+    let mut existing: Vec<serde_json::Value> = fs::read_to_string(&path)
+        .ok()
+        .map(|content| {
+            content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| {
+                    let st = v.get("source_type").and_then(|x| x.as_str()).unwrap_or("");
+                    let sn = v.get("source_name").and_then(|x| x.as_str()).unwrap_or("");
+                    (st, sn) != (new_key.0.as_str(), new_key.1.as_str())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    existing.push(payload.clone());
+    if existing.len() > 10 {
+        let start = existing.len() - 10;
+        existing = existing.split_off(start);
+    }
+
+    let mut serialized = String::new();
+    for item in &existing {
+        let line = serde_json::to_string(item)
+            .map_err(|e| format!("Failed to serialize inventory snapshot: {e}"))?;
+        serialized.push_str(&line);
+        serialized.push('\n');
+    }
+
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp_path, serialized)
+        .map_err(|e| format!("Failed to write temp inventory spool: {e}"))?;
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to commit inventory spool: {e}")
+    })
+}
+
+/// Drains queued AI-BOM inventory snapshots from `arc_inventory_queue.jsonl` to Vexa Cloud.
+/// Returns the number of snapshots successfully uploaded.
+pub fn flush_arc_inventory_spool(api_base_url: Option<&str>) -> usize {
+    if VexaCloudAuth::is_offline() || VexaCloudAuth::get_token().is_none() {
+        return 0;
+    }
+    let path = cloud_inventory_spool_path();
+    if !path.exists() {
+        return 0;
+    }
+    let Ok(content) = fs::read_to_string(&path) else {
+        return 0;
+    };
+    let items: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
+    if items.is_empty() {
+        let _ = fs::remove_file(&path);
+        return 0;
+    }
+
+    let mut uploaded = 0usize;
+    let mut remaining = Vec::new();
+    for item in items {
+        match upload_arc_inventory(&item, api_base_url) {
+            Ok(_) => uploaded += 1,
+            Err(_) => remaining.push(item),
+        }
+    }
+
+    if remaining.is_empty() {
+        let _ = fs::remove_file(&path);
+    } else {
+        let mut out = String::new();
+        for item in &remaining {
+            if let Ok(line) = serde_json::to_string(item) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        let _ = fs::write(&path, out);
+    }
+    uploaded
+}
+
 pub fn upload_arc_inventory(
     payload: &serde_json::Value,
     api_base_url: Option<&str>,
@@ -812,29 +974,48 @@ pub fn upload_arc_inventory(
 
     run_blocking_future(async move {
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-        let mut req = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token.trim()));
-        if let Some(org) = org_slug {
-            req = req.header("X-Vexa-Org", org);
+
+        const MAX_ATTEMPTS: usize = 2;
+        let mut last_err = String::new();
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut req = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token.trim()));
+            if let Some(ref org) = org_slug {
+                req = req.header("X-Vexa-Org", org);
+            }
+            match req.json(&payload_owned).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        return serde_json::from_str(&text)
+                            .map_err(|e| format!("Invalid JSON response from Vexa Cloud: {e}"));
+                    }
+                    last_err = format!("Vexa Cloud inventory upload rejected ({status}): {text}");
+                    if attempt < MAX_ATTEMPTS && is_retryable_status(status) {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+                Err(e) => {
+                    let detail = format_reqwest_error_chain(&e);
+                    last_err = format!("Failed to upload Arc inventory to {url}: {detail}");
+                    if attempt < MAX_ATTEMPTS && is_retryable_reqwest_error(&e) {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            }
         }
-        let resp = req
-            .json(&payload_owned)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to upload Arc inventory to {url}: {e}"))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(format!(
-                "Vexa Cloud inventory upload rejected ({status}): {text}"
-            ));
-        }
-        serde_json::from_str(&text)
-            .map_err(|e| format!("Invalid JSON response from Vexa Cloud: {e}"))
+        Err(last_err)
     })?
 }
 
@@ -851,26 +1032,48 @@ pub fn fetch_signed_policy_bundle(api_base_url: Option<&str>) -> Result<serde_js
 
     run_blocking_future(async move {
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-        let mut req = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token.trim()));
-        if let Some(org) = org_slug {
-            req = req.header("X-Vexa-Org", org);
+
+        const MAX_ATTEMPTS: usize = 2;
+        let mut last_err = String::new();
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut req = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token.trim()));
+            if let Some(ref org) = org_slug {
+                req = req.header("X-Vexa-Org", org);
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        return serde_json::from_str(&text)
+                            .map_err(|e| format!("Invalid JSON response from Vexa Cloud: {e}"));
+                    }
+                    last_err = format!("Policy sync failed ({status}): {text}");
+                    if attempt < MAX_ATTEMPTS && is_retryable_status(status) {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+                Err(e) => {
+                    let detail = format_reqwest_error_chain(&e);
+                    last_err = format!("Failed to fetch signed policy from {url}: {detail}");
+                    if attempt < MAX_ATTEMPTS && is_retryable_reqwest_error(&e) {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            }
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch signed policy from {url}: {e}"))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(format!("Policy sync failed ({status}): {text}"));
-        }
-        serde_json::from_str(&text)
-            .map_err(|e| format!("Invalid JSON response from Vexa Cloud: {e}"))
+        Err(last_err)
     })?
 }
 
@@ -1335,5 +1538,96 @@ mod multi_env_device_tests {
     async fn run_blocking_future_does_not_panic_inside_active_tokio_runtime() {
         let res = run_blocking_future(async { 42usize }).unwrap();
         assert_eq!(res, 42);
+    }
+
+    #[test]
+    fn inventory_upload_retries_503_and_spool_drains_on_flush() {
+        let _guard = crate::cloud::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(DEFAULT_VEXA_API_BASE_URL, "https://app.vexasec.io/v1");
+
+        let tmp_dir = std::env::temp_dir().join(format!("arc_inv_retry_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cred_file = tmp_dir.join("credentials.json");
+        std::env::set_var("ARC_TELEMETRY_DIR", &tmp_dir);
+        std::env::set_var("VEXA_CREDENTIALS_PATH", &cred_file);
+        std::env::remove_var("ARC_OFFLINE");
+        std::env::remove_var("VEXA_FIREWALL_OFFLINE");
+
+        VexaCloudAuth::save_credentials("vexa_pat_retry_test_1234", Some("acme"), None).unwrap();
+
+        // Server returns 503 on first attempt, then 200 OK on retry
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (mut s1, _) = listener.accept().unwrap();
+            let _ = s1.read(&mut buf);
+            let _ = s1.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            drop(s1);
+
+            let (mut s2, _) = listener.accept().unwrap();
+            let _ = s2.read(&mut buf);
+            let body = r#"{"snapshot_id":"snap-retry-ok"}"#;
+            let _ = s2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            );
+        });
+
+        let api_base = format!("http://{addr}/v1");
+        let payload = serde_json::json!({
+            "source_type": "repo",
+            "source_name": "demo-repo",
+            "exposed_secrets_count": 0
+        });
+        let resp = upload_arc_inventory(&payload, Some(&api_base))
+            .expect("upload_arc_inventory must succeed on 503 retry");
+        assert_eq!(resp["snapshot_id"], "snap-retry-ok");
+        srv.join().unwrap();
+
+        // Spool deduplication + flush verification
+        spool_arc_inventory(&payload).unwrap();
+        spool_arc_inventory(&payload).unwrap();
+        let spooled_lines = fs::read_to_string(cloud_inventory_spool_path())
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(
+            spooled_lines, 1,
+            "inventory spool must deduplicate by source"
+        );
+
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a2 = l2.local_addr().unwrap();
+        let srv2 = std::thread::spawn(move || {
+            let (mut s, _) = l2.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let body = r#"{"snapshot_id":"snap-flushed"}"#;
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            );
+        });
+        let flushed = flush_arc_inventory_spool(Some(&format!("http://{a2}/v1")));
+        srv2.join().unwrap();
+        assert_eq!(flushed, 1);
+        assert!(!cloud_inventory_spool_path().exists());
+
+        std::env::remove_var("ARC_TELEMETRY_DIR");
+        std::env::remove_var("VEXA_CREDENTIALS_PATH");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

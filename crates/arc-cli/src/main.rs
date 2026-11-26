@@ -2146,11 +2146,12 @@ fn run_telemetry(action: TelemetryAction) -> bool {
         },
         TelemetryAction::Flush { api_url, quiet } => {
             let flushed = arc_telemetry::flush_arc_event_spool(api_url.as_deref());
+            let flushed_inv = arc_telemetry::flush_arc_inventory_spool(api_url.as_deref());
             let hb = commands::setup::build_workstation_heartbeat(Path::new("."));
             let hb_ok = arc_telemetry::emit_cloud_heartbeat(&hb, api_url.as_deref());
             if !quiet {
                 println!(
-                    "[Arc Telemetry] Flushed {flushed} event(s); heartbeat={hb_ok} (policy seq #{})",
+                    "[Arc Telemetry] Flushed {flushed} event(s), {flushed_inv} inventory snapshot(s); heartbeat={hb_ok} (policy seq #{})",
                     hb.active_policy_seq
                 );
             }
@@ -3613,11 +3614,22 @@ fn maybe_sync_audit_to_cloud(
     let payload =
         commands::ci_report::build_arc_inventory_payload_from_audit(path, report, workstation, 0);
     Some(
-        arc_telemetry::upload_arc_inventory(&payload, api_url).map(|resp| {
-            resp.get("snapshot_id")
+        match arc_telemetry::upload_arc_inventory(&payload, api_url) {
+            Ok(resp) => Ok(resp
+                .get("snapshot_id")
                 .and_then(|s| s.as_str())
-                .map(str::to_string)
-        }),
+                .map(str::to_string)),
+            Err(err) => {
+                let queued = arc_telemetry::spool_arc_inventory(&payload).is_ok();
+                if queued {
+                    Err(format!(
+                        "{err} (snapshot queued locally; run `arc telemetry flush` when online)"
+                    ))
+                } else {
+                    Err(err)
+                }
+            }
+        },
     )
 }
 
@@ -3825,8 +3837,13 @@ fn run_audit(
     println!("             VEXA ARC ZERO-TOUCH AUDIT REPORT           ");
     println!("=======================================================");
     println!("Scanned Target:     {}", report.scanned_path.display());
+    let duration_note = if report.scan_duration_ms <= 1200 {
+        "<= 1200 ms latency target"
+    } else {
+        "exceeded 1200 ms latency target"
+    };
     println!(
-        "Scan Duration:      {} ms (< 1200 ms latency target)",
+        "Scan Duration:      {} ms ({duration_note})",
         report.scan_duration_ms
     );
     println!("Total AI Assets:    {}", report.total_assets);
@@ -3842,7 +3859,7 @@ fn run_audit(
     } else {
         for s in &report.mcp_servers {
             println!(
-                "  • {:<16} [transport: {:<8} risk: {:<8} score: {:<4}] (from: {})",
+                "  • {:<16} [transport: {:<8} risk: {:<8} score: {:>4}/1000] (from: {})",
                 s.name,
                 s.transport,
                 format!("{:?}", s.profile.band).to_lowercase(),
@@ -3892,12 +3909,38 @@ fn run_audit(
         println!("  (No exposed production credentials detected)");
     } else {
         for sec in &report.exposed_secrets {
+            let loc = match sec.line {
+                Some(l) => format!("{}:{}", sec.file_path.display(), l),
+                None => sec.file_path.display().to_string(),
+            };
+            println!("  • [{}] in {}: {}", sec.detector, loc, sec.snippet);
+        }
+    }
+    if !report.test_or_doc_secrets.is_empty() {
+        println!(
+            "  ℹ Informational: {} secret-like match(es) in test/doc/example files (excluded from risk band; use --json to inspect)",
+            report.test_or_doc_secrets.len()
+        );
+    }
+
+    if !report.supply_chain_signals.is_empty() {
+        println!(
+            "\n[5] Supply Chain & AI Integrity Signals via vexa-sca ({}):",
+            report.supply_chain_signals.len()
+        );
+        for sig in report.supply_chain_signals.iter().take(25) {
+            let loc = match (&sig.file_path, sig.line) {
+                (Some(f), Some(l)) => format!(" ({f}:{l})"),
+                (Some(f), None) => format!(" ({f})"),
+                _ => String::new(),
+            };
             println!(
-                "  • [{}] in {}: {}",
-                sec.detector,
-                sec.file_path.display(),
-                sec.snippet
+                "  • [{}] [{}] {}{}",
+                sig.rule_id, sig.severity, sig.message, loc
             );
+        }
+        if report.supply_chain_signals.len() > 25 {
+            println!("  ... and {} more", report.supply_chain_signals.len() - 25);
         }
     }
     println!("=======================================================");

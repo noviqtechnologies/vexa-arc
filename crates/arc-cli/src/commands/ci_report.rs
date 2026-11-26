@@ -1,12 +1,11 @@
 use crate::commands::rollout::{evaluate_policy_tests, PolicyTestSummary};
 use arc_discover::scanner::DiscoveryScanner;
-use arc_dlp::detector::SecretScanEngine;
 use arc_dlp::sanitizer::sanitize_inbound_text;
 use arc_firewall::remediation::{run_sca_audit, ScaAuditOptions, ScaAuditResult};
 use arc_hooks::broker::load_mcp_pin_from_lockfile;
 use arc_telemetry::VexaCloudAuth;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +18,8 @@ pub struct SecretSummary {
     pub file_path: String,
     pub detector: String,
     pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,61 +39,6 @@ pub struct CiReport {
     pub failure_reasons: Vec<String>,
     #[serde(skip_serializing)]
     pub audit_report: Option<Box<arc_discover::scanner::AuditReport>>,
-}
-
-fn collect_repo_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 10 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if matches!(
-            name,
-            ".git" | "target" | "node_modules" | ".venv" | "venv" | ".sca-cache"
-        ) {
-            continue;
-        }
-        if path.is_dir() {
-            collect_repo_files(&path, depth + 1, out);
-        } else if path.is_file() {
-            let lower = name.to_ascii_lowercase();
-            let is_generated_report = matches!(
-                lower.as_str(),
-                "sbom-cyclonedx.json"
-                    | "sca-report.html"
-                    | "sca-report.json"
-                    | "sca-report.sarif"
-                    | "ai-bom.json"
-                    | "vexa-ai-bom.json"
-            );
-            if !is_generated_report {
-                out.push(path);
-            }
-        }
-    }
-}
-
-fn is_agent_instruction_file(path: &Path) -> bool {
-    let lower = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "claude.md"
-            | ".cursorrules"
-            | ".windsurfrules"
-            | "copilot-instructions.md"
-            | "agent.md"
-            | "agents.md"
-            | "skill.md"
-    ) || lower.ends_with(".mdc")
-        || lower.ends_with(".prompt.md")
 }
 
 #[cfg(test)]
@@ -142,39 +88,38 @@ pub fn generate_ci_report_with_options(
         }
     }
 
-    let mut files = Vec::new();
-    collect_repo_files(path, 0, &mut files);
+    // Reuse DiscoveryScanner's WorkspaceAudit secret findings as the single source of truth
+    // so `arc audit` and `arc ci-report` always agree and respect .gitignore/.arcignore/vendor exclusions.
+    let secrets: Vec<SecretSummary> = audit
+        .exposed_secrets
+        .iter()
+        .map(|f| {
+            let rel = f
+                .file_path
+                .strip_prefix(path)
+                .unwrap_or(&f.file_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            SecretSummary {
+                file_path: rel,
+                detector: f.detector.clone(),
+                snippet: f.snippet.clone(),
+                line: f.line,
+            }
+        })
+        .collect();
 
-    let secret_engine = SecretScanEngine::new();
-    let mut secrets = Vec::new();
     let mut unicode_anomalies = Vec::new();
-
-    for file in &files {
-        let Ok(bytes) = std::fs::read(file) else {
-            continue;
-        };
-        if bytes.len() > 2 * 1024 * 1024 {
-            continue;
-        }
-        let rel = file
-            .strip_prefix(path)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        for f in secret_engine.scan(&bytes) {
-            secrets.push(SecretSummary {
-                file_path: rel.clone(),
-                detector: f.detector.to_string(),
-                snippet: f.snippet,
-            });
-        }
-
-        if is_agent_instruction_file(file) {
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                if sanitize_inbound_text(text) != text {
-                    unicode_anomalies.push(UnicodeAnomaly { file_path: rel });
-                }
+    for skill in &audit.agent_skills {
+        if let Ok(text) = std::fs::read_to_string(&skill.file_path) {
+            if sanitize_inbound_text(&text) != text {
+                let rel = skill
+                    .file_path
+                    .strip_prefix(path)
+                    .unwrap_or(&skill.file_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                unicode_anomalies.push(UnicodeAnomaly { file_path: rel });
             }
         }
     }
@@ -317,7 +262,7 @@ pub fn build_vexa_facts_payload(path: &Path, report: &CiReport) -> serde_json::V
             "title": format!("Exposed credential detected ({})", s.detector),
             "cwe": "CWE-798",
             "file_path": s.file_path,
-            "line": 1,
+            "line": s.line.unwrap_or(1),
             "matched_sink": masked_sink,
             "remediation": "Revoke this credential immediately and load secrets from environment variables or a secret manager."
         }));
@@ -982,7 +927,7 @@ mod tests {
         assert!(clean.unicode_anomalies.is_empty());
         assert!(clean.advisory_warnings.is_empty());
 
-        let fake_aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let fake_aws = concat!("AKIA", "9X8W7V6U5T4S3R2Q");
         std::fs::write(dir.join(".env"), format!("AWS_KEY={fake_aws}\n")).unwrap();
         std::fs::write(
             dir.join(".cursorrules"),

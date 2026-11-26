@@ -3193,10 +3193,12 @@ fn test_v14_unified_secret_scanning_and_audit_json_bom() {
         "sk-proj-{}",
         "aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5zA7bC9dE1fG3"
     );
+    let fake_aws_id = format!("{}9X8W7V6U5T4S3R2Q", "AKIA");
+    let fake_aws_secret = format!("{}{}", "wJalrXUtnFEMI/K7MDENG/bPxRfiCY", "9K8M7P6Q5R");
     fs::write(
         temp_dir.join(".env"),
         format!(
-            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\nOPENAI_API_KEY={fake_oai}\n"
+            "AWS_ACCESS_KEY_ID={fake_aws_id}\nAWS_SECRET_ACCESS_KEY={fake_aws_secret}\nOPENAI_API_KEY={fake_oai}\n"
         ),
     )
     .unwrap();
@@ -3754,7 +3756,7 @@ fn test_v16_audit_and_setup_cloud_inventory_sync() {
     )
     .unwrap();
     fs::write(root_dir.join("CLAUDE.md"), "# Team Rules\n").unwrap();
-    let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
+    let fake_aws = format!("{}9X8W7V6U5T4S3R2Q", "AKIA");
     fs::write(root_dir.join(".env"), format!("AWS_KEY={fake_aws}\n")).unwrap();
     fs::write(
         root_dir

@@ -2,6 +2,21 @@
 
 All notable changes to **Vexa Arc** are documented in this file.
 
+## [1.9.1] - 2026-11-26
+
+### WorkspaceAudit Precision Scanning, `vexa-sca` Supply-Chain Alignment & Resilient Cloud Sync
+- **Two-Tier `WorkspaceAudit` Secret Scanning & `vexa-sca` Supply-Chain Integration (`arc-discover`, `arc-cli`):**
+  - Kept `arc-dlp::SecretScanEngine` strict and fail-closed for runtime interception (`arc intercept`, `arc protect`, `arc scan-secrets`) while upgrading workspace discovery (`arc audit`, `arc ci-report`) to hard-exclude third-party/generated directories (`vendor/`, `third_party/`, `dist/`, `build/`, `.next/`, `.terraform/`) and lockfiles (`Cargo.lock`, `package-lock.json`, `go.sum`, `*.lock`), preserving gitignored `.env*` and IDE MCP configs.
+  - Added value-level filtering for canonical doc placeholders (`AKIAIOSFODNN7EXAMPLE`, `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`), local/template DB URIs, stub PEMs, low-entropy dummy tokens, comment/regex lines, and inline suppressions (`arc:ignore`, `vexa:ignore`, `gitleaks:allow`, `nosec`).
+  - Classified real-looking matches inside `tests/`, `benches/`, `fixtures/`, `docs/`, `*.example`, and Rust `#[cfg(test)]` blocks into informational `test_or_doc_secrets` (`SecretScope::TestOrDoc`, cross-OS via `Path::components()`) with 1-based `file:line` reporting and per-line deduplication, so test fixtures do not falsely inflate `Overall Risk Band`.
+  - Delegated targeted MCP, GitHub Actions, and AI instruction file supply-chain checks to `vexa_sca::supply_chain::local_analyzer::LocalSupplyChainAnalyzer` (`supply_chain_signals`), unified `arc ci-report` onto `DiscoveryScanner` as the single source of truth, and refined `arc audit` CLI output (`file:line`, `score/1000`, accurate latency-target indicator).
+- **Resilient Cloud AI-BOM Upload, Error Diagnostics & Local Inventory Spooling (`arc-telemetry`, `arc-cli`):**
+  - Updated `DEFAULT_VEXA_API_BASE_URL` to `https://app.vexasec.io/v1`.
+  - Added `connect_timeout(5s)` and bounded retry (1 retry after 600ms) on transient connect/timeout, HTTP `429`/`502`/`503`/`504`, and temporary DNS failures (`os error 11002` / `WSATRY_AGAIN` / `EAI_AGAIN`) while failing fast on permanent DNS errors (`NXDOMAIN`) and `4xx`.
+  - Added full `std::error::Error::source()` chain formatting (`format_reqwest_error_chain`) and atomic, symlink-safe local inventory spooling (`arc_inventory_queue.jsonl`, deduplicated by source, capped to 10 snapshots) drained automatically by `arc telemetry flush`.
+- **Tests & Documentation Sync:**
+  - Added unit tests for `WorkspaceAudit` filtering/classification, 503 retry + inventory spool draining, and updated `README.md`, `docs/user-guide.md`, and `docs/developer-guide.md`.
+
 ## [1.9.0] - 2026-11-25
 
 ### 9 Native Host Adapters (GitHub Copilot, Cline, AWS Kiro, OpenCode) & Cross-OS Hardening

@@ -464,8 +464,8 @@ Vault Tokens Registered (1):
 
 > [!TIP]
 > **`arc scan-secrets` vs. `arc audit`:**
-> * Use `arc audit` for fast (< 1.2s) high-level posture assessment across all AI assets (MCP servers, Agent skills/rules, Model checkpoints) and common configuration secret files.
-> * Use `arc scan-secrets` when you need dedicated, exhaustive DLP inspection across every file in a directory tree or to pseudonymize streams with local vault tokens (`<ARC_VAULT_SECRET_XX>`).
+> * Use `arc audit` for fast (`<= 1.2s` target) repository/workstation posture assessment across AI assets (MCP servers, Agent skills/rules, Model checkpoints), `vexa-sca` supply-chain signals, and **production** exposed credentials (`file:line`). `arc audit` automatically excludes `vendor/`/build/lockfiles, filters canonical doc placeholders (`AKIAIOSFODNN7EXAMPLE`, local `localhost` DB URIs, stub PEMs) and inline `arc:ignore` lines, and separates test/doc/`#[cfg(test)]` matches into informational `test_or_doc_secrets` so fixtures do not falsely inflate risk. If Vexa Cloud is temporarily unreachable, snapshots are retried once on transient errors and spooled locally for `arc telemetry flush`.
+> * Use `arc scan-secrets` when you need strict, fail-closed Runtime DLP inspection across raw streams or files (no placeholder or test-path filtering) or to pseudonymize streams with local vault tokens (`<ARC_VAULT_SECRET_XX>`).
 
 ---
 

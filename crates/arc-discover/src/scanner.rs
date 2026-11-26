@@ -38,11 +38,34 @@ pub struct DiscoveredModelAsset {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretScope {
+    Production,
+    TestOrDoc,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExposedSecretFinding {
     pub file_path: PathBuf,
     pub detector: String,
     pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<SecretScope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupplyChainSignal {
+    pub rule_id: String,
+    pub signal_name: String,
+    pub severity: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +76,10 @@ pub struct AuditReport {
     pub agent_skills: Vec<DiscoveredAgentSkill>,
     pub model_assets: Vec<DiscoveredModelAsset>,
     pub exposed_secrets: Vec<ExposedSecretFinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_or_doc_secrets: Vec<ExposedSecretFinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supply_chain_signals: Vec<SupplyChainSignal>,
     pub overall_risk_band: RiskBand,
     pub total_assets: usize,
     #[serde(default)]
@@ -231,6 +258,7 @@ impl DiscoveryScanner {
         let mut agent_skills = Vec::new();
         let mut model_assets = Vec::new();
         let mut exposed_secrets = Vec::new();
+        let mut test_or_doc_secrets = Vec::new();
         let mut scanned_locations = Vec::new();
         let mut unscanned_locations = Vec::new();
         let mut excluded_paths = Vec::new();
@@ -254,16 +282,31 @@ impl DiscoveryScanner {
             &mut agent_skills,
             &mut model_assets,
             &mut exposed_secrets,
+            &mut test_or_doc_secrets,
         );
         if inspect_timed_out {
             budget.truncated = true;
         }
+
+        // Delegate targeted AI/MCP/workflow supply-chain checks to vexa-sca's LocalSupplyChainAnalyzer
+        let mut supply_chain_signals = if !budget.truncated {
+            collect_vexa_sca_supply_chain_signals(root)
+        } else {
+            Vec::new()
+        };
+        supply_chain_signals.sort_by(|a, b| {
+            a.rule_id
+                .cmp(&b.rule_id)
+                .then(a.file_path.cmp(&b.file_path))
+                .then(a.line.cmp(&b.line))
+        });
 
         sort_report_vectors(
             &mut mcp_servers,
             &mut agent_skills,
             &mut model_assets,
             &mut exposed_secrets,
+            &mut test_or_doc_secrets,
             &mut scanned_locations,
             &mut unscanned_locations,
             &mut excluded_paths,
@@ -272,7 +315,7 @@ impl DiscoveryScanner {
 
         let elapsed = start.elapsed().as_millis() as u64;
 
-        // Determine overall risk band: highest band among MCP servers or High if secrets found
+        // Determine overall risk band: highest band among MCP servers or High if actionable production secrets found
         let mut highest_band = RiskBand::Low;
         for s in &mcp_servers {
             if s.profile.band > highest_band {
@@ -292,6 +335,8 @@ impl DiscoveryScanner {
             agent_skills,
             model_assets,
             exposed_secrets,
+            test_or_doc_secrets,
+            supply_chain_signals,
             overall_risk_band: highest_band,
             total_assets,
             scanned_locations,
@@ -312,6 +357,7 @@ impl DiscoveryScanner {
         let mut agent_skills = Vec::new();
         let mut model_assets = Vec::new();
         let mut exposed_secrets = Vec::new();
+        let mut test_or_doc_secrets = Vec::new();
         let mut scanned_locations = Vec::new();
         let mut not_installed_locations = Vec::new();
         let mut unscanned_locations = Vec::new();
@@ -362,6 +408,7 @@ impl DiscoveryScanner {
             &mut agent_skills,
             &mut model_assets,
             &mut exposed_secrets,
+            &mut test_or_doc_secrets,
         );
         if inspect_timed_out {
             any_truncated = true;
@@ -372,6 +419,7 @@ impl DiscoveryScanner {
             &mut agent_skills,
             &mut model_assets,
             &mut exposed_secrets,
+            &mut test_or_doc_secrets,
             &mut scanned_locations,
             &mut unscanned_locations,
             &mut excluded_paths,
@@ -397,6 +445,8 @@ impl DiscoveryScanner {
             agent_skills,
             model_assets,
             exposed_secrets,
+            test_or_doc_secrets,
+            supply_chain_signals: Vec::new(),
             overall_risk_band: highest_band,
             total_assets,
             scanned_locations,
@@ -457,6 +507,7 @@ impl DiscoveryScanner {
                     if name == ".git"
                         || name.eq_ignore_ascii_case(".sca-cache")
                         || is_ephemeral_cache_dir(name)
+                        || is_vendored_or_generated_dir(name)
                         || vexa_core::fs_guard::is_os_heavy_dir(name)
                     {
                         if let Ok(mut ex) = excluded_for_filter.lock() {
@@ -523,6 +574,7 @@ impl DiscoveryScanner {
 
     /// Inspects collected candidate files across available CPU cores using scoped threads.
     /// Returns `true` if a bounded `deadline` was exceeded before all files were inspected.
+    #[allow(clippy::too_many_arguments)]
     fn inspect_files_parallel(
         &self,
         files: &[PathBuf],
@@ -531,6 +583,7 @@ impl DiscoveryScanner {
         agent_skills: &mut Vec<DiscoveredAgentSkill>,
         model_assets: &mut Vec<DiscoveredModelAsset>,
         exposed_secrets: &mut Vec<ExposedSecretFinding>,
+        test_or_doc_secrets: &mut Vec<ExposedSecretFinding>,
     ) -> bool {
         if files.is_empty() {
             return false;
@@ -557,6 +610,7 @@ impl DiscoveryScanner {
                     agent_skills,
                     model_assets,
                     exposed_secrets,
+                    test_or_doc_secrets,
                 );
             }
             return false;
@@ -574,6 +628,7 @@ impl DiscoveryScanner {
                         let mut local_skills = Vec::new();
                         let mut local_models = Vec::new();
                         let mut local_secrets = Vec::new();
+                        let mut local_test_secrets = Vec::new();
                         for path in chunk {
                             if let Some(dl) = deadline {
                                 if timed_out_ref.load(Ordering::Relaxed)
@@ -591,9 +646,16 @@ impl DiscoveryScanner {
                                 &mut local_skills,
                                 &mut local_models,
                                 &mut local_secrets,
+                                &mut local_test_secrets,
                             );
                         }
-                        (local_mcp, local_skills, local_models, local_secrets)
+                        (
+                            local_mcp,
+                            local_skills,
+                            local_models,
+                            local_secrets,
+                            local_test_secrets,
+                        )
                     })
                 })
                 .collect();
@@ -601,16 +663,18 @@ impl DiscoveryScanner {
             handles.into_iter().filter_map(|h| h.join().ok()).collect()
         });
 
-        for (mut m, mut s, mut mo, mut sec) in partial_results {
+        for (mut m, mut s, mut mo, mut sec, mut test_sec) in partial_results {
             mcp_servers.append(&mut m);
             agent_skills.append(&mut s);
             model_assets.append(&mut mo);
             exposed_secrets.append(&mut sec);
+            test_or_doc_secrets.append(&mut test_sec);
         }
 
         timed_out.load(Ordering::Relaxed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inspect_file(
         &self,
         path: &Path,
@@ -619,6 +683,7 @@ impl DiscoveryScanner {
         agent_skills: &mut Vec<DiscoveredAgentSkill>,
         model_assets: &mut Vec<DiscoveredModelAsset>,
         exposed_secrets: &mut Vec<ExposedSecretFinding>,
+        test_or_doc_secrets: &mut Vec<ExposedSecretFinding>,
     ) {
         let lower = file_name.to_lowercase();
 
@@ -749,20 +814,64 @@ impl DiscoveryScanner {
                 | "ai-bom.json"
                 | "vexa-ai-bom.json"
         );
-        if !is_binary_ext && !is_generated_report {
+        if !is_binary_ext && !is_generated_report && !is_lockfile(&lower) {
             let within_size = fs::metadata(path)
                 .map(|m| m.len() <= MAX_SECRET_SCAN_BYTES)
                 .unwrap_or(false);
             if within_size {
                 if let Ok(bytes) = fs::read(path) {
                     if !bytes.contains(&0) {
-                        let findings = self.dlp_engine.scan(&bytes);
-                        for f in findings {
-                            exposed_secrets.push(ExposedSecretFinding {
-                                file_path: path.to_path_buf(),
-                                detector: f.detector.to_string(),
-                                snippet: f.snippet,
-                            });
+                        if let Ok(text) = std::str::from_utf8(&bytes) {
+                            let findings = self.dlp_engine.scan(&bytes);
+                            if !findings.is_empty() {
+                                let path_is_test_or_doc = is_test_or_doc_path(path);
+                                let cfg_test_offset = if lower.ends_with(".rs") {
+                                    rust_cfg_test_byte_offset(text)
+                                } else {
+                                    None
+                                };
+                                let mut seen_in_file: HashSet<(usize, &'static str)> =
+                                    HashSet::new();
+
+                                for f in findings {
+                                    let raw_match = text.get(f.start..f.end).unwrap_or("");
+                                    let (line_no, line_text) = byte_offset_to_line(text, f.start);
+
+                                    // Skip developer-suppressed lines, pure comments, regex literals,
+                                    // and canonical documentation/placeholder/local-dev values.
+                                    if is_inline_suppressed(line_text)
+                                        || is_comment_or_regex_line(line_text)
+                                        || is_canonical_placeholder(f.detector, raw_match)
+                                    {
+                                        continue;
+                                    }
+
+                                    // Deduplicate multiple hits of the same detector on the same line
+                                    if !seen_in_file.insert((line_no, f.detector)) {
+                                        continue;
+                                    }
+
+                                    let in_cfg_test =
+                                        cfg_test_offset.map(|off| f.start >= off).unwrap_or(false);
+                                    let scope = if path_is_test_or_doc || in_cfg_test {
+                                        SecretScope::TestOrDoc
+                                    } else {
+                                        SecretScope::Production
+                                    };
+
+                                    let entry = ExposedSecretFinding {
+                                        file_path: path.to_path_buf(),
+                                        detector: f.detector.to_string(),
+                                        snippet: f.snippet,
+                                        line: Some(line_no),
+                                        scope: Some(scope),
+                                    };
+                                    match scope {
+                                        SecretScope::Production => exposed_secrets.push(entry),
+                                        SecretScope::TestOrDoc => test_or_doc_secrets.push(entry),
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -992,6 +1101,7 @@ fn sort_report_vectors(
     agent_skills: &mut [DiscoveredAgentSkill],
     model_assets: &mut [DiscoveredModelAsset],
     exposed_secrets: &mut [ExposedSecretFinding],
+    test_or_doc_secrets: &mut [ExposedSecretFinding],
     scanned_locations: &mut [PathBuf],
     unscanned_locations: &mut [PathBuf],
     excluded_paths: &mut [PathBuf],
@@ -1000,16 +1110,384 @@ fn sort_report_vectors(
     mcp_servers.sort_by(|a, b| a.source_file.cmp(&b.source_file).then(a.name.cmp(&b.name)));
     agent_skills.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
     model_assets.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
-    exposed_secrets.sort_by(|a, b| {
+    let secret_cmp = |a: &ExposedSecretFinding, b: &ExposedSecretFinding| {
         a.file_path
             .cmp(&b.file_path)
+            .then(a.line.cmp(&b.line))
             .then(a.detector.cmp(&b.detector))
             .then(a.snippet.cmp(&b.snippet))
-    });
+    };
+    exposed_secrets.sort_by(secret_cmp);
+    test_or_doc_secrets.sort_by(secret_cmp);
     scanned_locations.sort();
     unscanned_locations.sort();
     excluded_paths.sort();
     permission_errors.sort();
+}
+
+/// Returns true for third-party vendored or build-output directories that are never
+/// first-party source code and should be excluded from workspace audits.
+fn is_vendored_or_generated_dir(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "vendor"
+            | "third_party"
+            | "3rdparty"
+            | "dist"
+            | "build"
+            | "out"
+            | "coverage"
+            | ".next"
+            | ".nuxt"
+            | ".svelte-kit"
+            | ".turbo"
+            | "bower_components"
+            | "jspm_packages"
+            | "pods"
+            | ".terraform"
+            | ".serverless"
+    )
+}
+
+/// Returns true for dependency lockfiles and scanner metadata files that contain
+/// package hashes rather than user-authored secrets.
+fn is_lockfile(lower_file_name: &str) -> bool {
+    lower_file_name.ends_with(".lock")
+        || matches!(
+            lower_file_name,
+            "package-lock.json"
+                | "pnpm-lock.yaml"
+                | "yarn.lock"
+                | "cargo.lock"
+                | "go.sum"
+                | "poetry.lock"
+                | "uv.lock"
+                | "pipfile.lock"
+                | "gemfile.lock"
+                | "composer.lock"
+                | "flake.lock"
+                | ".vexa.facts.json"
+        )
+}
+
+/// Cross-platform check (using `Path::components()`) for test, benchmark, fixture,
+/// documentation, or template/example files. Matches in these files are classified as
+/// `SecretScope::TestOrDoc` rather than elevating production risk.
+fn is_test_or_doc_path(path: &Path) -> bool {
+    for comp in path.components() {
+        let std::path::Component::Normal(os_str) = comp else {
+            continue;
+        };
+        let Some(seg) = os_str.to_str() else {
+            continue;
+        };
+        let lower = seg.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "test"
+                | "tests"
+                | "__tests__"
+                | "testdata"
+                | "fixtures"
+                | "fixture"
+                | "mock"
+                | "mocks"
+                | "bench"
+                | "benches"
+                | "benchmarks"
+                | "example"
+                | "examples"
+                | "sample"
+                | "samples"
+                | "docs"
+                | "doc"
+                | "e2e"
+                | "cypress"
+                | "spec"
+                | "specs"
+        ) {
+            return true;
+        }
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    file_name.ends_with(".example")
+        || file_name.ends_with(".sample")
+        || file_name.ends_with(".template")
+        || file_name.ends_with(".md")
+        || file_name.ends_with(".rst")
+        || file_name.ends_with(".adoc")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_tests.rs")
+        || file_name.ends_with("_test.go")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with(".test.ts")
+        || file_name.ends_with(".test.tsx")
+        || file_name.ends_with(".test.js")
+        || file_name.ends_with(".test.jsx")
+        || file_name.ends_with(".spec.ts")
+        || file_name.ends_with(".spec.tsx")
+        || file_name.ends_with(".spec.js")
+        || file_name.ends_with(".spec.jsx")
+        || file_name.starts_with("test_")
+        || file_name == "tests.rs"
+        || file_name.starts_with("benchmark")
+}
+
+/// Returns the byte offset of the first `#[cfg(test)]` attribute in a Rust source file.
+fn rust_cfg_test_byte_offset(text: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed == "#[cfg(test)]" || trimmed.starts_with("#[cfg(test)]") {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Converts a byte offset in `text` to a 1-based line number and the full line slice.
+fn byte_offset_to_line(text: &str, byte_offset: usize) -> (usize, &str) {
+    let clamped = byte_offset.min(text.len());
+    let prefix = text.get(..clamped).unwrap_or("");
+    let line_no = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = text
+        .get(line_start..)
+        .and_then(|s| s.find('\n').map(|i| line_start + i))
+        .unwrap_or(text.len());
+    let line_text = text
+        .get(line_start..line_end)
+        .unwrap_or("")
+        .trim_end_matches('\r');
+    (line_no, line_text)
+}
+
+/// Returns true if the line carries an explicit inline suppression directive.
+fn is_inline_suppressed(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("arc:ignore")
+        || lower.contains("vexa:ignore")
+        || lower.contains("gitleaks:allow")
+        || lower.contains("nosec")
+}
+
+/// Returns true for pure comment lines or regex pattern definitions.
+fn is_comment_or_regex_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with("<!--")
+    {
+        return true;
+    }
+    trimmed.contains("Regex::new(")
+        || trimmed.contains("RegExp(")
+        || trimmed.contains("= /")
+        || trimmed.contains(": /")
+}
+
+/// Value-level filter for canonical documentation placeholders, local-dev DB URIs,
+/// truncated/stub PEM blocks, and low-entropy sequential dummy tokens.
+/// Applied only in `WorkspaceAudit` mode; runtime DLP (`arc-dlp`) remains strict.
+fn is_canonical_placeholder(detector: &str, raw_match: &str) -> bool {
+    let upper = raw_match.to_ascii_uppercase();
+    match detector {
+        "SEC-AWS-001" | "SEC-AWS-003" => {
+            raw_match == "AKIAIOSFODNN7EXAMPLE"
+                || upper.ends_with("EXAMPLE")
+                || upper.ends_with("DUMMY")
+                || upper.ends_with("ANOTHER")
+                || upper.ends_with("ABCDEF")
+                || upper.ends_with("123456")
+                || upper.ends_with("000000")
+                || upper.contains("EXAMPLE")
+                || upper.contains("FAKE")
+                || upper.contains("TEST")
+                || upper.contains("PLACEHOLDER")
+        }
+        "SEC-AWS-002" => {
+            raw_match == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+                || upper.contains("EXAMPLEKEY")
+                || upper.contains("EXAMPLE")
+                || upper.contains("DUMMY")
+                || upper.contains("PLACEHOLDER")
+        }
+        "SEC-URI-001" => is_placeholder_or_local_db_uri(raw_match),
+        "SEC-PRV-001" => is_stub_private_key(raw_match),
+        _ => {
+            let lower = raw_match.to_ascii_lowercase();
+            if lower.contains("example")
+                || lower.contains("placeholder")
+                || lower.contains("dummy")
+                || lower.contains("fake")
+                || lower.contains("12345678")
+                || lower.contains("abcdefgh")
+                || lower.contains("11112222")
+                || lower.contains("00000000")
+                || lower.contains("aaaaaaaa")
+                || lower.ends_with("1234")
+                || lower.ends_with("3456")
+                || lower.ends_with("stuv")
+            {
+                return true;
+            }
+            // Strip common prefix to measure entropy of the secret payload itself
+            let payload = raw_match
+                .split_once('_')
+                .map(|(_, r)| r)
+                .or_else(|| raw_match.split_once('-').map(|(_, r)| r))
+                .unwrap_or(raw_match);
+            arc_dlp::entropy::shannon_entropy(payload.as_bytes()) < 3.0
+        }
+    }
+}
+
+fn is_placeholder_or_local_db_uri(uri: &str) -> bool {
+    let Some((_, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    let Some((userinfo, host_part)) = rest.split_once('@') else {
+        return false;
+    };
+    let host = host_part
+        .split(['/', ':', '?'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_local_or_example_host = matches!(
+        host.as_str(),
+        "localhost"
+            | "127.0.0.1"
+            | "::1"
+            | "0.0.0.0"
+            | "db"
+            | "postgres"
+            | "postgresql"
+            | "mysql"
+            | "redis"
+            | "mongo"
+            | "mongodb"
+            | "host"
+            | "hostname"
+            | "myhost"
+            | "example.com"
+            | "db.example.com"
+            | "postgres.example.com"
+    ) || host.ends_with(".local")
+        || host.ends_with(".localhost")
+        || host.ends_with(".example")
+        || host.ends_with(".example.com")
+        || host.starts_with("${")
+        || host.starts_with('<');
+
+    let password = userinfo
+        .split_once(':')
+        .map(|(_, p)| p)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_dummy_password = matches!(
+        password.as_str(),
+        "" | "pass"
+            | "password"
+            | "passwd"
+            | "pwd"
+            | "postgres"
+            | "root"
+            | "admin"
+            | "secret"
+            | "changeme"
+            | "test"
+            | "testing"
+            | "dev"
+            | "local"
+            | "example"
+            | "dummy"
+            | "your_password"
+            | "your-password"
+            | "mysecretpassword"
+            | "supersecret"
+            | "***"
+            | "..."
+    ) || password.starts_with("${")
+        || password.starts_with('<')
+        || password.contains("example")
+        || password.contains("placeholder");
+
+    is_local_or_example_host || is_dummy_password
+}
+
+fn is_stub_private_key(pem: &str) -> bool {
+    let upper = pem.to_ascii_uppercase();
+    if upper.contains("...")
+        || upper.contains("EXAMPLE")
+        || upper.contains("REDACTED")
+        || upper.contains("DUMMY")
+        || upper.contains("PLACEHOLDER")
+        || upper.contains("YOUR_KEY")
+        || upper.contains("YOUR PRIVATE KEY")
+    {
+        return true;
+    }
+    let body_b64_len: usize = pem
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with("-----BEGIN ") && !t.starts_with("-----END ")
+        })
+        .map(|l| {
+            l.bytes()
+                .filter(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=')
+                .count()
+        })
+        .sum();
+    body_b64_len < 64
+}
+
+/// Delegates targeted workspace supply-chain checks (GitHub Actions pinning, MCP config
+/// hygiene, and AI instruction file prompt-injection/Unicode checks) to `vexa-sca`.
+fn collect_vexa_sca_supply_chain_signals(root: &Path) -> Vec<SupplyChainSignal> {
+    let mut raw = Vec::new();
+    vexa_sca::supply_chain::local_analyzer::LocalSupplyChainAnalyzer::scan_github_workflows(
+        root, &mut raw,
+    );
+    vexa_sca::supply_chain::local_analyzer::LocalSupplyChainAnalyzer::scan_mcp_configs(
+        root, &mut raw,
+    );
+    vexa_sca::supply_chain::local_analyzer::LocalSupplyChainAnalyzer::scan_ai_instruction_files(
+        root, &mut raw,
+    );
+
+    let mut seen = HashSet::new();
+    let mut signals = Vec::new();
+    for f in raw {
+        let key = (f.rule_id.clone(), f.file_path.clone(), f.line);
+        if !seen.insert(key) {
+            continue;
+        }
+        signals.push(SupplyChainSignal {
+            rule_id: f.rule_id,
+            signal_name: f.signal_name,
+            severity: f.severity.as_str().to_string(),
+            message: f.message,
+            file_path: f.file_path,
+            line: f.line,
+        });
+    }
+    signals
 }
 
 /// Returns true for ephemeral IDE/browser/plugin cache or temp directories that never hold
@@ -1072,6 +1550,7 @@ mod tests {
         let mut agent_skills = Vec::new();
         let mut model_assets = Vec::new();
         let mut exposed_secrets = Vec::new();
+        let mut test_or_doc_secrets = Vec::new();
 
         let temp_skill = std::env::temp_dir().join("test_security.mdc");
         std::fs::write(&temp_skill, "# Cursor Agent Rule\nApply security gates").unwrap();
@@ -1083,6 +1562,7 @@ mod tests {
             &mut agent_skills,
             &mut model_assets,
             &mut exposed_secrets,
+            &mut test_or_doc_secrets,
         );
 
         assert_eq!(agent_skills.len(), 1);
@@ -1096,6 +1576,7 @@ mod tests {
             &mut agent_skills,
             &mut model_assets,
             &mut exposed_secrets,
+            &mut test_or_doc_secrets,
         );
 
         assert_eq!(model_assets.len(), 1);
@@ -1214,8 +1695,8 @@ mod tests {
         fs::create_dir_all(temp_dir.join("src")).unwrap();
         fs::create_dir_all(temp_dir.join(".cursor")).unwrap();
 
-        let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
-        let fake_gh = format!("{}{}", "ghp_", "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8");
+        let fake_aws = format!("{}9X8W7V6U5T4S3R2Q", "AKIA");
+        let fake_gh = format!("{}{}", "ghp_", "K9mN3pQ7rS2tU5vW8xY1zA4bC6dE0fG2hJ9k");
 
         // .gitignore ignores dist/, .env, and .cursor/
         fs::write(temp_dir.join(".gitignore"), "dist/\n.env\n.cursor/\n").unwrap();
@@ -1294,7 +1775,7 @@ mod tests {
             std::env::temp_dir().join(format!("vexa_arc_determ_{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(temp_dir.join("src")).unwrap();
 
-        let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
+        let fake_aws = format!("{}9X8W7V6U5T4S3R2Q", "AKIA");
         // Create 50 files (>32 threshold so parallel inspection runs) with secrets in deterministic slots
         for i in 0..50 {
             let content = if i % 5 == 0 {
@@ -1359,7 +1840,7 @@ mod tests {
             std::env::temp_dir().join(format!("vexa_arc_noise_excl_{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(temp_dir.join(".sca-cache").join("advisories")).unwrap();
 
-        let fake_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
+        let fake_aws = format!("{}9X8W7V6U5T4S3R2Q", "AKIA");
         // Cache advisory and generated reports containing example credentials must be ignored
         fs::write(
             temp_dir
@@ -1402,6 +1883,100 @@ mod tests {
             "unexpected secret path: {:?}",
             report.exposed_secrets[0].file_path
         );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_workspace_audit_filters_vendor_placeholders_and_classifies_tests_and_cfg_test() {
+        let scanner = DiscoveryScanner::new();
+        let temp_dir =
+            std::env::temp_dir().join(format!("vexa_arc_ws_audit_{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(temp_dir.join("vendor").join("github.com").join("lib")).unwrap();
+        fs::create_dir_all(temp_dir.join("tests")).unwrap();
+        fs::create_dir_all(temp_dir.join("docs")).unwrap();
+        fs::create_dir_all(temp_dir.join("src")).unwrap();
+
+        let real_like_aws = format!("{}9X8W7V6U5T4S3R2Q", "AKIA");
+        let placeholder_aws = format!("{}IOSFODNN7EXAMPLE", "AKIA");
+        let placeholder_secret = format!(
+            "AWS_SECRET_ACCESS_KEY={}{}",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCY", "EXAMPLEKEY"
+        );
+
+        // 1. Vendored code must be completely excluded
+        fs::write(
+            temp_dir
+                .join("vendor")
+                .join("github.com")
+                .join("lib")
+                .join("config.go"),
+            format!("const key = \"{real_like_aws}\"\n"),
+        )
+        .unwrap();
+
+        // 2. Canonical doc placeholders, local DB URIs, comments, and inline arc:ignore must be filtered
+        fs::write(
+            temp_dir.join("src").join("examples.rs"),
+            format!(
+                "// {real_like_aws}\n\
+                 let doc_key = \"{placeholder_aws}\";\n\
+                 let doc_sec = \"{placeholder_secret}\";\n\
+                 let local_db = \"postgres://postgres:postgres@localhost:5432/app\";\n\
+                 let suppressed = \"{real_like_aws}\"; // arc:ignore\n"
+            ),
+        )
+        .unwrap();
+
+        // 3. Real-looking key in tests/ and inside #[cfg(test)] -> classified as TestOrDoc (not Production)
+        fs::write(
+            temp_dir.join("tests").join("auth_test.rs"),
+            format!("const TEST_KEY: &str = \"{real_like_aws}\";\n"),
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("src").join("service.rs"),
+            format!(
+                "pub fn prod() {{}}\n\n#[cfg(test)]\nmod tests {{\n    const K: &str = \"{real_like_aws}\";\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        let clean_prod_report = scanner.audit_directory(&temp_dir).unwrap();
+        assert!(
+            clean_prod_report.exposed_secrets.is_empty(),
+            "No production secrets should be reported: {:?}",
+            clean_prod_report.exposed_secrets
+        );
+        assert_eq!(
+            clean_prod_report.overall_risk_band,
+            RiskBand::Low,
+            "Test/doc secrets must not elevate overall risk band to High"
+        );
+        assert_eq!(
+            clean_prod_report.test_or_doc_secrets.len(),
+            2,
+            "Real-looking keys in tests/ and #[cfg(test)] must be captured in test_or_doc_secrets"
+        );
+        assert!(clean_prod_report
+            .test_or_doc_secrets
+            .iter()
+            .all(|f| f.scope == Some(SecretScope::TestOrDoc) && f.line.is_some()));
+
+        // 4. Real-looking key in production source -> Production finding with exact line number + High risk
+        fs::write(
+            temp_dir.join("src").join("prod.rs"),
+            format!("pub fn init() {{\n    let k = \"{real_like_aws}\";\n}}\n"),
+        )
+        .unwrap();
+        let prod_report = scanner.audit_directory(&temp_dir).unwrap();
+        assert_eq!(prod_report.exposed_secrets.len(), 1);
+        assert_eq!(prod_report.exposed_secrets[0].line, Some(2));
+        assert_eq!(
+            prod_report.exposed_secrets[0].scope,
+            Some(SecretScope::Production)
+        );
+        assert_eq!(prod_report.overall_risk_band, RiskBand::High);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

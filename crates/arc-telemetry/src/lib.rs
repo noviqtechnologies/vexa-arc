@@ -7,12 +7,13 @@ pub use client::{
     default_spool_dir, export_aggregate, run_collector, TelemetryClient, TelemetrySink,
 };
 pub use cloud::{
-    cloud_spool_path, emit_cloud_firewall_event, emit_cloud_heartbeat, fetch_signed_policy_bundle,
-    flush_arc_event_spool, get_cloud_telemetry_status, maybe_spawn_background_flush,
+    cloud_inventory_spool_path, cloud_spool_path, emit_cloud_firewall_event, emit_cloud_heartbeat,
+    fetch_signed_policy_bundle, flush_arc_event_spool, flush_arc_inventory_spool,
+    format_reqwest_error_chain, get_cloud_telemetry_status, maybe_spawn_background_flush,
     poll_device_token, request_device_code, sanitize_cloud_actor, sanitize_cloud_reason,
-    spool_arc_event, upload_arc_inventory, CloudArcEvent, CloudArcHeartbeat, CloudFirewallEvent,
-    CloudTelemetryStatus, DeviceCodeSession, DeviceTokenPollResult, StoredVexaCredentials,
-    VexaCloudAuth, DEFAULT_VEXA_API_BASE_URL,
+    spool_arc_event, spool_arc_inventory, upload_arc_inventory, CloudArcEvent, CloudArcHeartbeat,
+    CloudFirewallEvent, CloudTelemetryStatus, DeviceCodeSession, DeviceTokenPollResult,
+    StoredVexaCredentials, VexaCloudAuth, DEFAULT_VEXA_API_BASE_URL,
 };
 pub use model::{TelemetryEvent, TelemetryEventBuilder};
 pub use privacy::{hash_identifier, install_id};
