@@ -93,13 +93,18 @@ impl PackageVulnFinding {
         // Build the remediation message (FR-PKG-006)
         let safe_version = remediation
             .and_then(|r| r.target_version.as_deref())
-            .or_else(|| finding.fixed_in.last().map(|s| s.as_str()))
-            .unwrap_or("a patched version");
+            .or_else(|| finding.fixed_in.last().map(|s| s.as_str()));
 
-        let remediation_message = format!(
-            "Vulnerable package {}@{}; update constraint to >={}",
-            finding.package, finding.version, safe_version
-        );
+        let remediation_message = match safe_version {
+            Some(ver) => format!(
+                "Vulnerable package {}@{}; update constraint to >={}",
+                finding.package, finding.version, ver
+            ),
+            None => format!(
+                "Vulnerable package {}@{}; no upstream patched version published (replace package or apply virtual shielding)",
+                finding.package, finding.version
+            ),
+        };
 
         let jsonrpc_error = serde_json::json!({
             "error": remediation_message,
